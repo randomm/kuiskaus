@@ -46,7 +46,7 @@ xcode-select --install
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/yourusername/kuiskaus.git
+git clone https://github.com/randomm/kuiskaus.git
 cd kuiskaus
 ```
 
@@ -143,16 +143,18 @@ The menu bar app allows you to switch between different Whisper models:
 ## Performance
 
 ### Apple Silicon Macs (with MLX optimization)
-- Whisper V3 Turbo typically transcribes at 5-10x real-time
-- A 5-second recording transcribes in ~0.5-1 second
+- Whisper V3 Turbo typically transcribes at 8-15x real-time
+- A 5-second recording transcribes in ~0.3-0.6 seconds
 - Leverages Neural Engine for maximum efficiency
+- Model loads in ~1-2 seconds on first use
 
 ### Intel Macs
 - Whisper V3 Turbo typically transcribes at 2-5x real-time
 - A 5-second recording transcribes in ~1-2.5 seconds
 - Uses CPU-based processing (GPU acceleration if available)
+- Model loads in ~3-5 seconds on first use
 
-**Note**: First transcription may be slower as the model loads into memory
+**Note**: Performance varies based on audio quality, background noise, and system load
 
 ## Testing
 
@@ -169,6 +171,11 @@ python3 -m tests.test_integration # Test system integration
 ```
 
 Run these tests after installation to verify everything is working correctly.
+
+## Known Issues
+
+- **Info.plist notification error**: If you see errors about Info.plist when running from a virtual environment, this is a known issue with rumps. The app will still work, but notifications may not display correctly.
+- **First-time model loading**: The first transcription after starting the app may take a few seconds as the model loads into memory.
 
 ## Troubleshooting
 
