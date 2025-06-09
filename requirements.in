@@ -1,0 +1,21 @@
+# Core macOS integration
+pyobjc-core
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+pyobjc-framework-ApplicationServices
+
+# Audio processing
+pyaudio
+numpy
+
+# Whisper speech recognition (faster, Python 3.11 compatible)
+faster-whisper
+
+# MLX optimization for Apple Silicon (optional)
+# mlx-whisper  # Uncomment for Apple Silicon
+
+# UI and notifications
+rumps  # Menu bar app framework
+
+# Utilities
+python-dotenv
