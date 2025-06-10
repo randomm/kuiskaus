@@ -177,7 +177,11 @@ kuiskaus/
 │   └── menubar.py          # Menu bar application
 ├── tests/                  # Test suite
 ├── setup.sh                # Installation script
-├── requirements.in         # Python dependencies
+├── launch_kuiskaus.sh      # Menu bar launcher
+├── launch_cli.sh           # CLI launcher
+├── run_tests.sh            # Test runner
+├── requirements.in         # Direct dependencies
+├── requirements.txt        # Locked dependencies
 └── README.md
 ```
 
@@ -188,11 +192,12 @@ Run the test suite:
 ./run_tests.sh
 ```
 
-Or run individual tests:
+### Updating Dependencies
+
+If you modify `requirements.in`, regenerate the locked dependencies:
 ```bash
-python3 -m tests.test_audio       # Test audio recording
-python3 -m tests.test_whisper     # Test Whisper model
-python3 -m tests.test_integration # Test system integration
+uv pip compile requirements.in -o requirements.txt
+uv pip sync requirements.txt
 ```
 
 ## Contributing
