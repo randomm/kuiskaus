@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch Kuiskaus CLI version
+# Launch Kuiskaus CLI
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 cd "$SCRIPT_DIR"
@@ -8,4 +8,4 @@ cd "$SCRIPT_DIR"
 source .venv/bin/activate
 
 # Launch the CLI version
-python3 -m kuiskaus.app "$@"
+python3 -m kuiskaus.app

@@ -1,44 +1,58 @@
 #!/usr/bin/env python3
 """
-Basic test to verify core functionality
+Basic sanity check for Kuiskaus installation.
+Quick test to ensure core components work.
 """
 
 import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import subprocess
 
-from kuiskaus.audio_recorder import AudioRecorder
-from kuiskaus.whisper_transcriber import WhisperTranscriber
-import time
+def check_system():
+    """Check if running on Apple Silicon Mac"""
+    try:
+        result = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], 
+                              capture_output=True, text=True)
+        if "Apple" not in result.stdout:
+            print("❌ This app requires Apple Silicon")
+            return False
+        print("✅ Apple Silicon detected")
+        return True
+    except:
+        return False
+
+def check_imports():
+    """Check if core modules can be imported"""
+    modules = [
+        ("pyaudio", "Audio recording"),
+        ("numpy", "Audio processing"),
+        ("mlx_whisper", "MLX Whisper"),
+        ("rumps", "Menu bar support"),
+        ("AppKit", "macOS integration")
+    ]
+    
+    all_good = True
+    for module, desc in modules:
+        try:
+            __import__(module)
+            print(f"✅ {desc} ({module})")
+        except ImportError:
+            print(f"❌ {desc} ({module}) - run: pip install -r requirements.txt")
+            all_good = False
+    
+    return all_good
 
 def main():
-    print("Testing basic functionality...")
+    print("🎤 Kuiskaus Quick Check\n")
     
-    # Test audio recorder
-    print("\n1. Testing audio recorder...")
-    recorder = AudioRecorder()
-    recorder.start_recording()
-    time.sleep(1)
-    audio = recorder.stop_recording()
-    print(f"✅ Recorded {len(audio)/16000:.1f}s of audio")
+    if not check_system():
+        return 1
+        
+    print("\nChecking dependencies:")
+    if not check_imports():
+        return 1
     
-    # Test transcriber
-    print("\n2. Testing Whisper transcriber...")
-    transcriber = WhisperTranscriber(model_name="turbo")
-    print("Waiting for model to load...")
-    transcriber.ensure_model_loaded()
-    print("✅ Model loaded")
-    
-    # Test transcription
-    print("\n3. Testing transcription...")
-    result = transcriber.transcribe(audio)
-    print(f"✅ Transcription complete: '{result.get('text', '').strip()}'")
-    
-    # Cleanup
-    recorder.cleanup()
-    transcriber.cleanup()
-    
-    print("\n✅ All basic tests passed!")
+    print("\n✅ Basic checks passed! Run ./run_tests.sh for full tests.")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

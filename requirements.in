@@ -8,11 +8,11 @@ pyobjc-framework-ApplicationServices
 pyaudio
 numpy
 
-# Whisper speech recognition (faster, Python 3.11 compatible)
-faster-whisper
+# MLX-optimized Whisper for Apple Silicon
+mlx-whisper
 
-# MLX optimization for Apple Silicon (optional)
-# mlx-whisper  # Uncomment for Apple Silicon
+# Override numba version for Python 3.11 compatibility
+numba>=0.57.0
 
 # UI and notifications
 rumps  # Menu bar app framework

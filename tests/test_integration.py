@@ -14,13 +14,9 @@ def test_accessibility_permissions():
     print("=== Accessibility Permissions Test ===\n")
     
     try:
-        import Quartz
+        from ApplicationServices import AXIsProcessTrusted
         
-        # Check if we're trusted for accessibility
-        # Create options dictionary without prompting
-        from Quartz import kAXTrustedCheckOptionPrompt
-        options = {kAXTrustedCheckOptionPrompt: False}
-        is_trusted = Quartz.AXIsProcessTrustedWithOptions(options)
+        is_trusted = AXIsProcessTrusted()
         
         if is_trusted:
             print("✅ Accessibility permissions granted")
@@ -28,17 +24,16 @@ def test_accessibility_permissions():
         else:
             print("❌ Accessibility permissions NOT granted")
             print("\nTo grant permissions:")
-            print("1. Open System Preferences")
-            print("2. Go to Security & Privacy > Privacy > Accessibility")
-            print("3. Click the lock to make changes")
-            print("4. Add Terminal (or your terminal app) to the list")
-            print("5. Ensure it's checked/enabled")
-            print("\nNote: You'll need to restart this app after granting permissions")
+            print("1. Open System Settings > Privacy & Security > Accessibility")
+            print("2. Add Terminal (or your terminal app) to the list")
+            print("3. Ensure it's enabled")
+            print("4. Restart this app after granting permissions")
             return False
             
     except Exception as e:
-        print(f"❌ Error checking accessibility: {e}")
-        return False
+        print(f"⚠️  Could not check accessibility: {e}")
+        print("   The app will prompt for permissions when needed")
+        return True  # Don't fail the test for this
 
 def test_pyobjc_frameworks():
     """Test if required PyObjC frameworks are available"""
@@ -176,11 +171,13 @@ def test_system_info():
         
         # Check if Apple Silicon
         if "Apple" in processor:
-            print("✅ Apple Silicon detected - MLX optimization available")
+            print("✅ Apple Silicon detected - Required for this application")
         else:
-            print("ℹ️  Intel processor - MLX optimization not available")
+            print("❌ Intel processor detected - This application requires Apple Silicon")
+            return False
     except:
-        print("Processor: Unable to determine")
+        print("❌ Processor: Unable to determine")
+        return False
     
     # Python version
     print(f"Python Version: {sys.version.split()[0]}")

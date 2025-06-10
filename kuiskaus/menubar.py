@@ -114,11 +114,11 @@ class KuiskausMenuBarApp(rumps.App):
         if self.enabled:
             self.title = "🎤"
             self.update_status("🟢 Ready")
-            rumps.notification("Kuiskaus Enabled", "", "Speech-to-text is now active")
+            print("✅ Kuiskaus enabled")
         else:
             self.title = "🔇"
             self.update_status("🔴 Disabled")
-            rumps.notification("Kuiskaus Disabled", "", "Speech-to-text is now inactive")
+            print("🔴 Kuiskaus disabled")
     
     def on_hotkey_press(self):
         """Called when hotkey is pressed"""
@@ -174,12 +174,8 @@ class KuiskausMenuBarApp(rumps.App):
                 # Insert text
                 self.text_inserter.insert_text(text)
                 
-                # Show notification
-                rumps.notification(
-                    "Transcribed",
-                    "",
-                    text[:100] + "..." if len(text) > 100 else text
-                )
+                # Log instead of notification (avoids Info.plist issues)
+                print(f"📝 Transcribed: {text}")
                 
                 self.update_status("🟢 Ready")
             else:
@@ -188,7 +184,6 @@ class KuiskausMenuBarApp(rumps.App):
         except Exception as e:
             print(f"Error during transcription: {e}")
             self.update_status("🟢 Ready (error)")
-            rumps.notification("Transcription Error", "", str(e))
     
     def update_status(self, status: str):
         """Update the status menu item"""
@@ -212,10 +207,10 @@ class KuiskausMenuBarApp(rumps.App):
             old_transcriber.cleanup()
             
             self.update_status("🟢 Ready")
-            rumps.notification("Model Changed", "", f"Now using {model_name} model")
+            print(f"✅ Model changed to {model_name}")
         except Exception as e:
             self.update_status("🟢 Ready (model error)")
-            rumps.notification("Model Error", "", str(e))
+            print(f"❌ Model error: {e}")
     
     @rumps.clicked("Statistics...")
     def show_stats(self, _):
@@ -272,8 +267,27 @@ Version 1.0
         except Exception as e:
             print(f"Cleanup error: {e}")
 
+def check_apple_silicon():
+    """Check if running on Apple Silicon"""
+    try:
+        import subprocess
+        result = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], 
+                              capture_output=True, text=True)
+        return "Apple" in result.stdout
+    except:
+        return False
+
 def main():
     """Main entry point for menu bar app"""
+    # Check for Apple Silicon
+    if not check_apple_silicon():
+        rumps.alert(
+            "Apple Silicon Required",
+            "This application requires Apple Silicon (M1/M2/M3). Intel-based Macs are not supported.",
+            ok="OK"
+        )
+        return
+    
     app = KuiskausMenuBarApp()
     app.run()
 

@@ -161,11 +161,27 @@ class KuiskausApp:
         self.print_stats()
         print("👋 Goodbye!")
 
+def check_apple_silicon():
+    """Check if running on Apple Silicon"""
+    try:
+        import subprocess
+        result = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], 
+                              capture_output=True, text=True)
+        return "Apple" in result.stdout
+    except:
+        return False
+
 def main():
     """Main entry point"""
     # Check Python version
     if sys.version_info < (3, 8):
         print("Python 3.8 or higher is required")
+        sys.exit(1)
+    
+    # Check for Apple Silicon
+    if not check_apple_silicon():
+        print("\n❌ Error: This application requires Apple Silicon (M1/M2/M3)")
+        print("Intel-based Macs are not supported.")
         sys.exit(1)
     
     # Parse arguments (simple for now)
