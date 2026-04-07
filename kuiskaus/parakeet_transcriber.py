@@ -2,6 +2,8 @@
 
 import time
 import threading
+from typing import Any
+
 import numpy as np
 
 from .transcriber import TranscriptionResult
@@ -13,7 +15,7 @@ class ParakeetTranscriber:
     MODEL_ID = "mlx-community/parakeet-tdt-0.6b-v3"
 
     def __init__(self) -> None:
-        self.model = None
+        self.model: Any = None
         self._model_lock = threading.Lock()
         self._load_thread = threading.Thread(target=self._load_model, daemon=True)
         self._load_thread.start()
