@@ -85,7 +85,7 @@ uv run pytest --cov=kuiskaus --cov-report=term-missing tests/
 - **Python version**: 3.8+ compatible (see `.python-version`)
 - **Formatter**: ruff format
 - **Linter**: ruff check
-- **Type checker**: ty (0.0.x - verify version before upgrading)
+- **Type checker**: ty
 - **Line length**: 88 characters (ruff default)
 - **Imports**: isort-compatible (ruff handles this)
 
@@ -179,10 +179,9 @@ uv run ruff format --check kuiskaus/ tests/  # Format check only
 uv run ty check kuiskaus/
 
 # Dependency management
-uv pip compile requirements.in -o requirements.txt         # Relock runtime deps
-uv pip compile requirements-dev.in -o requirements-dev.txt  # Relock dev deps
-uv pip sync requirements.txt                                # Install runtime deps
-uv pip sync requirements-dev.txt                            # Install dev deps (includes ty, and includes all runtime deps via -r requirements.txt)
+uv sync                # Install runtime deps
+uv sync --group dev    # Install all deps including dev tools (ty)
+uv lock                # Regenerate uv.lock after editing pyproject.toml
 ```
 
 ---
