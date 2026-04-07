@@ -12,6 +12,7 @@ import numpy as np
 
 from .audio_recorder import AudioRecorder
 from .whisper_transcriber import WhisperTranscriber
+from .parakeet_transcriber import ParakeetTranscriber
 from .transcriber import Transcriber
 from .hotkey_listener import HotkeyListener
 from .text_inserter import TextInserter
@@ -26,7 +27,7 @@ except ImportError:
     HAS_NOTIFICATIONS = False
 
 
-ALLOWED_MODELS = {"turbo", "base", "small", "medium", "large"}
+ALLOWED_MODELS = {"turbo", "base", "small", "medium", "large", "parakeet"}
 
 
 class KuiskausApp:
@@ -42,7 +43,10 @@ class KuiskausApp:
 
         # Initialize components
         self.audio_recorder = AudioRecorder()
-        self.transcriber: Transcriber = WhisperTranscriber(model_name=model_name)
+        if model_name == "parakeet":
+            self.transcriber: Transcriber = ParakeetTranscriber()
+        else:
+            self.transcriber: Transcriber = WhisperTranscriber(model_name=model_name)
         if not isinstance(self.transcriber, Transcriber):
             raise TypeError(
                 f"Transcriber implementation {type(self.transcriber)} does not satisfy "

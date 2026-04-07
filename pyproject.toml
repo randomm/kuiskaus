@@ -1,7 +1,7 @@
 [project]
 name = "kuiskaus"
 version = "0.1.0"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 dependencies = [
     "pyobjc-core",
     "pyobjc-framework-Cocoa",
@@ -10,6 +10,7 @@ dependencies = [
     "pyaudio",
     "numpy",
     "mlx-whisper",
+    "parakeet-mlx",
     "numba>=0.57.0",
     "rumps",
     "python-dotenv",
