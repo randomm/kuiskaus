@@ -73,23 +73,12 @@ if [ -d ".venv" ]; then
     rm -rf .venv
 fi
 
-uv venv
-echo -e "${GREEN}✓ Virtual environment created${NC}"
-
-# Install Python dependencies with UV
+# Install dependencies and create virtual environment with UV
 echo
 echo "Installing Python dependencies (this will be fast!)..."
+uv sync --group dev || { echo -e "${RED}Error: Failed to install dependencies${NC}"; exit 1; }
 source .venv/bin/activate
-
-# Generate requirements.txt from requirements.in
-if [ -f "requirements.in" ]; then
-    echo "Compiling requirements..."
-    uv pip compile requirements.in -o requirements.txt
-fi
-
-# Install dependencies
-echo "Installing dependencies..."
-uv pip sync requirements.txt
+echo -e "${GREEN}✓ Virtual environment created and dependencies installed${NC}"
 
 # Pre-download Whisper model
 echo

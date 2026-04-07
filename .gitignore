@@ -66,6 +66,3 @@ Icon
 # Files that might contain secrets
 .env
 .env.local
-
-# uv lockfile (project uses requirements-based workflow)
-uv.lock

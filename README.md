@@ -67,13 +67,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Install system dependencies
 brew install portaudio ffmpeg
 
-# Create virtual environment
-uv venv
-source .venv/bin/activate
-
 # Install Python packages
-uv pip compile requirements.in -o requirements.txt
-uv pip sync requirements.txt
+uv sync --group dev
 ```
 
 ## Usage
@@ -180,8 +175,8 @@ kuiskaus/
 ├── launch_kuiskaus.sh      # Menu bar launcher
 ├── launch_cli.sh           # CLI launcher
 ├── run_tests.sh            # Test runner
-├── requirements.in         # Direct dependencies
-├── requirements.txt        # Locked dependencies
+├── pyproject.toml          # Project metadata and dependencies
+├── uv.lock                 # Locked dependencies (auto-generated)
 └── README.md
 ```
 
@@ -194,10 +189,10 @@ Run the test suite:
 
 ### Updating Dependencies
 
-If you modify `requirements.in`, regenerate the locked dependencies:
+If you add or modify dependencies in `pyproject.toml`, regenerate the lockfile:
 ```bash
-uv pip compile requirements.in -o requirements.txt
-uv pip sync requirements.txt
+uv lock
+uv sync --group dev
 ```
 
 ## Contributing
