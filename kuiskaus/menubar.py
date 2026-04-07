@@ -16,6 +16,7 @@ from .whisper_transcriber import WhisperTranscriber
 from .transcriber import Transcriber
 from .hotkey_listener_cgevent import HotkeyListenerCGEvent
 from .text_inserter import TextInserter
+from .postprocessor import clean_with_apfel
 
 
 class KuiskausMenuBarApp(rumps.App):
@@ -40,6 +41,8 @@ class KuiskausMenuBarApp(rumps.App):
         self.is_recording = False
         self.recording_start_time = None
         self.enabled = True
+        self.use_apfel: bool = False
+        self._apfel_lock = threading.Lock()
 
         # Initialize hotkey listener with CGEventTap
         self.hotkey_listener = HotkeyListenerCGEvent(
@@ -68,6 +71,12 @@ class KuiskausMenuBarApp(rumps.App):
         self.enable_item = rumps.MenuItem("Enabled", callback=self.toggle_enabled)
         self.enable_item.state = True
         self.menu.add(self.enable_item)
+
+        self.apfel_item = rumps.MenuItem(
+            "LLM Cleanup (apfel)", callback=self.toggle_apfel
+        )
+        self.apfel_item.state = False
+        self.menu.add(self.apfel_item)
 
         # Hotkey info
         self.menu.add(rumps.MenuItem("Hotkey: ⌃⌥ (Control+Option)", callback=None))
@@ -141,6 +150,15 @@ class KuiskausMenuBarApp(rumps.App):
             self.update_status("🔴 Disabled")
             print("🔴 Kuiskaus disabled")
 
+    def toggle_apfel(self, sender: "rumps.MenuItem") -> None:
+        """Toggle apfel LLM cleanup"""
+        with self._apfel_lock:
+            self.use_apfel = not self.use_apfel
+            enabled = self.use_apfel
+        sender.state = enabled
+        status = "enabled" if enabled else "disabled"
+        print(f"✨ LLM cleanup {status}")
+
     def on_hotkey_press(self):
         """Called when hotkey is pressed"""
         if not self.enabled:
@@ -180,12 +198,20 @@ class KuiskausMenuBarApp(rumps.App):
             else:
                 self.update_status("🟢 Ready")
 
-    def _transcribe_and_insert(self, audio_data: np.ndarray, recording_duration: float) -> None:
+    def _transcribe_and_insert(
+        self, audio_data: np.ndarray, recording_duration: float
+    ) -> None:
         """Transcribe audio and insert text (runs in separate thread)"""
         try:
             # Transcribe
             result = self.transcriber.transcribe(audio_data)
             text = result.get("text", "").strip()
+
+            # Apply apfel cleanup if enabled
+            with self._apfel_lock:
+                should_clean = self.use_apfel
+            if text and should_clean:
+                text = clean_with_apfel(text)
 
             if text:
                 # Update stats
@@ -300,7 +326,7 @@ def check_apple_silicon():
             ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True
         )
         return "Apple" in result.stdout
-    except:
+    except Exception:
         return False
 
 

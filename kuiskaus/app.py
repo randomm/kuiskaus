@@ -5,10 +5,8 @@ Hold Control+Option to record, release to transcribe and insert text.
 """
 
 import sys
-import os
 import threading
 import time
-from datetime import datetime
 
 import numpy as np
 
@@ -17,6 +15,7 @@ from .whisper_transcriber import WhisperTranscriber
 from .transcriber import Transcriber
 from .hotkey_listener import HotkeyListener
 from .text_inserter import TextInserter
+from .postprocessor import clean_with_apfel
 
 # Optional: notifications
 try:
@@ -27,13 +26,17 @@ except ImportError:
     HAS_NOTIFICATIONS = False
 
 
+ALLOWED_MODELS = {"turbo", "base", "small", "medium", "large"}
+
+
 class KuiskausApp:
-    def __init__(self, model_name: str = "turbo"):
+    def __init__(self, model_name: str = "turbo", use_apfel: bool = False):
         """
         Initialize the Kuiskaus application
 
         Args:
             model_name: Whisper model to use (default: "turbo" for V3 Turbo)
+            use_apfel: Whether to use LLM cleanup with apfel (default: False)
         """
         print("Initializing Kuiskaus...")
 
@@ -50,6 +53,7 @@ class KuiskausApp:
         # State
         self.is_recording = False
         self.recording_start_time = None
+        self.use_apfel = use_apfel
 
         # Initialize hotkey listener with callbacks
         self.hotkey_listener = HotkeyListener(
@@ -89,7 +93,9 @@ class KuiskausApp:
             else:
                 print("No audio recorded")
 
-    def _transcribe_and_insert(self, audio_data: np.ndarray, recording_duration: float) -> None:
+    def _transcribe_and_insert(
+        self, audio_data: np.ndarray, recording_duration: float
+    ) -> None:
         """Transcribe audio and insert text (runs in separate thread)"""
         try:
             print("🤖 Transcribing...")
@@ -100,6 +106,10 @@ class KuiskausApp:
             text = result.get("text", "").strip()
 
             if text:
+                # Apply apfel cleanup if enabled
+                if self.use_apfel:
+                    text = clean_with_apfel(text)
+
                 # Update stats
                 self.total_transcriptions += 1
                 self.total_recording_time += recording_duration
@@ -188,7 +198,7 @@ def check_apple_silicon():
             ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True
         )
         return "Apple" in result.stdout
-    except:
+    except Exception:
         return False
 
 
@@ -207,12 +217,21 @@ def main():
 
     # Parse arguments (simple for now)
     model_name = "turbo"
-    if len(sys.argv) > 1:
-        model_name = sys.argv[1]
-        print(f"Using model: {model_name}")
+    use_apfel = "--apfel" in sys.argv
+    args = [arg for arg in sys.argv[1:] if arg != "--apfel"]
+    if args:
+        model_name = args[0]
+        if model_name not in ALLOWED_MODELS:
+            print(
+                f"❌ Unknown model '{model_name}'. Allowed: {', '.join(sorted(ALLOWED_MODELS))}"
+            )
+            sys.exit(1)
+    print(f"Using model: {model_name}")
+    if use_apfel:
+        print("LLM cleanup enabled (apfel)")
 
     # Create and run app
-    app = KuiskausApp(model_name=model_name)
+    app = KuiskausApp(model_name=model_name, use_apfel=use_apfel)
     app.run()
 
 
