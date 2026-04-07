@@ -45,6 +45,8 @@ The setup script will:
 - Download the Whisper V3 Turbo model (~1.5GB)
 - Create launch scripts
 
+> **Upgrading from a previous install?** Remove your existing virtual environment and reinstall: `rm -rf .venv && ./setup.sh`
+
 3. Grant accessibility permissions when prompted:
    - Go to System Settings > Privacy & Security > Accessibility
    - Add and enable Terminal (or your terminal app)
