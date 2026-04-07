@@ -9,6 +9,8 @@ import threading
 import time
 from datetime import datetime
 
+import numpy as np
+
 from .audio_recorder import AudioRecorder
 from .whisper_transcriber import WhisperTranscriber
 from .transcriber import Transcriber
@@ -27,9 +29,11 @@ class KuiskausMenuBarApp(rumps.App):
         # Initialize components
         self.audio_recorder = AudioRecorder()
         self.transcriber: Transcriber = WhisperTranscriber(model_name="turbo")
-        assert isinstance(self.transcriber, Transcriber), (
-            f"Transcriber implementation {type(self.transcriber)} does not satisfy the Transcriber protocol"
-        )
+        if not isinstance(self.transcriber, Transcriber):
+            raise TypeError(
+                f"Transcriber implementation {type(self.transcriber)} does not satisfy "
+                "the Transcriber protocol"
+            )
         self.text_inserter = TextInserter()
 
         # State
@@ -176,7 +180,7 @@ class KuiskausMenuBarApp(rumps.App):
             else:
                 self.update_status("🟢 Ready")
 
-    def _transcribe_and_insert(self, audio_data, recording_duration):
+    def _transcribe_and_insert(self, audio_data: np.ndarray, recording_duration: float) -> None:
         """Transcribe audio and insert text (runs in separate thread)"""
         try:
             # Transcribe
@@ -218,6 +222,11 @@ class KuiskausMenuBarApp(rumps.App):
         try:
             old_transcriber = self.transcriber
             self.transcriber: Transcriber = WhisperTranscriber(model_name=model_name)
+            if not isinstance(self.transcriber, Transcriber):
+                raise TypeError(
+                    f"Transcriber implementation {type(self.transcriber)} does not satisfy "
+                    "the Transcriber protocol"
+                )
             old_transcriber.cleanup()
 
             self.update_status("🟢 Ready")

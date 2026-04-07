@@ -1,6 +1,6 @@
 """Transcriber Protocol for speech-to-text backends."""
 
-from typing import Protocol, runtime_checkable, TypedDict
+from typing import Any, Protocol, runtime_checkable, TypedDict
 import numpy as np
 
 
@@ -16,7 +16,7 @@ class TranscriptionResult(_TranscriptionBase, total=False):
     The 'text' field is always required. Other fields are optional.
     """
 
-    segments: list
+    segments: list[Any]
     language: str
     transcribe_time: float
     audio_duration: float

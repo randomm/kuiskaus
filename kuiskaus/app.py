@@ -10,6 +10,8 @@ import threading
 import time
 from datetime import datetime
 
+import numpy as np
+
 from .audio_recorder import AudioRecorder
 from .whisper_transcriber import WhisperTranscriber
 from .transcriber import Transcriber
@@ -38,9 +40,11 @@ class KuiskausApp:
         # Initialize components
         self.audio_recorder = AudioRecorder()
         self.transcriber: Transcriber = WhisperTranscriber(model_name=model_name)
-        assert isinstance(self.transcriber, Transcriber), (
-            f"Transcriber implementation {type(self.transcriber)} does not satisfy the Transcriber protocol"
-        )
+        if not isinstance(self.transcriber, Transcriber):
+            raise TypeError(
+                f"Transcriber implementation {type(self.transcriber)} does not satisfy "
+                "the Transcriber protocol"
+            )
         self.text_inserter = TextInserter()
 
         # State
@@ -85,7 +89,7 @@ class KuiskausApp:
             else:
                 print("No audio recorded")
 
-    def _transcribe_and_insert(self, audio_data, recording_duration):
+    def _transcribe_and_insert(self, audio_data: np.ndarray, recording_duration: float) -> None:
         """Transcribe audio and insert text (runs in separate thread)"""
         try:
             print("🤖 Transcribing...")
