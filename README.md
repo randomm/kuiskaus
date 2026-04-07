@@ -1,58 +1,61 @@
 # Kuiskaus 🎤
 
-A fast, local speech-to-text application for Apple Silicon Macs using OpenAI's Whisper V3 Turbo model with MLX optimization. Hold a hotkey to record your voice, release to transcribe and automatically insert the text at your cursor position.
+Hold a hotkey to record your voice, release to transcribe and automatically paste the text at your cursor. All processing happens on your Apple Silicon Mac — no internet required after setup.
 
 ## Features
 
-- **Blazing Fast**: Leverages Apple Silicon's Neural Engine via MLX for 8-15x real-time transcription
-- **Global Hotkey**: Hold Control+Option (⌃⌥) to record from anywhere
-- **Automatic Text Insertion**: Transcribed text is automatically typed at your cursor position
-- **Menu Bar App**: Unobtrusive menu bar interface with easy access to settings
-- **100% Local**: All processing happens on your Mac - no internet required after setup
-- **Privacy First**: Your audio never leaves your device
+- **Fast transcription**: 8-15x real-time using Apple Silicon's Neural Engine
+- **Global hotkey**: Hold Control+Option (⌃⌥) to record from anywhere
+- **Automatic text insertion**: Transcribed text types at your cursor position
+- **Menu bar interface**: Unobtrusive status control and settings
+- **100% local**: Your audio never leaves your Mac
 
 ## Requirements
 
-- **macOS 12.0 or later**
-- **Apple Silicon Mac (M1/M2/M3)** - Required
-- **Python 3.8 or higher**
-- **~1.5GB disk space** for the Whisper model
-- **8GB RAM minimum** (16GB recommended)
-
-⚠️ **Note**: This application is optimized exclusively for Apple Silicon and does not support Intel-based Macs.
+- macOS 12.0 or later
+- Apple Silicon Mac (M1/M2/M3) — Intel not supported
+- Python 3.8 or higher
+- ~1.5GB disk space for the Whisper model
+- 8GB RAM minimum (16GB recommended)
 
 ## Installation
 
 ### Quick Install
 
-1. Clone this repository:
+Run the setup script. It handles everything:
+
 ```bash
 git clone https://github.com/randomm/kuiskaus.git
 cd kuiskaus
-```
-
-2. Run the setup script:
-```bash
 ./setup.sh
 ```
 
-The setup script will:
-- Verify you're running on Apple Silicon
-- Install UV for ultra-fast package management
-- Install system dependencies (portaudio, ffmpeg)
-- Create a Python virtual environment
-- Install all Python dependencies including MLX
-- Download the Whisper V3 Turbo model (~1.5GB)
-- Create launch scripts
+The script:
+- Verifies you're on Apple Silicon
+- Installs UV for fast package management
+- Installs system dependencies (portaudio, ffmpeg)
+- Installs Python dependencies including MLX
+- Downloads the Whisper V3 Turbo model (~1.5GB)
 
-3. Grant accessibility permissions when prompted:
-   - Go to System Settings > Privacy & Security > Accessibility
-   - Add and enable Terminal (or your terminal app)
-   - Restart the app after granting permissions
+After installation completes, grant accessibility permissions:
+
+1. Open System Settings > Privacy & Security > Accessibility
+2. Add your terminal app and enable it
+3. Restart Kuiskaus
+
+### Upgrading
+
+Remove your virtual environment and reinstall:
+
+```bash
+rm -rf .venv && ./setup.sh
+```
+
+This ensures all dependencies update cleanly.
 
 ### Manual Installation
 
-If the setup script fails, you can install manually:
+If the setup script fails, install manually:
 
 ```bash
 # Verify Apple Silicon
@@ -67,25 +70,21 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Install system dependencies
 brew install portaudio ffmpeg
 
-# Create virtual environment
-uv venv
-source .venv/bin/activate
-
 # Install Python packages
-uv pip compile requirements.in -o requirements.txt
-uv pip sync requirements.txt
+uv sync --group dev
 ```
+
+Grant accessibility permissions as shown in Quick Install above.
 
 ## Usage
 
 ### Menu Bar App (Recommended)
 
-Launch the menu bar version:
 ```bash
 ./launch_kuiskaus.sh
 ```
 
-The app will appear in your menu bar as a microphone icon (🎤). Click it to:
+Click the microphone icon (🎤) in your menu bar to:
 - See current status
 - Enable/disable speech recognition
 - Change Whisper model size
@@ -94,78 +93,80 @@ The app will appear in your menu bar as a microphone icon (🎤). Click it to:
 
 ### CLI Version
 
-For a command-line interface:
 ```bash
 ./launch_cli.sh
 ```
 
-### How to Use
+### How It Works
 
-1. **Start the app** using one of the methods above
-2. **Hold Control+Option (⌃⌥)** to start recording
-3. **Speak clearly** into your microphone
-4. **Release the keys** to stop recording and transcribe
-5. **The text will be automatically inserted** at your cursor position
+1. Hold Control+Option (⌃⌥) to start recording
+2. Speak clearly into your microphone
+3. Release the keys to stop recording and transcribe
+4. Text appears at your cursor position
 
 ## Performance
 
-With MLX optimization on Apple Silicon:
+MLX optimization on Apple Silicon provides:
 - **Whisper V3 Turbo**: 8-15x real-time (0.3-0.6s for 5s audio)
-- **Model loads in ~1-2 seconds**
-- **Leverages Neural Engine** for maximum efficiency
-- **Minimal CPU usage** during transcription
+- **Model load**: ~1-2 seconds
+- **Hardware acceleration**: Neural Engine utilization
+- **Low CPU usage**: during transcription
 
 ## Configuration
 
-### Available Models
+### Model Selection
 
-The menu bar app allows you to switch between different Whisper models:
-- **Turbo** (default): Fastest, optimized for speed
-- **Base**: Smallest model, ultra-fast
-- **Small**: Good balance of speed and accuracy
-- **Medium**: Better accuracy, slower
-- **Large**: Best accuracy, slowest
+The menu bar app lets you switch between Whisper models:
 
-### Changing the Hotkey
+| Model | Speed | Accuracy |
+|-------|-------|----------|
+| Turbo | Fastest | Good |
+| Base | Fastest | Basic |
+| Small | Fast | Balanced |
+| Medium | Slower | Better |
+| Large | Slowest | Best |
 
-To modify the hotkey, edit `kuiskaus/hotkey_listener_cgevent.py` and change the `required_modifiers`.
+### Hotkey Modification
+
+Edit `kuiskaus/hotkey_listener_cgevent.py` and change `required_modifiers`.
 
 ## Troubleshooting
 
 ### "Accessibility permissions required"
-- Grant permissions in System Settings > Privacy & Security > Accessibility
-- Add your terminal application to the list and enable it
-- Restart the app after granting permissions
 
-### No audio is being recorded
-- Check that your microphone is working in other apps
-- Ensure no other app is exclusively using the microphone
-- Try selecting a different audio input device in System Settings
+Grant permissions in System Settings > Privacy & Security > Accessibility. Add your terminal app and enable it. Restart Kuiskaus after granting permissions.
 
-### Text not being inserted
-- Some applications may block programmatic text input
-- Try using the clipboard paste method (longer text is automatically pasted)
-- Ensure the target application has focus when releasing the hotkey
+### No audio recorded
 
-### Model loading is slow
-- First-time model download can take several minutes (~1.5GB)
-- The model is cached locally after first download
-- Subsequent loads take only 1-2 seconds
+1. Verify your microphone works in other apps
+2. Ensure no other app uses the microphone exclusively
+3. Try a different audio input device in System Settings
 
-## Known Issues
+### Text not inserted
 
-- **Info.plist notification error**: If you see errors about Info.plist when running from a virtual environment, this is a known issue with rumps. The app will still work, but notifications may not display correctly.
+1. Some applications block programmatic text input
+2. Longer text uses clipboard paste automatically
+3. Ensure the target application has focus when releasing the hotkey
+
+### Slow model loading
+
+First-time download takes several minutes (~1.5GB). The model caches locally after download. Subsequent loads take 1-2 seconds.
+
+### Info.plist notification error
+
+You may see Info.plist errors when running from a virtual environment. This is a known rumps issue. The app still works, but notifications may not display correctly.
 
 ## Privacy & Security
 
-- **100% Local**: All speech processing happens on-device
-- **No Internet Required**: Works completely offline after setup
-- **No Data Collection**: Your audio and transcriptions never leave your Mac
-- **Open Source**: Full source code available for inspection
+- **On-device processing**: All transcription happens locally
+- **No internet required**: Works completely offline after setup
+- **No data collection**: Your audio and transcriptions never leave your Mac
+- **Open source**: Full source code available for inspection
 
 ## Development
 
 ### Project Structure
+
 ```
 kuiskaus/
 ├── kuiskaus/               # Core application package
@@ -180,37 +181,56 @@ kuiskaus/
 ├── launch_kuiskaus.sh      # Menu bar launcher
 ├── launch_cli.sh           # CLI launcher
 ├── run_tests.sh            # Test runner
-├── requirements.in         # Direct dependencies
-├── requirements.txt        # Locked dependencies
+├── pyproject.toml          # Project metadata and dependencies
+├── uv.lock                 # Locked dependencies (auto-generated)
 └── README.md
 ```
+
+### Setup
+
+```bash
+uv sync --group dev
+```
+
+This installs all dependencies including the `ty` type checker.
 
 ### Testing
 
 Run the test suite:
+
 ```bash
 ./run_tests.sh
 ```
 
 ### Updating Dependencies
 
-If you modify `requirements.in`, regenerate the locked dependencies:
+After modifying `pyproject.toml`, regenerate the lockfile:
+
 ```bash
-uv pip compile requirements.in -o requirements.txt
-uv pip sync requirements.txt
+uv lock
+uv sync --group dev
+```
+
+### Code Quality
+
+```bash
+# Linting
+uv run ruff check kuiskaus/ tests/
+
+# Type checking
+uv run ty check kuiskaus/
+
+# Formatting
+uv run ruff format kuiskaus/ tests/
 ```
 
 ## Contributing
 
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
+Contributions are welcome! See the project structure above for code organization. Follow conventional commits format (`feat:`, `fix:`, `refactor:`, etc.) and name branches as `feature/issue-{number}-short-description`.
 
 ## License
 
-MIT License - see LICENSE file for details
+MIT License — see LICENSE file for details.
 
 ## Acknowledgments
 
@@ -220,4 +240,4 @@ MIT License - see LICENSE file for details
 
 ---
 
-**Note**: "Kuiskaus" is Finnish for "whisper" 🇫🇮
+*"Kuiskaus" is Finnish for "whisper"* 🇫🇮

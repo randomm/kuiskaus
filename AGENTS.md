@@ -48,7 +48,7 @@ All of the following MUST pass locally before any `git push`. CI is for verifica
 uv run ruff check kuiskaus/ tests/
 
 # Type checking
-uv run mypy kuiskaus/
+uv run ty check kuiskaus/
 
 # Format check
 uv run ruff format --check kuiskaus/ tests/
@@ -85,7 +85,7 @@ uv run pytest --cov=kuiskaus --cov-report=term-missing tests/
 - **Python version**: 3.8+ compatible (see `.python-version`)
 - **Formatter**: ruff format
 - **Linter**: ruff check
-- **Type checker**: mypy
+- **Type checker**: ty
 - **Line length**: 88 characters (ruff default)
 - **Imports**: isort-compatible (ruff handles this)
 
@@ -176,11 +176,12 @@ uv run ruff format kuiskaus/ tests/          # Format
 uv run ruff format --check kuiskaus/ tests/  # Format check only
 
 # Type checking
-uv run mypy kuiskaus/
+uv run ty check kuiskaus/
 
 # Dependency management
-uv pip compile requirements.in -o requirements.txt  # Relock deps
-uv pip sync requirements.txt                         # Install locked deps
+uv sync                # Install runtime deps
+uv sync --group dev    # Install all deps including dev tools (ty)
+uv lock                # Regenerate uv.lock after editing pyproject.toml
 ```
 
 ---

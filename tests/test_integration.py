@@ -144,7 +144,7 @@ def test_rumps_availability():
         return True
     except ImportError:
         print("❌ rumps not installed (required for menu bar app)")
-        print("   Install with: pip install rumps")
+        print("   Install with: uv sync")
         return False
 
 def test_system_info():
@@ -223,7 +223,7 @@ def main():
         print("\n⚠️  Some tests failed. Please check the errors above.")
         print("\nCommon fixes:")
         print("- Grant accessibility permissions in System Preferences")
-        print("- Install missing dependencies with: pip install -r requirements.txt")
+        print("- Install missing dependencies with: uv sync --group dev")
         print("- Restart Terminal after granting permissions")
         return 1
 

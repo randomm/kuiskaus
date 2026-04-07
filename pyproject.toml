@@ -1,0 +1,22 @@
+[project]
+name = "kuiskaus"
+version = "0.1.0"
+requires-python = ">=3.8"
+dependencies = [
+    "pyobjc-core",
+    "pyobjc-framework-Cocoa",
+    "pyobjc-framework-Quartz",
+    "pyobjc-framework-ApplicationServices",
+    "pyaudio",
+    "numpy",
+    "mlx-whisper",
+    "numba>=0.57.0",
+    "rumps",
+    "python-dotenv",
+]
+
+[dependency-groups]
+dev = ["ty"]
+
+[tool.ty.environment]
+python-version = "3.11"
