@@ -13,6 +13,7 @@ import numpy as np
 
 from .audio_recorder import AudioRecorder
 from .whisper_transcriber import WhisperTranscriber
+from .parakeet_transcriber import ParakeetTranscriber
 from .transcriber import Transcriber
 from .hotkey_listener_cgevent import HotkeyListenerCGEvent
 from .text_inserter import TextInserter
@@ -29,7 +30,7 @@ class KuiskausMenuBarApp(rumps.App):
 
         # Initialize components
         self.audio_recorder = AudioRecorder()
-        self.transcriber: Transcriber = WhisperTranscriber(model_name="turbo")
+        self.transcriber: Transcriber = ParakeetTranscriber()
         if not isinstance(self.transcriber, Transcriber):
             raise TypeError(
                 f"Transcriber implementation {type(self.transcriber)} does not satisfy "
@@ -86,7 +87,13 @@ class KuiskausMenuBarApp(rumps.App):
         model_menu = rumps.MenuItem("Model")
         model_menu.add(
             rumps.MenuItem(
-                "Turbo (Fastest)", callback=lambda _: self.change_model("turbo")
+                "Parakeet TDT 0.6B v3 (Default)",
+                callback=lambda _: self.change_model("parakeet"),
+            )
+        )
+        model_menu.add(
+            rumps.MenuItem(
+                "Whisper Turbo", callback=lambda _: self.change_model("turbo")
             )
         )
         model_menu.add(
@@ -247,7 +254,12 @@ class KuiskausMenuBarApp(rumps.App):
         """Reload the model in background"""
         try:
             old_transcriber = self.transcriber
-            self.transcriber: Transcriber = WhisperTranscriber(model_name=model_name)
+            if model_name == "parakeet":
+                self.transcriber: Transcriber = ParakeetTranscriber()
+            else:
+                self.transcriber: Transcriber = WhisperTranscriber(
+                    model_name=model_name
+                )
             if not isinstance(self.transcriber, Transcriber):
                 raise TypeError(
                     f"Transcriber implementation {type(self.transcriber)} does not satisfy "
