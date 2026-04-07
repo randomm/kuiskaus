@@ -93,6 +93,12 @@ class KuiskausMenuBarApp(rumps.App):
         )
         model_menu.add(
             rumps.MenuItem(
+                "Voxtral Realtime",
+                callback=lambda _: self.change_model("voxtral"),
+            )
+        )
+        model_menu.add(
+            rumps.MenuItem(
                 "Whisper Turbo", callback=lambda _: self.change_model("turbo")
             )
         )
@@ -256,6 +262,10 @@ class KuiskausMenuBarApp(rumps.App):
             old_transcriber = self.transcriber
             if model_name == "parakeet":
                 self.transcriber: Transcriber = ParakeetTranscriber()
+            elif model_name == "voxtral":
+                from .voxtral_transcriber import VoxtralTranscriber
+
+                self.transcriber: Transcriber = VoxtralTranscriber()
             else:
                 self.transcriber: Transcriber = WhisperTranscriber(
                     model_name=model_name

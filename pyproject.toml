@@ -10,6 +10,7 @@ dependencies = [
     "pyaudio",
     "numpy",
     "mlx-whisper",
+    "mlx-voxtral",
     "parakeet-mlx",
     "numba>=0.57.0",
     "rumps",

@@ -27,7 +27,7 @@ except ImportError:
     HAS_NOTIFICATIONS = False
 
 
-ALLOWED_MODELS = {"turbo", "base", "small", "medium", "large", "parakeet"}
+ALLOWED_MODELS = {"turbo", "base", "small", "medium", "large", "parakeet", "voxtral"}
 
 
 class KuiskausApp:
@@ -45,6 +45,10 @@ class KuiskausApp:
         self.audio_recorder = AudioRecorder()
         if model_name == "parakeet":
             self.transcriber: Transcriber = ParakeetTranscriber()
+        elif model_name == "voxtral":
+            from .voxtral_transcriber import VoxtralTranscriber
+
+            self.transcriber: Transcriber = VoxtralTranscriber()
         else:
             self.transcriber: Transcriber = WhisperTranscriber(model_name=model_name)
         if not isinstance(self.transcriber, Transcriber):
