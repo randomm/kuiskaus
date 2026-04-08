@@ -4,7 +4,9 @@ Hold a hotkey to record your voice, release to transcribe and automatically past
 
 ## Features
 
-- **Fast transcription**: 8-15x real-time using Apple Silicon's Neural Engine
+- **Fast transcription**: Parakeet TDT 0.6B v3 by default — 10x faster than Whisper with 17% better accuracy
+- **Multiple STT backends**: Parakeet (default), Voxtral Realtime (Mistral), or Whisper — switchable from menu bar
+- **Optional LLM cleanup**: Post-process transcriptions with apfel for punctuation, filler word removal, and technical term correction
 - **Global hotkey**: Hold Control+Option (⌃⌥) to record from anywhere
 - **Automatic text insertion**: Transcribed text types at your cursor position
 - **Menu bar interface**: Unobtrusive status control and settings
@@ -14,8 +16,8 @@ Hold a hotkey to record your voice, release to transcribe and automatically past
 
 - macOS 12.0 or later
 - Apple Silicon Mac (M1/M2/M3) — Intel not supported
-- Python 3.8 or higher
-- ~1.5GB disk space for the Whisper model
+- Python 3.11 or higher
+- ~600MB–1.5GB disk space depending on model (Parakeet: ~600MB, Whisper Turbo: ~1.5GB)
 - 8GB RAM minimum (16GB recommended)
 
 ## Installation
@@ -35,7 +37,7 @@ The script:
 - Installs UV for fast package management
 - Installs system dependencies (portaudio, ffmpeg)
 - Installs Python dependencies including MLX
-- Downloads the Whisper V3 Turbo model (~1.5GB)
+- Downloads the Parakeet TDT 0.6B v3 model (~600MB) by default
 
 After installation completes, grant accessibility permissions:
 
@@ -87,14 +89,27 @@ Grant accessibility permissions as shown in Quick Install above.
 Click the microphone icon (🎤) in your menu bar to:
 - See current status
 - Enable/disable speech recognition
-- Change Whisper model size
+- Change STT model (Parakeet, Voxtral, or Whisper)
+- Toggle LLM cleanup (apfel)
 - View usage statistics
 - Quit the app
 
 ### CLI Version
 
 ```bash
-./launch_cli.sh
+./launch_cli.sh [model] [--apfel]
+```
+
+Optional arguments:
+- `model` — STT backend to use. Options: `parakeet` (default), `voxtral`, `turbo`, `base`, `small`, `medium`, `large`
+- `--apfel` — enable LLM post-processing to clean punctuation, remove filler words, and fix technical terms (requires `apfel` CLI tool)
+
+Examples:
+```bash
+./launch_cli.sh                    # Parakeet (default)
+./launch_cli.sh turbo              # Whisper V3 Turbo
+./launch_cli.sh parakeet --apfel   # Parakeet with LLM cleanup
+./launch_cli.sh voxtral            # Voxtral Realtime (Mistral)
 ```
 
 ### How It Works
@@ -106,25 +121,41 @@ Click the microphone icon (🎤) in your menu bar to:
 
 ## Performance
 
-MLX optimization on Apple Silicon provides:
-- **Whisper V3 Turbo**: 8-15x real-time (0.3-0.6s for 5s audio)
-- **Model load**: ~1-2 seconds
-- **Hardware acceleration**: Neural Engine utilization
-- **Low CPU usage**: during transcription
+| Model | Speed | Word Error Rate | Notes |
+|-------|-------|----------------|-------|
+| Parakeet TDT 0.6B v3 | ~10x real-time | 6.32% WER | Default; best speed/accuracy balance |
+| Voxtral Mini 3B | Sub-200ms | ~4% WER | 13 languages; higher RAM usage |
+| Whisper V3 Turbo | 8-15x real-time | 7.6% WER | Legacy fallback |
+| Whisper Large | 4-8x real-time | 5.8% WER | Highest accuracy of Whisper family |
+
+All models run locally on Apple Silicon via MLX. First use downloads the model and caches it.
 
 ## Configuration
 
 ### Model Selection
 
-The menu bar app lets you switch between Whisper models:
+Switch models from the menu bar **Model** submenu, or pass as CLI argument:
 
-| Model | Speed | Accuracy |
-|-------|-------|----------|
-| Turbo | Fastest | Good |
-| Base | Fastest | Basic |
-| Small | Fast | Balanced |
-| Medium | Slower | Better |
-| Large | Slowest | Best |
+| Model | CLI name | Speed | Accuracy | Size |
+|-------|----------|-------|----------|------|
+| Parakeet TDT 0.6B v3 | `parakeet` | ⚡ Fastest | ★★★★ 6.32% WER | ~600MB |
+| Voxtral Mini 3B | `voxtral` | ⚡ Fast | ★★★★★ ~4% WER | ~2GB |
+| Whisper V3 Turbo | `turbo` | ⚡ Fast | ★★★ 7.6% WER | ~1.5GB |
+| Whisper Small | `small` | Fast | ★★ | ~250MB |
+| Whisper Medium | `medium` | Moderate | ★★★ | ~750MB |
+| Whisper Large | `large` | Slower | ★★★★ 5.8% WER | ~3GB |
+
+### LLM Post-Processing (apfel)
+
+When enabled, each transcription is cleaned up by a local LLM via the `apfel` tool:
+- Fixes punctuation and capitalisation
+- Removes filler words (um, uh, er)
+- Corrects common technical term mistranscriptions (e.g. "pie test" → pytest, "get hub" → GitHub)
+
+Enable via: menu bar **LLM Cleanup (apfel)** toggle, or `--apfel` CLI flag.
+
+Requires `apfel` to be installed separately. Falls back to raw transcription if unavailable.
+See the apfel documentation for installation instructions.
 
 ### Hotkey Modification
 
@@ -150,7 +181,7 @@ Grant permissions in System Settings > Privacy & Security > Accessibility. Add y
 
 ### Slow model loading
 
-First-time download takes several minutes (~1.5GB). The model caches locally after download. Subsequent loads take 1-2 seconds.
+First-time download takes a few minutes (Parakeet: ~600MB, Whisper Turbo: ~1.5GB). The model caches locally after download. Subsequent loads take 1-2 seconds.
 
 ### Info.plist notification error
 
@@ -170,12 +201,16 @@ You may see Info.plist errors when running from a virtual environment. This is a
 ```
 kuiskaus/
 ├── kuiskaus/               # Core application package
-│   ├── audio_recorder.py   # PyAudio-based recording
-│   ├── whisper_transcriber.py # MLX Whisper integration
+│   ├── transcriber.py          # Transcriber protocol (interface)
+│   ├── parakeet_transcriber.py # Parakeet TDT 0.6B v3 backend
+│   ├── voxtral_transcriber.py  # Voxtral Realtime backend
+│   ├── whisper_transcriber.py  # MLX Whisper backend
+│   ├── postprocessor.py        # apfel LLM post-processing
+│   ├── audio_recorder.py       # PyAudio-based recording
 │   ├── hotkey_listener_cgevent.py # Global hotkey detection
-│   ├── text_inserter.py    # Text insertion at cursor
-│   ├── app.py              # CLI application
-│   └── menubar.py          # Menu bar application
+│   ├── text_inserter.py        # Text insertion at cursor
+│   ├── app.py                  # CLI application
+│   └── menubar.py              # Menu bar application
 ├── tests/                  # Test suite
 ├── setup.sh                # Installation script
 ├── launch_kuiskaus.sh      # Menu bar launcher
@@ -234,6 +269,8 @@ MIT License — see LICENSE file for details.
 
 ## Acknowledgments
 
+- NVIDIA / Senstella for the Parakeet TDT model
+- Mistral AI for the Voxtral model
 - OpenAI for the Whisper model
 - Apple for the MLX framework
 - The Python community for excellent macOS integration libraries
