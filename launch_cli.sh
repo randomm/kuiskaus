@@ -8,4 +8,5 @@ cd "$SCRIPT_DIR"
 source .venv/bin/activate
 
 # Launch the CLI version
-python3 -m kuiskaus.app "$@"
+echo "Starting Kuiskaus CLI..."
+python3 -u -m kuiskaus.app "$@"
