@@ -80,27 +80,24 @@ uv sync --group dev || { echo -e "${RED}Error: Failed to install dependencies${N
 source .venv/bin/activate
 echo -e "${GREEN}✓ Virtual environment created and dependencies installed${NC}"
 
-# Pre-download Whisper model
+# Pre-download Parakeet model
 echo
-echo "Checking Whisper V3 Turbo model..."
+echo "Checking Parakeet TDT 0.6B v3 model..."
 python3 -c "
 import os
-import mlx_whisper
 
 # Check if model is already cached
 cache_dir = os.path.expanduser('~/.cache/huggingface/hub')
-turbo_model = 'models--mlx-community--whisper-large-v3-turbo'
+parakeet_model = 'models--mlx-community--parakeet-tdt-0-6b-v3'
 
-if os.path.exists(os.path.join(cache_dir, turbo_model)):
-    print('✓ Turbo model already cached')
+if os.path.exists(os.path.join(cache_dir, parakeet_model)):
+    print('✓ Parakeet model already cached')
 else:
-    print('Downloading MLX Whisper V3 Turbo model...')
-    print('Note: This will take 5-10 minutes (~1.5GB)')
-    
-    # Pre-download the model
-    model_path = 'mlx-community/whisper-large-v3-turbo'
-    model = mlx_whisper.load_models.load_model(model_path)
-    print('✓ MLX Turbo model downloaded successfully')
+    print('Downloading Parakeet TDT 0.6B v3 model...')
+    print('Note: This will take 2-5 minutes (~600MB)')
+    from parakeet_mlx import from_pretrained
+    model = from_pretrained('mlx-community/parakeet-tdt-0.6b-v3')
+    print('✓ Parakeet model downloaded successfully')
 "
 
 # Create launch script
@@ -137,7 +134,7 @@ cd "$SCRIPT_DIR"
 source .venv/bin/activate
 
 # Launch the CLI version
-python3 -m kuiskaus.app
+python3 -m kuiskaus.app "$@"
 EOL
 
 chmod +x launch_cli.sh

@@ -31,12 +31,12 @@ ALLOWED_MODELS = {"turbo", "base", "small", "medium", "large", "parakeet", "voxt
 
 
 class KuiskausApp:
-    def __init__(self, model_name: str = "turbo", use_apfel: bool = False):
+    def __init__(self, model_name: str = "parakeet", use_apfel: bool = False):
         """
         Initialize the Kuiskaus application
 
         Args:
-            model_name: Whisper model to use (default: "turbo" for V3 Turbo)
+            model_name: STT model to use (default: "parakeet")
             use_apfel: Whether to use LLM cleanup with apfel (default: False)
         """
         print("Initializing Kuiskaus...")
@@ -224,7 +224,7 @@ def main():
         sys.exit(1)
 
     # Parse arguments (simple for now)
-    model_name = "turbo"
+    model_name = "parakeet"
     use_apfel = "--apfel" in sys.argv
     args = [arg for arg in sys.argv[1:] if arg != "--apfel"]
     if args:
