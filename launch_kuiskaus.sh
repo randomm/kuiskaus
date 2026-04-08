@@ -8,4 +8,5 @@ cd "$SCRIPT_DIR"
 source .venv/bin/activate
 
 # Launch the application (menu bar version by default)
-python3 -m kuiskaus.menubar
+echo "Starting Kuiskaus..."
+python3 -u -m kuiskaus.menubar

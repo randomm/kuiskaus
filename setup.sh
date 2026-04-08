@@ -94,7 +94,7 @@ if os.path.exists(os.path.join(cache_dir, parakeet_model)):
     print('✓ Parakeet model already cached')
 else:
     print('Downloading Parakeet TDT 0.6B v3 model...')
-    print('Note: This will take 2-5 minutes (~600MB)')
+    print('Note: This will take 5-15 minutes (~2.5GB)')
     from parakeet_mlx import from_pretrained
     model = from_pretrained('mlx-community/parakeet-tdt-0.6b-v3')
     print('✓ Parakeet model downloaded successfully')
@@ -114,7 +114,8 @@ cd "$SCRIPT_DIR"
 source .venv/bin/activate
 
 # Launch the application (menu bar version by default)
-python3 -m kuiskaus.menubar
+echo "Starting Kuiskaus..."
+python3 -u -m kuiskaus.menubar
 EOL
 
 chmod +x launch_kuiskaus.sh
@@ -134,7 +135,8 @@ cd "$SCRIPT_DIR"
 source .venv/bin/activate
 
 # Launch the CLI version
-python3 -m kuiskaus.app "$@"
+echo "Starting Kuiskaus CLI..."
+python3 -u -m kuiskaus.app "$@"
 EOL
 
 chmod +x launch_cli.sh

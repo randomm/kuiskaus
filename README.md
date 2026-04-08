@@ -17,7 +17,7 @@ Hold a hotkey to record your voice, release to transcribe and automatically past
 - macOS 12.0 or later
 - Apple Silicon Mac (M1/M2/M3) — Intel not supported
 - Python 3.11 or higher
-- ~600MB–1.5GB disk space depending on model (Parakeet: ~600MB, Whisper Turbo: ~1.5GB)
+- ~1.5GB–2.5GB disk space depending on model (Parakeet: ~2.5GB, Whisper Turbo: ~1.5GB)
 - 8GB RAM minimum (16GB recommended)
 
 ## Installation
@@ -37,7 +37,7 @@ The script:
 - Installs UV for fast package management
 - Installs system dependencies (portaudio, ffmpeg)
 - Installs Python dependencies including MLX
-- Downloads the Parakeet TDT 0.6B v3 model (~600MB) by default
+- Downloads the Parakeet TDT 0.6B v3 model (~2.5GB) by default
 
 After installation completes, grant accessibility permissions:
 
@@ -138,7 +138,7 @@ Switch models from the menu bar **Model** submenu, or pass as CLI argument:
 
 | Model | CLI name | Speed | Accuracy | Size |
 |-------|----------|-------|----------|------|
-| Parakeet TDT 0.6B v3 | `parakeet` | ⚡ Fastest | ★★★★ 6.32% WER | ~600MB |
+| Parakeet TDT 0.6B v3 | `parakeet` | ⚡ Fastest | ★★★★ 6.32% WER | ~2.5GB |
 | Voxtral Mini 3B | `voxtral` | ⚡ Fast | ★★★★★ ~4% WER | ~2GB |
 | Whisper V3 Turbo | `turbo` | ⚡ Fast | ★★★ 7.6% WER | ~1.5GB |
 | Whisper Small | `small` | Fast | ★★ | ~250MB |
@@ -181,7 +181,7 @@ Grant permissions in System Settings > Privacy & Security > Accessibility. Add y
 
 ### Slow model loading
 
-First-time download takes a few minutes (Parakeet: ~600MB, Whisper Turbo: ~1.5GB). The model caches locally after download. Subsequent loads take 1-2 seconds.
+First-time download takes several minutes (Parakeet: ~2.5GB, Whisper Turbo: ~1.5GB). The model caches locally after download. Subsequent loads take 1-2 seconds.
 
 ### Info.plist notification error
 
