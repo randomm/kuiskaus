@@ -1,11 +1,13 @@
 """Voxtral Realtime (Mistral) transcriber for Apple Silicon."""
 
+import os
 import tempfile
-import time
 import threading
+import time
 import wave
+from typing import TYPE_CHECKING, Optional
+
 import numpy as np
-from typing import Optional, TYPE_CHECKING
 
 from .transcriber import TranscriptionResult
 
@@ -62,9 +64,7 @@ class VoxtralTranscriber:
                 wf.setframerate(sample_rate)
                 wf.writeframes(audio_int16.tobytes())
         except Exception:
-            import os as _os
-
-            _os.unlink(tmp_path)
+            os.unlink(tmp_path)
             raise
         return tmp_path
 
@@ -77,8 +77,6 @@ class VoxtralTranscriber:
 
         if audio.dtype != np.float32:
             audio = audio.astype(np.float32)
-
-        import os
 
         text = ""
         transcribe_time = 0.0

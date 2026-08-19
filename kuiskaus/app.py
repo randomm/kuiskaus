@@ -83,23 +83,28 @@ class KuiskausApp:
 
     def on_hotkey_release(self):
         """Called when hotkey is released"""
-        if self.is_recording:
-            self.is_recording = False
-            recording_duration = time.time() - self.recording_start_time
+        if not self.is_recording:
+            # No active recording: harmless no-op (e.g. release whose press
+            # was lost, or a spurious release event).
+            print("⏹️  Not recording - ignoring release")
+            return
 
-            print(f"⏹️  Stopped recording ({recording_duration:.1f}s)")
+        self.is_recording = False
+        recording_duration = time.time() - self.recording_start_time
 
-            # Stop recording and get audio
-            audio_data = self.audio_recorder.stop_recording()
+        print(f"⏹️  Stopped recording ({recording_duration:.1f}s)")
 
-            if len(audio_data) > 0:
-                # Transcribe in a separate thread to avoid blocking
-                threading.Thread(
-                    target=self._transcribe_and_insert,
-                    args=(audio_data, recording_duration),
-                ).start()
-            else:
-                print("No audio recorded")
+        # Stop recording and get audio
+        audio_data = self.audio_recorder.stop_recording()
+
+        if len(audio_data) > 0:
+            # Transcribe in a separate thread to avoid blocking
+            threading.Thread(
+                target=self._transcribe_and_insert,
+                args=(audio_data, recording_duration),
+            ).start()
+        else:
+            print("No audio recorded")
 
     def _transcribe_and_insert(
         self, audio_data: np.ndarray, recording_duration: float

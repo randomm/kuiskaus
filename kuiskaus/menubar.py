@@ -191,25 +191,29 @@ class KuiskausMenuBarApp(rumps.App):
         if not self.enabled:
             return
 
-        if self.is_recording:
-            self.is_recording = False
-            recording_duration = time.time() - self.recording_start_time
+        if not self.is_recording:
+            # No active recording: nothing to stop. Restore Ready status.
+            self.update_status("🟢 Ready")
+            return
 
-            # Update UI
-            self.title = "🎤"
-            self.update_status("🟡 Processing...")
+        self.is_recording = False
+        recording_duration = time.time() - self.recording_start_time
 
-            # Stop recording and get audio
-            audio_data = self.audio_recorder.stop_recording()
+        # Update UI
+        self.title = "🎤"
+        self.update_status("🟡 Processing...")
 
-            if len(audio_data) > 0:
-                # Transcribe in a separate thread
-                threading.Thread(
-                    target=self._transcribe_and_insert,
-                    args=(audio_data, recording_duration),
-                ).start()
-            else:
-                self.update_status("🟢 Ready")
+        # Stop recording and get audio
+        audio_data = self.audio_recorder.stop_recording()
+
+        if len(audio_data) > 0:
+            # Transcribe in a separate thread
+            threading.Thread(
+                target=self._transcribe_and_insert,
+                args=(audio_data, recording_duration),
+            ).start()
+        else:
+            self.update_status("🟢 Ready")
 
     def _transcribe_and_insert(
         self, audio_data: np.ndarray, recording_duration: float

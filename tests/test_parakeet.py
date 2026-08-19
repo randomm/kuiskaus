@@ -6,6 +6,46 @@ from unittest.mock import MagicMock, patch
 import sys
 
 
+def _is_real_numpy(mod) -> bool:
+    """True if `mod` is the real numpy module, not a MagicMock."""
+    spec = getattr(mod, "__spec__", None)
+    return spec is not None and getattr(spec, "name", None) == "numpy"
+
+
+def _restore_real_numpy():
+    """Pop mock numpy and ALL numpy.* submodules from sys.modules, then
+    re-import the real numpy.
+
+    Popping only `numpy` (without its submodules) causes a RecursionError
+    on re-import: the import system finds `numpy.exceptions` already in
+    sys.modules but its parent `numpy` is missing, so numpy's module-level
+    `__getattr__` fires and re-triggers the partial-import cycle.
+    """
+    current = sys.modules.get("numpy")
+    if current is not None and not _is_real_numpy(current):
+        to_remove = [k for k in sys.modules if k == "numpy" or k.startswith("numpy.")]
+        for k in to_remove:
+            del sys.modules[k]
+        import numpy as _real
+
+        sys.modules["numpy"] = _real
+
+
+# test_postprocessor.py installs a MagicMock numpy for the whole session;
+# restore the real module if it was swapped out, so the local `np`
+# binding is always the real one (issue #17 full-suite ordering fix).
+_restore_real_numpy()
+if not _is_real_numpy(np):
+    np = sys.modules["numpy"]
+
+
+def _ensure_real_numpy_in_module(module):
+    """Restore real numpy in a module if an earlier test mocked it."""
+    if not _is_real_numpy(module.np):
+        module.np = np
+        sys.modules["numpy"] = np
+
+
 def make_mock_model():
     """Create a mock parakeet model."""
     mock_model = MagicMock()
@@ -27,6 +67,14 @@ sys.modules["parakeet_mlx"].from_pretrained = MagicMock(return_value=make_mock_m
 
 
 class TestParakeetTranscriber:
+    def setup_method(self):
+        """Restore real numpy in the transcriber module before each test
+        (test_postprocessor.py may have installed a MagicMock numpy for
+        the whole session before this module was imported)."""
+        import kuiskaus.parakeet_transcriber as pt
+
+        _ensure_real_numpy_in_module(pt)
+
     def _make_transcriber_with_mock(self):
         """Create a ParakeetTranscriber with mocked model (skips loading)."""
         from kuiskaus.parakeet_transcriber import ParakeetTranscriber
