@@ -186,6 +186,25 @@ uv lock                # Regenerate uv.lock after editing pyproject.toml
 
 ---
 
-## Agents May NOT Merge
+## Merge Authority
 
-Agents must NOT merge pull requests. Stop at PR creation and notify the user for manual merge.
+Agents MAY merge pull requests, but ONLY when every condition below holds:
+
+1. **All quality gates pass locally** — `./run_tests.sh`, `uv run ruff check kuiskaus/ tests/`, `uv run ty check kuiskaus/`, `uv run ruff format --check kuiskaus/ tests/`.
+2. **CI passes**, where CI exists.
+3. **Any adversarial or code-review gate attached to the work returned an approving verdict.**
+4. **The diff stays within the scope its issue declares.** A PR touching files outside the issue's stated scope or diff budget must be halted and reported — never merged, and never merged "because the extra changes look harmless".
+
+### Documented gate exemptions
+
+A ticket may explicitly record a gate as expected-to-fail — for example, a chore that declares the linter toolchain while deferring the repo-wide reformat to a separate issue. Such an exemption is valid only when **all** of the following are true:
+
+- It is written in the issue body **before** the PR is opened.
+- It names the specific gate and the issue that will resolve it.
+- It is a deliberate scoping decision, not a workaround for a failure discovered during implementation.
+
+An exemption decided at merge time is not an exemption. If a gate fails unexpectedly, that is a blocker.
+
+### When any condition is unmet
+
+Stop at PR creation, apply the `needs-human-attention` label, and notify the operator with the specific failing condition. **When in doubt, do not merge.**
