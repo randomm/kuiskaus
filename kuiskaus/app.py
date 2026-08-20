@@ -83,30 +83,35 @@ class KuiskausApp:
 
     def on_hotkey_release(self):
         """Called when hotkey is released"""
-        if self.is_recording:
-            self.is_recording = False
-            if self.recording_start_time is None:
-                print("⚠️  No start time recorded — ignoring release")
-                self.audio_recorder.stop_recording()
-                self.show_notification(
-                    "Recording error", "Missing start time; recording discarded"
-                )
-                return
-            recording_duration = time.time() - self.recording_start_time
+        if not self.is_recording:
+            # No active recording: release is a harmless no-op (#17).
+            # Never call stop_recording() without a matching press.
+            self.recording_start_time = None
+            print("✅ Ready")
+            return
+        self.is_recording = False
+        if self.recording_start_time is None:
+            print("⚠️  No start time recorded — ignoring release")
+            self.audio_recorder.stop_recording()
+            self.show_notification(
+                "Recording error", "Missing start time; recording discarded"
+            )
+            return
+        recording_duration = time.time() - self.recording_start_time
 
-            print(f"⏹️  Stopped recording ({recording_duration:.1f}s)")
+        print(f"⏹️  Stopped recording ({recording_duration:.1f}s)")
 
-            # Stop recording and get audio
-            audio_data = self.audio_recorder.stop_recording()
+        # Stop recording and get audio
+        audio_data = self.audio_recorder.stop_recording()
 
-            if len(audio_data) > 0:
-                # Transcribe in a separate thread to avoid blocking
-                threading.Thread(
-                    target=self._transcribe_and_insert,
-                    args=(audio_data, recording_duration),
-                ).start()
-            else:
-                print("No audio recorded")
+        if len(audio_data) > 0:
+            # Transcribe in a separate thread to avoid blocking
+            threading.Thread(
+                target=self._transcribe_and_insert,
+                args=(audio_data, recording_duration),
+            ).start()
+        else:
+            print("No audio recorded")
 
     def _transcribe_and_insert(
         self, audio_data: np.ndarray, recording_duration: float

@@ -1,7 +1,8 @@
-import threading
 from collections.abc import Callable
 
 import Quartz
+
+from .callback_dispatcher import CallbackDispatcher
 
 
 class HotkeyListenerCGEvent:
@@ -21,6 +22,11 @@ class HotkeyListenerCGEvent:
         self.tap = None
         self.run_loop_source = None
         self.running = False
+
+        # Shared single-threaded executor: tap callbacks enqueue the user
+        # callbacks, one worker thread drains them in event order, so a
+        # release always observes the state left by its press (issue #17).
+        self._dispatcher = CallbackDispatcher()
 
     def _check_modifiers(self, flags: int) -> bool:
         """Check if the required modifier keys are pressed"""
@@ -57,16 +63,16 @@ class HotkeyListenerCGEvent:
                     print("[DEBUG CGEvent] Hotkey pressed!")
                     self.is_pressed = True
                     if self.on_press:
-                        # Run callback in separate thread to avoid blocking
-                        threading.Thread(target=self.on_press).start()
+                        # Enqueue; worker runs it in event order without
+                        # blocking the run loop (issue #17).
+                        self._dispatcher.dispatch(self.on_press)
 
                 elif not modifiers_pressed and self.is_pressed:
                     # Hotkey released
                     print("[DEBUG CGEvent] Hotkey released!")
                     self.is_pressed = False
                     if self.on_release:
-                        # Run callback in separate thread to avoid blocking
-                        threading.Thread(target=self.on_release).start()
+                        self._dispatcher.dispatch(self.on_release)
 
         # Event tap callbacks must never crash the run loop; log and continue.
         except Exception as e:  # noqa: BLE001 - logged; run-loop guard
@@ -79,6 +85,8 @@ class HotkeyListenerCGEvent:
         """Start listening for hotkeys"""
         if not self.running:
             self.running = True
+
+            self._dispatcher.start()
 
             # Check accessibility permissions
             from ApplicationServices import AXIsProcessTrusted
@@ -145,6 +153,8 @@ class HotkeyListenerCGEvent:
                     )
                 self.tap = None
                 self.run_loop_source = None
+
+            self._dispatcher.stop()
 
             self.running = False
             self.is_pressed = False

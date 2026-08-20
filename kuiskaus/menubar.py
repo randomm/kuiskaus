@@ -191,31 +191,38 @@ class KuiskausMenuBarApp(rumps.App):
         if not self.enabled:
             return
 
-        if self.is_recording:
-            self.is_recording = False
-            if self.recording_start_time is None:
-                print("⚠️  No start time recorded — ignoring release")
-                self.audio_recorder.stop_recording()
-                self.title = "🎤"
-                self.update_status("🟢 Ready")
-                return
-            recording_duration = time.time() - self.recording_start_time
-
-            # Update UI
+        if not self.is_recording:
+            # A release that finds no active recording is a harmless no-op;
+            # restore Ready status without touching the recorder (issue #17).
+            self.recording_start_time = None
             self.title = "🎤"
-            self.update_status("🟡 Processing...")
+            self.update_status("🟢 Ready")
+            return
 
-            # Stop recording and get audio
-            audio_data = self.audio_recorder.stop_recording()
+        self.is_recording = False
+        if self.recording_start_time is None:
+            print("⚠️  No start time recorded — ignoring release")
+            self.audio_recorder.stop_recording()
+            self.title = "🎤"
+            self.update_status("🟢 Ready")
+            return
+        recording_duration = time.time() - self.recording_start_time
 
-            if len(audio_data) > 0:
-                # Transcribe in a separate thread
-                threading.Thread(
-                    target=self._transcribe_and_insert,
-                    args=(audio_data, recording_duration),
-                ).start()
-            else:
-                self.update_status("🟢 Ready")
+        # Update UI
+        self.title = "🎤"
+        self.update_status("🟡 Processing...")
+
+        # Stop recording and get audio
+        audio_data = self.audio_recorder.stop_recording()
+
+        if len(audio_data) > 0:
+            # Transcribe in a separate thread
+            threading.Thread(
+                target=self._transcribe_and_insert,
+                args=(audio_data, recording_duration),
+            ).start()
+        else:
+            self.update_status("🟢 Ready")
 
     def _transcribe_and_insert(
         self, audio_data: np.ndarray, recording_duration: float

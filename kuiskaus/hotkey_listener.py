@@ -1,8 +1,9 @@
-import threading
 from collections.abc import Callable
 
 from AppKit import NSEvent
 from PyObjCTools import AppHelper
+
+from .callback_dispatcher import CallbackDispatcher
 
 # Define event masks
 NSKeyDownMask = 1 << 10
@@ -30,6 +31,11 @@ class HotkeyListener:
         self.is_pressed = False
         self.monitor = None
         self.running = False
+
+        # Shared single-threaded executor: press/release callbacks run in
+        # event order, so a release always observes the state set by its
+        # press (issue #17).
+        self._dispatcher = CallbackDispatcher()
 
     def _check_modifiers(self, flags: int) -> bool:
         """Check if the required modifier keys are pressed"""
@@ -74,16 +80,16 @@ class HotkeyListener:
                     print("[DEBUG] Hotkey pressed!")
                     self.is_pressed = True
                     if self.on_press:
-                        # Run callback in separate thread to avoid blocking
-                        threading.Thread(target=self.on_press).start()
+                        # Dispatch to the shared worker so press/release
+                        # callbacks run in event order (issue #17).
+                        self._dispatcher.dispatch(self.on_press)
 
                 elif not modifiers_pressed and self.is_pressed:
                     # Hotkey released
                     print("[DEBUG] Hotkey released!")
                     self.is_pressed = False
                     if self.on_release:
-                        # Run callback in separate thread to avoid blocking
-                        threading.Thread(target=self.on_release).start()
+                        self._dispatcher.dispatch(self.on_release)
 
         # Event callbacks must never crash the run loop; log and continue.
         except Exception as e:  # noqa: BLE001 - logged; run-loop guard
@@ -96,6 +102,8 @@ class HotkeyListener:
         """Start listening for hotkeys"""
         if not self.running:
             self.running = True
+
+            self._dispatcher.start()
 
             # Check accessibility permissions
             # Use the function from ApplicationServices
@@ -145,6 +153,7 @@ class HotkeyListener:
                 self.local_monitor = None
             self.running = False
             self.is_pressed = False
+            self._dispatcher.stop()
             print("Hotkey listener stopped.")
 
     def run_loop(self):
