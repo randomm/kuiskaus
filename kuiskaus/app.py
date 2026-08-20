@@ -75,9 +75,17 @@ class KuiskausApp:
     def on_hotkey_press(self):
         """Called when hotkey is pressed"""
         if not self.is_recording:
+            admitted = self.audio_recorder.start_recording()
+            if not admitted:
+                # A worker from a previous recording is still alive (#16).
+                # Refuse rather than desyncing app-level state from the
+                # recorder, which has no active worker to serve this press.
+                print(
+                    "⚠️  Recording could not start — previous recording still stopping"
+                )
+                return
             self.is_recording = True
             self.recording_start_time = time.time()
-            self.audio_recorder.start_recording()
             print("🎤 Recording...")
             self.show_notification("Recording", "Speak now...")
 
@@ -90,19 +98,30 @@ class KuiskausApp:
             print("✅ Ready")
             return
         self.is_recording = False
-        if self.recording_start_time is None:
+        start_time = self.recording_start_time
+        self.recording_start_time = None
+
+        # Stop recording and get audio
+        audio_data = self.audio_recorder.stop_recording()
+
+        # A failed/stuck microphone open must surface as its own error,
+        # not as "no audio recorded" -- that's indistinguishable from
+        # genuine silence (#16).
+        if self.audio_recorder.last_error:
+            error_msg = self.audio_recorder.last_error
+            print(f"⚠️  {error_msg}")
+            self.show_notification("Error", error_msg)
+            return
+
+        if start_time is None:
             print("⚠️  No start time recorded — ignoring release")
-            self.audio_recorder.stop_recording()
             self.show_notification(
                 "Recording error", "Missing start time; recording discarded"
             )
             return
-        recording_duration = time.time() - self.recording_start_time
+        recording_duration = time.time() - start_time
 
         print(f"⏹️  Stopped recording ({recording_duration:.1f}s)")
-
-        # Stop recording and get audio
-        audio_data = self.audio_recorder.stop_recording()
 
         if len(audio_data) > 0:
             # Transcribe in a separate thread to avoid blocking
