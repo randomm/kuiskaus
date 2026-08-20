@@ -3,7 +3,6 @@
 import html
 import subprocess
 
-
 SYSTEM_PROMPT = (
     "You are a speech-to-text cleanup function. "
     "The user will send text wrapped in <transcription> tags. "
@@ -34,6 +33,7 @@ def clean_with_apfel(text: str, timeout: int = 10) -> str:
             capture_output=True,
             text=True,
             timeout=timeout,
+            check=False,
         )
         if result.returncode != 0:
             return text

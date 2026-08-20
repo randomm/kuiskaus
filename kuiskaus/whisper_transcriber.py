@@ -1,13 +1,14 @@
-import numpy as np
-import time
-from typing import Optional
 import threading
+import time
+
 import mlx_whisper
+import numpy as np
+
 from .transcriber import TranscriptionResult
 
 
 class WhisperTranscriber:
-    def __init__(self, model_name: str = "turbo", device: Optional[str] = None):
+    def __init__(self, model_name: str = "turbo", device: str | None = None):
         """
         Initialize Whisper transcriber for Apple Silicon
 
@@ -56,7 +57,7 @@ class WhisperTranscriber:
     def transcribe(
         self,
         audio: np.ndarray,
-        language: Optional[str] = None,
+        language: str | None = None,
         task: str = "transcribe",
         **kwargs,
     ) -> TranscriptionResult:

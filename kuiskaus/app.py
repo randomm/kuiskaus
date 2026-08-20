@@ -11,12 +11,12 @@ import time
 import numpy as np
 
 from .audio_recorder import AudioRecorder
-from .whisper_transcriber import WhisperTranscriber
-from .parakeet_transcriber import ParakeetTranscriber
-from .transcriber import Transcriber
 from .hotkey_listener import HotkeyListener
-from .text_inserter import TextInserter
+from .parakeet_transcriber import ParakeetTranscriber
 from .postprocessor import clean_with_apfel
+from .text_inserter import TextInserter
+from .transcriber import Transcriber
+from .whisper_transcriber import WhisperTranscriber
 
 # Optional: notifications
 try:
@@ -85,6 +85,13 @@ class KuiskausApp:
         """Called when hotkey is released"""
         if self.is_recording:
             self.is_recording = False
+            if self.recording_start_time is None:
+                print("⚠️  No start time recorded — ignoring release")
+                self.audio_recorder.stop_recording()
+                self.show_notification(
+                    "Recording error", "Missing start time; recording discarded"
+                )
+                return
             recording_duration = time.time() - self.recording_start_time
 
             print(f"⏹️  Stopped recording ({recording_duration:.1f}s)")
@@ -141,7 +148,9 @@ class KuiskausApp:
                     "No speech detected", "Try speaking more clearly"
                 )
 
-        except Exception as e:
+        # Top-level guard for the transcription worker thread: any failure
+        # here (model, inference, text insertion) must not crash the app.
+        except Exception as e:  # noqa: BLE001 - logged; worker-thread guard
             print(f"Error during transcription: {e}")
             self.show_notification("Error", "Failed to transcribe audio")
 
@@ -155,7 +164,10 @@ class KuiskausApp:
                 NSUserNotificationCenter.defaultUserNotificationCenter().deliverNotification_(
                     notification
                 )
-            except Exception as e:
+            except (AttributeError, OSError, RuntimeError) as e:
+                # Notification failure must never break the transcription flow.
+                # AttributeError covers defaultUserNotificationCenter() being
+                # None when no AppKit run loop is active (CLI path).
                 print(f"Failed to show notification: {e}")
 
     def print_stats(self):
@@ -203,20 +215,18 @@ def check_apple_silicon():
         import subprocess
 
         result = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         return "Apple" in result.stdout
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         return False
 
 
 def main():
     """Main entry point"""
-    # Check Python version
-    if sys.version_info < (3, 8):
-        print("Python 3.8 or higher is required")
-        sys.exit(1)
-
     # Check for Apple Silicon
     if not check_apple_silicon():
         print("\n❌ Error: This application requires Apple Silicon (M1/M2/M3)")

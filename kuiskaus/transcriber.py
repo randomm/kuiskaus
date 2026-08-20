@@ -1,6 +1,7 @@
 """Transcriber Protocol for speech-to-text backends."""
 
-from typing import Any, Protocol, runtime_checkable, TypedDict
+from typing import Any, Protocol, TypedDict, runtime_checkable
+
 import numpy as np
 
 
