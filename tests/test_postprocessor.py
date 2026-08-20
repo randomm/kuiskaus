@@ -1,15 +1,14 @@
-"""Tests for apfel LLM post-processor."""
+"""Tests for apfel LLM post-processor.
 
-# Mock problematic imports before importing kuiskaus modules
+The kuiskaus.postprocessor module is stdlib-only (html + subprocess), so
+these tests use plain context-scoped patches rather than process-wide
+sys.modules mocks: nothing needs to be stubbed at import time, and no
+mocking leaks into the rest of the shared pytest process.
+"""
+
 import subprocess
-import sys
 from unittest.mock import MagicMock, patch
 
-sys.modules["pyaudio"] = MagicMock()
-sys.modules["mlx_whisper"] = MagicMock()
-sys.modules["numpy"] = MagicMock()
-
-# ruff: noqa: E402 - Module import must come after mocks
 from kuiskaus.postprocessor import (
     SYSTEM_PROMPT,
     _strip_meta_commentary,

@@ -18,7 +18,43 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["ty"]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.3",
+    "ty",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Lint-strict by design: there is no ignore baseline. All 85 pre-existing
+# violations (16 codes, baselined during issue #15) were fixed rather than
+# suppressed, so new code cannot silently reintroduce the same defects.
+# A narrowly-targeted inline `# noqa: CODE - <reason>` is the only accepted
+# suppression and is limited to genuinely broad-but-logged exception guards
+# (BLE001) where catching a specific exception set would be arbitrary.
 
 [tool.ty.environment]
 python-version = "3.11"
+
+# PyObjC (Foundation, AppKit, Quartz, ApplicationServices) is an untyped
+# Objective-C bridge: ty cannot see the symbols it exposes, so every
+# `from AppKit import ...` / `Quartz.CFRunLoop*` access reads as an
+# unresolved import/attribute. That is boundary noise, not a defect in our
+# code, and hand-written stubs for a third-party framework are an explicit
+# non-goal (permanent maintenance liability). We use module-level
+# `replace-imports-with-any` because the PyObjC boundary is pervasive across
+# the codebase; per-line `# ty: ignore[unresolved-import]` remains available
+# for one-off cases. Note the module names are matched as a PREFIX, so
+# `Quartz` covers the whole `Quartz.*` subtree, not just the top-level
+# module. ty's other rules (unsupported-operator, etc.) and ruff continue to
+# cover our code normally.
+[tool.ty.analysis]
+replace-imports-with-any = [
+    "Foundation",
+    "AppKit",
+    "Quartz",
+    "ApplicationServices",
+]

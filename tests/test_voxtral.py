@@ -1,11 +1,12 @@
 """Tests for VoxtralTranscriber."""
 
-import numpy as np
 import os
 import sys
 import wave
-import pytest
 from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
 
 sys.modules["pyaudio"] = MagicMock()
 sys.modules["mlx_whisper"] = MagicMock()
@@ -63,6 +64,28 @@ class TestVoxtralTranscriber:
         assert "transcribe_time" in result
         assert "audio_duration" in result
         assert "rtf" in result
+
+    def test_audio_to_wav_unlinks_on_non_oserror_failure(self):
+        """A wave.Error (not OSError) during write must still unlink the temp file."""
+        from kuiskaus.voxtral_transcriber import VoxtralTranscriber
+
+        with patch("kuiskaus.voxtral_transcriber.VoxtralTranscriber._load_model"):
+            t = VoxtralTranscriber()
+        t._load_thread.join(timeout=1)
+        audio = np.zeros(16000, dtype=np.float32)
+        with (
+            patch("wave.open") as mock_open,
+            patch("os.unlink") as mock_unlink,
+        ):
+            mock_wf = MagicMock()
+            mock_wf.setframerate.side_effect = wave.Error("bad frame rate")
+            mock_open.return_value.__enter__.return_value = mock_wf
+            with pytest.raises(wave.Error):
+                t._audio_to_wav_file(audio, sample_rate=0)
+        # Unlinked exactly once, with the created temp path
+        assert len(mock_unlink.call_args_list) == 1
+        unlinked_path = mock_unlink.call_args_list[0].args[0]
+        assert unlinked_path.endswith(".wav")
 
     def test_wav_file_cleaned_up(self):
         t = self._make_transcriber_with_mock()

@@ -1,9 +1,10 @@
 """Tests for ParakeetTranscriber."""
 
+import sys
+from unittest.mock import MagicMock, patch
+
 import numpy as np
 import pytest
-from unittest.mock import MagicMock, patch
-import sys
 
 
 def make_mock_model():
@@ -75,8 +76,8 @@ class TestParakeetTranscriber:
         assert "rtf" in result
 
     def test_transcribe_satisfies_protocol(self):
-        from kuiskaus.transcriber import Transcriber
         from kuiskaus.parakeet_transcriber import ParakeetTranscriber
+        from kuiskaus.transcriber import Transcriber
 
         with patch("kuiskaus.parakeet_transcriber.ParakeetTranscriber._load_model"):
             t = ParakeetTranscriber()

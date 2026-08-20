@@ -54,7 +54,7 @@ uv run ty check kuiskaus/
 uv run ruff format --check kuiskaus/ tests/
 ```
 
-**If any check fails**: Fix the issue. NEVER bypass with `# noqa`, `# type: ignore`, or similar suppressions.
+**If any check fails**: Fix the issue. NEVER bypass with blanket suppressions. The ONE accepted suppression is a per-line `# noqa: <CODE> - <reason>` on a broad `except Exception` guard that logs the exception, at a boundary where catching a specific exception set would be arbitrary (worker threads, CGEvent/NSEvent run-loop callbacks, the quit path, test runners). Everything else remains prohibited: global ignore lists, file-level suppressions, blanket `# noqa` without a code, and `# type: ignore`.
 
 ---
 
@@ -63,7 +63,7 @@ uv run ruff format --check kuiskaus/ tests/
 - **TDD preferred**: Write tests before implementation
 - **Coverage threshold**: 80%+ for all new code
 - **Test location**: `tests/` directory, mirroring `kuiskaus/` module structure
-- **Test runner**: `./run_tests.sh` (wraps pytest)
+- **Test runner**: `./run_tests.sh` (runs pytest; add `--hardware` to also run the manual hardware scripts)
 
 ### macOS Hardware Dependencies
 
@@ -82,7 +82,7 @@ uv run pytest --cov=kuiskaus --cov-report=term-missing tests/
 
 ## Code Style & Conventions
 
-- **Python version**: 3.8+ compatible (see `.python-version`)
+- **Python version**: 3.11+ (authoritative source: `requires-python` in `pyproject.toml`)
 - **Formatter**: ruff format
 - **Linter**: ruff check
 - **Type checker**: ty
@@ -164,8 +164,9 @@ If work must be deferred, create a GitHub issue. **The issue IS the TODO.**
 ./launch_cli.sh                     # CLI version
 
 # Tests
-./run_tests.sh                      # Full test suite
-uv run pytest tests/test_audio.py   # Single test file
+./run_tests.sh                      # Unit test suite (pytest)
+./run_tests.sh --hardware           # Also run manual hardware scripts
+uv run pytest tests/test_transcriber.py   # Single test file
 uv run pytest -k "test_name"        # Single test by name
 uv run pytest --cov=kuiskaus tests/ # With coverage
 
@@ -190,20 +191,12 @@ uv lock                # Regenerate uv.lock after editing pyproject.toml
 
 Agents MAY merge pull requests, but ONLY when every condition below holds:
 
-1. **All quality gates pass locally** — `./run_tests.sh`, `uv run ruff check kuiskaus/ tests/`, `uv run ty check kuiskaus/`, `uv run ruff format --check kuiskaus/ tests/`.
+1. **All quality gates pass locally, with no exceptions** — `./run_tests.sh`, `uv run ruff check kuiskaus/ tests/`, `uv run ty check kuiskaus/`, `uv run ruff format --check kuiskaus/ tests/`. There is no exemption mechanism and no such thing as a "known-failing" gate: a red gate blocks the merge, full stop.
 2. **CI passes**, where CI exists.
 3. **Any adversarial or code-review gate attached to the work returned an approving verdict.**
 4. **The diff stays within the scope its issue declares.** A PR touching files outside the issue's stated scope or diff budget must be halted and reported — never merged, and never merged "because the extra changes look harmless".
 
-### Documented gate exemptions
-
-A ticket may explicitly record a gate as expected-to-fail — for example, a chore that declares the linter toolchain while deferring the repo-wide reformat to a separate issue. Such an exemption is valid only when **all** of the following are true:
-
-- It is written in the issue body **before** the PR is opened.
-- It names the specific gate and the issue that will resolve it.
-- It is a deliberate scoping decision, not a workaround for a failure discovered during implementation.
-
-An exemption decided at merge time is not an exemption. If a gate fails unexpectedly, that is a blocker.
+**Pre-existing failures are not grounds for an exemption.** If a gate fails because of issues that pre-date the PR's diff, those issues must be fixed — on this PR or on an unblocking branch — before anything merges. A PR may not land while any quality gate is red, regardless of when the failure originated.
 
 ### When any condition is unmet
 

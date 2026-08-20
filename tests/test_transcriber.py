@@ -1,9 +1,10 @@
 """Tests for Transcriber protocol."""
 
-import numpy as np
-import os
 import importlib.util
+import os
 from typing import Protocol
+
+import numpy as np
 
 # Load transcriber module directly to avoid dependencies
 spec_transcriber = importlib.util.spec_from_file_location(

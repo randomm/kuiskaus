@@ -4,25 +4,25 @@ Kuiskaus Menu Bar App - Whisper V3 Turbo Speech-to-Text for macOS
 A menu bar application for easy access to speech-to-text functionality.
 """
 
-import rumps
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 import numpy as np
+import rumps
 
 from .audio_recorder import AudioRecorder
-from .whisper_transcriber import WhisperTranscriber
-from .parakeet_transcriber import ParakeetTranscriber
-from .transcriber import Transcriber
 from .hotkey_listener_cgevent import HotkeyListenerCGEvent
-from .text_inserter import TextInserter
+from .parakeet_transcriber import ParakeetTranscriber
 from .postprocessor import clean_with_apfel
+from .text_inserter import TextInserter
+from .transcriber import Transcriber
+from .whisper_transcriber import WhisperTranscriber
 
 
 class KuiskausMenuBarApp(rumps.App):
     def __init__(self):
-        super(KuiskausMenuBarApp, self).__init__(
+        super().__init__(
             "Kuiskaus",
             title="🎤",  # Use title instead of icon for emoji
             quit_button=None,  # We'll add custom quit with stats
@@ -53,7 +53,7 @@ class KuiskausMenuBarApp(rumps.App):
         # Stats
         self.total_transcriptions = 0
         self.total_recording_time = 0.0
-        self.session_start = datetime.now()
+        self.session_start = datetime.now(tz=UTC)
 
         # Setup menu
         self.setup_menu()
@@ -193,6 +193,12 @@ class KuiskausMenuBarApp(rumps.App):
 
         if self.is_recording:
             self.is_recording = False
+            if self.recording_start_time is None:
+                print("⚠️  No start time recorded — ignoring release")
+                self.audio_recorder.stop_recording()
+                self.title = "🎤"
+                self.update_status("🟢 Ready")
+                return
             recording_duration = time.time() - self.recording_start_time
 
             # Update UI
@@ -241,7 +247,9 @@ class KuiskausMenuBarApp(rumps.App):
             else:
                 self.update_status("🟢 Ready (no speech)")
 
-        except Exception as e:
+        # Top-level guard for the transcription worker thread: any failure
+        # here (model, inference, text insertion) must not crash the app.
+        except Exception as e:  # noqa: BLE001 - logged; worker-thread guard
             print(f"Error during transcription: {e}")
             self.update_status("🟢 Ready (error)")
 
@@ -279,14 +287,16 @@ class KuiskausMenuBarApp(rumps.App):
 
             self.update_status("🟢 Ready")
             print(f"✅ Model changed to {model_name}")
-        except Exception as e:
+        # Top-level guard for the model-reload worker thread: model loading
+        # can fail for many reasons and must not crash the app.
+        except Exception as e:  # noqa: BLE001 - logged; worker-thread guard
             self.update_status("🟢 Ready (model error)")
             print(f"❌ Model error: {e}")
 
     @rumps.clicked("Statistics...")
     def show_stats(self, _):
         """Show statistics dialog"""
-        session_duration = (datetime.now() - self.session_start).total_seconds()
+        session_duration = (datetime.now(tz=UTC) - self.session_start).total_seconds()
         hours = int(session_duration // 3600)
         minutes = int((session_duration % 3600) // 60)
 
@@ -335,7 +345,7 @@ Version 1.0
             self.hotkey_listener.stop()
             self.audio_recorder.cleanup()
             self.transcriber.cleanup()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - logged; must not raise from quit
             print(f"Cleanup error: {e}")
 
 
@@ -345,10 +355,13 @@ def check_apple_silicon():
         import subprocess
 
         result = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         return "Apple" in result.stdout
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         return False
 
 

@@ -1,7 +1,7 @@
 """Parakeet TDT 0.6B v3 transcriber for Apple Silicon."""
 
-import time
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -30,7 +30,9 @@ class ParakeetTranscriber:
             with self._model_lock:
                 self.model = from_pretrained(self.MODEL_ID)
             print(f"Parakeet model loaded in {time.time() - start:.2f}s")
-        except Exception as e:
+        # Top-level guard for third-party model loading: must never let a
+        # load failure crash the app; the error is logged here.
+        except Exception as e:  # noqa: BLE001 - logged; model-load guard
             print(f"Failed to load Parakeet model: {e}")
             # model stays None — RuntimeError will be raised on next transcribe()
 
@@ -58,8 +60,8 @@ class ParakeetTranscriber:
 
         start = time.time()
 
-        from parakeet_mlx.audio import get_logmel
         import mlx.core as mx
+        from parakeet_mlx.audio import get_logmel
 
         with self._model_lock:
             mel = get_logmel(mx.array(audio), self.model.preprocessor_config)
