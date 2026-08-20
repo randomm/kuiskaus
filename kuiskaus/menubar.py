@@ -156,7 +156,13 @@ class KuiskausMenuBarApp(rumps.App):
 
         if self.enabled:
             self.title = "🎤"
-            self.update_status("🟢 Ready")
+            # Re-enabling is a deliberate user action but it does not fix
+            # the microphone: a persisted error (#16) must survive this
+            # toggle too, else disable->enable is a silent-clear backdoor.
+            if self.audio_recorder.last_error:
+                self.update_status(f"🔴 {self.audio_recorder.last_error}")
+            else:
+                self.update_status("🟢 Ready")
             print("✅ Kuiskaus enabled")
         else:
             self.title = "🔇"
@@ -178,9 +184,14 @@ class KuiskausMenuBarApp(rumps.App):
             return
 
         if not self.is_recording:
+            admitted = self.audio_recorder.start_recording()
+            if not admitted:
+                # A worker from a previous recording is still alive (#16).
+                # Refuse rather than desyncing app-level state from the
+                # recorder, which has no active worker to serve this press.
+                return
             self.is_recording = True
             self.recording_start_time = time.time()
-            self.audio_recorder.start_recording()
 
             # Update UI
             self.title = "🔴"
@@ -192,28 +203,49 @@ class KuiskausMenuBarApp(rumps.App):
             return
 
         if not self.is_recording:
-            # A release that finds no active recording is a harmless no-op;
-            # restore Ready status without touching the recorder (issue #17).
+            # A release that finds no active recording is a harmless no-op
+            # (issue #17). This branch is reachable even for a physically
+            # paired press: when start_recording() refuses admission
+            # (#16, prior worker still alive), on_hotkey_press returns
+            # early without ever setting is_recording True, so the release
+            # for that same keypress lands here. A persisted mic error
+            # must therefore survive this branch too -- it clears only on
+            # a genuinely successful recording, never on a no-op release.
             self.recording_start_time = None
             self.title = "🎤"
-            self.update_status("🟢 Ready")
+            if self.audio_recorder.last_error:
+                self.update_status(f"🔴 {self.audio_recorder.last_error}")
+            else:
+                self.update_status("🟢 Ready")
             return
 
         self.is_recording = False
-        if self.recording_start_time is None:
+        start_time = self.recording_start_time
+        self.recording_start_time = None
+
+        # Stop recording and get audio
+        audio_data = self.audio_recorder.stop_recording()
+
+        # A failed/stuck microphone open must surface as its own error and
+        # persist until the next successful recording -- no auto-clear
+        # timer, and it must NOT be masked as a silent return to Ready (#16).
+        if self.audio_recorder.last_error:
+            error_msg = self.audio_recorder.last_error
+            print(f"⚠️  {error_msg}")
+            self.title = "🎤"
+            self.update_status(f"🔴 {error_msg}")
+            return
+
+        if start_time is None:
             print("⚠️  No start time recorded — ignoring release")
-            self.audio_recorder.stop_recording()
             self.title = "🎤"
             self.update_status("🟢 Ready")
             return
-        recording_duration = time.time() - self.recording_start_time
+        recording_duration = time.time() - start_time
 
         # Update UI
         self.title = "🎤"
         self.update_status("🟡 Processing...")
-
-        # Stop recording and get audio
-        audio_data = self.audio_recorder.stop_recording()
 
         if len(audio_data) > 0:
             # Transcribe in a separate thread
@@ -250,15 +282,23 @@ class KuiskausMenuBarApp(rumps.App):
                 # Log instead of notification (avoids Info.plist issues)
                 print(f"📝 Transcribed: {text}")
 
-                self.update_status("🟢 Ready")
-            else:
+                # This thread was spawned for a recording that completed
+                # without a mic error. But transcription runs async and can
+                # outlive a *later* press/release cycle; if that later
+                # cycle has since set last_error, this stale completion
+                # must not clobber it (#16, same principle as the no-op
+                # release branch above).
+                if not self.audio_recorder.last_error:
+                    self.update_status("🟢 Ready")
+            elif not self.audio_recorder.last_error:
                 self.update_status("🟢 Ready (no speech)")
 
         # Top-level guard for the transcription worker thread: any failure
         # here (model, inference, text insertion) must not crash the app.
         except Exception as e:  # noqa: BLE001 - logged; worker-thread guard
             print(f"Error during transcription: {e}")
-            self.update_status("🟢 Ready (error)")
+            if not self.audio_recorder.last_error:
+                self.update_status("🟢 Ready (error)")
 
     def update_status(self, status: str):
         """Update the status menu item"""
@@ -292,12 +332,18 @@ class KuiskausMenuBarApp(rumps.App):
                 )
             old_transcriber.cleanup()
 
-            self.update_status("🟢 Ready")
+            # A model switch never touches the microphone, so it must not
+            # clear a live mic-error banner (#16 DoD: persists until the
+            # next successful *recording*, no other auto-clear trigger).
+            if not self.audio_recorder.last_error:
+                self.update_status("🟢 Ready")
             print(f"✅ Model changed to {model_name}")
         # Top-level guard for the model-reload worker thread: model loading
         # can fail for many reasons and must not crash the app.
         except Exception as e:  # noqa: BLE001 - logged; worker-thread guard
-            self.update_status("🟢 Ready (model error)")
+            # Same rationale as the success path above.
+            if not self.audio_recorder.last_error:
+                self.update_status("🟢 Ready (model error)")
             print(f"❌ Model error: {e}")
 
     @rumps.clicked("Statistics...")

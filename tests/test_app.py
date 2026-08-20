@@ -79,7 +79,12 @@ def _make_app():
 @pytest.fixture
 def app(monkeypatch: pytest.MonkeyPatch):
     _install_stubs(monkeypatch)
-    return _make_app()
+    instance = _make_app()
+    # Real AudioRecorder.__init__ sets last_error = None; a bare
+    # MagicMock() attribute is truthy by default, which would make every
+    # test believe a mic error is persisted unless overridden here.
+    instance.audio_recorder.last_error = None
+    return instance
 
 
 class TestHotkeyReleaseNoOp:
@@ -128,3 +133,60 @@ class TestHotkeyReleaseNoOp:
 
         assert app.is_recording is False
         assert app.recording_start_time is None
+
+
+class TestHotkeyPressAdmission:
+    """start_recording()'s bool return must be consumed (#16)."""
+
+    def test_press_refused_does_not_flip_recording_state(self, app):
+        """A refused start_recording() must not set is_recording True."""
+        app.audio_recorder.start_recording = MagicMock(return_value=False)
+
+        app.on_hotkey_press()
+
+        assert app.is_recording is False
+        assert app.recording_start_time is None
+
+    def test_press_admitted_flips_recording_state(self, app):
+        """An admitted start_recording() still sets is_recording True."""
+        app.audio_recorder.start_recording = MagicMock(return_value=True)
+
+        app.on_hotkey_press()
+
+        assert app.is_recording is True
+        assert app.recording_start_time is not None
+
+
+class TestHotkeyReleaseLastError:
+    """A failed/stuck microphone open must surface via last_error (#16)."""
+
+    def test_release_with_last_error_skips_transcription_and_notifies(self, app):
+        """last_error set: no transcription thread, error notification shown."""
+        app.audio_recorder.stop_recording = MagicMock(return_value=b"\x00\x00")
+        app.audio_recorder.last_error = "Microphone unavailable: boom"
+        app.show_notification = MagicMock()
+
+        app.on_hotkey_press()
+        app.show_notification.reset_mock()
+        with patch("threading.Thread") as mock_thread_cls:
+            app.on_hotkey_release()
+            mock_thread_cls.assert_not_called()
+
+        app.show_notification.assert_called_once()
+        args = app.show_notification.call_args.args
+        assert args[0] == "Error"
+        assert "boom" in args[1]
+
+    def test_release_without_last_error_still_transcribes(self, app):
+        """No last_error: the normal transcription path still fires."""
+        import numpy as np
+
+        app.audio_recorder.stop_recording = MagicMock(
+            return_value=np.array([0.1, 0.2], dtype=np.float32)
+        )
+        app.audio_recorder.last_error = None
+
+        app.on_hotkey_press()
+        with patch("threading.Thread") as mock_thread_cls:
+            app.on_hotkey_release()
+            mock_thread_cls.assert_called_once()
