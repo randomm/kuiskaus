@@ -1,4 +1,10 @@
-"""Tests for apfel LLM post-processor."""
+"""Tests for apfel LLM post-processor.
+
+The kuiskaus.postprocessor module is stdlib-only (html + subprocess), so
+these tests use plain context-scoped patches rather than process-wide
+sys.modules mocks: nothing needs to be stubbed at import time, and no
+mocking leaks into the rest of the shared pytest process.
+"""
 
 import subprocess
 from unittest.mock import MagicMock, patch

@@ -18,20 +18,44 @@ if [[ "${1:-}" == "--hardware" ]]; then
     echo "=============================="
     echo
 
+    hardware_failures=()
+
     echo "1. Audio Test"
     echo "-------------"
-    uv run python -m tests.test_audio
+    if ! uv run python -m tests.test_audio; then
+        hardware_failures+=("test_audio")
+    fi
     echo
 
     echo "2. MLX Whisper Test"
     echo "-------------------"
-    uv run python -m tests.test_whisper
+    if ! uv run python -m tests.test_whisper; then
+        hardware_failures+=("test_whisper")
+    fi
     echo
 
     echo "3. Integration Test"
     echo "-------------------"
-    uv run python -m tests.test_integration
+    if ! uv run python -m tests.test_integration; then
+        hardware_failures+=("test_integration")
+    fi
     echo
+
+    echo "Hardware test summary"
+    echo "====================="
+    for name in test_audio test_whisper test_integration; do
+        if [[ " ${hardware_failures[*]:-} " == *" $name "* ]]; then
+            echo "  FAILED: $name"
+        else
+            echo "  PASSED: $name"
+        fi
+    done
+    echo
+
+    if [[ ${#hardware_failures[@]} -gt 0 ]]; then
+        echo "❌ Hardware tests failed: ${hardware_failures[*]}"
+        exit 1
+    fi
 fi
 
 echo "✅ Test suite complete!"

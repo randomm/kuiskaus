@@ -166,7 +166,7 @@ If work must be deferred, create a GitHub issue. **The issue IS the TODO.**
 # Tests
 ./run_tests.sh                      # Unit test suite (pytest)
 ./run_tests.sh --hardware           # Also run manual hardware scripts
-uv run pytest tests/test_postprocessor.py   # Single test file
+uv run pytest tests/test_transcriber.py   # Single test file
 uv run pytest -k "test_name"        # Single test by name
 uv run pytest --cov=kuiskaus tests/ # With coverage
 

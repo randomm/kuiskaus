@@ -8,4 +8,8 @@ Use collect_ignore (not addopts --ignore) so collection stays independent
 of pyaudio availability — tests/test_audio.py imports pyaudio at module top.
 """
 
-collect_ignore = ["test_audio.py", "test_whisper.py", "test_integration.py"]
+collect_ignore: list[str] = [
+    "test_audio.py",
+    "test_whisper.py",
+    "test_integration.py",
+]
