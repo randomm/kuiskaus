@@ -18,7 +18,41 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["ty"]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.3",
+    "ty",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Issue #15 lands the toolchain only; this is the lint-only baseline of the
+# current (never-linted) codebase so `ruff check` passes at merge time
+# without touching source modules (explicitly out of scope for #15).
+# Every code below has at least one verified pre-existing violation.
+# #19 (repo-wide reformat) should re-audit and narrow this list.
+ignore = [
+    "BLE001",
+    "DTZ005",
+    "E722",
+    "EXE001",
+    "F401",
+    "F841",
+    "I001",
+    "PIE808",
+    "PLW1510",
+    "RUF022",
+    "RUF100",
+    "SIM115",
+    "UP008",
+    "UP035",
+    "UP036",
+    "UP037",
+    "UP045",
+]
 
 [tool.ty.environment]
 python-version = "3.11"

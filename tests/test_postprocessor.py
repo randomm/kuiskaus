@@ -1,15 +1,8 @@
 """Tests for apfel LLM post-processor."""
 
-# Mock problematic imports before importing kuiskaus modules
 import subprocess
-import sys
 from unittest.mock import MagicMock, patch
 
-sys.modules["pyaudio"] = MagicMock()
-sys.modules["mlx_whisper"] = MagicMock()
-sys.modules["numpy"] = MagicMock()
-
-# ruff: noqa: E402 - Module import must come after mocks
 from kuiskaus.postprocessor import (
     SYSTEM_PROMPT,
     _strip_meta_commentary,

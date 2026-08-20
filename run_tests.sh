@@ -1,27 +1,37 @@
 #!/bin/bash
-# Run Kuiskaus test suite
+# Run Kuiskaus test suite (wraps pytest).
+# Pass --hardware to also run the three manual hardware scripts, which
+# require a microphone, downloaded models, and system permissions.
+
+set -euo pipefail
 
 echo "🧪 Running Kuiskaus Tests"
 echo "========================"
 echo
 
-# Activate virtual environment
-source .venv/bin/activate
+echo "Running pytest test suite"
+uv run pytest tests/
 
-# Run tests
-echo "1. Audio Test"
-echo "-------------"
-python3 -m tests.test_audio
-echo
+if [[ "${1:-}" == "--hardware" ]]; then
+    echo
+    echo "Running manual hardware tests"
+    echo "=============================="
+    echo
 
-echo "2. MLX Whisper Test"
-echo "-------------------"
-python3 -m tests.test_whisper
-echo
+    echo "1. Audio Test"
+    echo "-------------"
+    uv run python -m tests.test_audio
+    echo
 
-echo "3. Integration Test"
-echo "-------------------"
-python3 -m tests.test_integration
-echo
+    echo "2. MLX Whisper Test"
+    echo "-------------------"
+    uv run python -m tests.test_whisper
+    echo
+
+    echo "3. Integration Test"
+    echo "-------------------"
+    uv run python -m tests.test_integration
+    echo
+fi
 
 echo "✅ Test suite complete!"

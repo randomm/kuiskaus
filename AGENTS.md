@@ -63,7 +63,7 @@ uv run ruff format --check kuiskaus/ tests/
 - **TDD preferred**: Write tests before implementation
 - **Coverage threshold**: 80%+ for all new code
 - **Test location**: `tests/` directory, mirroring `kuiskaus/` module structure
-- **Test runner**: `./run_tests.sh` (wraps pytest)
+- **Test runner**: `./run_tests.sh` (runs pytest; add `--hardware` to also run the manual hardware scripts)
 
 ### macOS Hardware Dependencies
 
@@ -164,8 +164,9 @@ If work must be deferred, create a GitHub issue. **The issue IS the TODO.**
 ./launch_cli.sh                     # CLI version
 
 # Tests
-./run_tests.sh                      # Full test suite
-uv run pytest tests/test_audio.py   # Single test file
+./run_tests.sh                      # Unit test suite (pytest)
+./run_tests.sh --hardware           # Also run manual hardware scripts
+uv run pytest tests/test_postprocessor.py   # Single test file
 uv run pytest -k "test_name"        # Single test by name
 uv run pytest --cov=kuiskaus tests/ # With coverage
 
