@@ -24,26 +24,32 @@ class VoxtralNotLoadedError(RuntimeError):
 class VoxtralTranscriber:
     """Voxtral Realtime speech-to-text transcriber using mlx-voxtral."""
 
-    def __init__(self, model_id: str = _MODEL_ID) -> None:
-        self._model_id = model_id
+    def __init__(self) -> None:
         self._model: VoxtralForConditionalGeneration | None = None
         self._processor: VoxtralProcessor | None = None
         self._model_lock = threading.Lock()
+        self._cleaned_up = False
         self._load_thread = threading.Thread(target=self._load_model, daemon=True)
         self._load_thread.start()
 
     def _load_model(self) -> None:
         """Load Voxtral model and processor in background."""
-        print(f"Loading Voxtral model: {self._model_id}")
+        print(f"Loading Voxtral model: {_MODEL_ID}")
         start = time.time()
         try:
             from mlx_voxtral import VoxtralForConditionalGeneration, VoxtralProcessor
 
+            model = VoxtralForConditionalGeneration.from_pretrained(_MODEL_ID)
+            processor = VoxtralProcessor.from_pretrained(_MODEL_ID)
             with self._model_lock:
-                self._model = VoxtralForConditionalGeneration.from_pretrained(
-                    self._model_id
-                )
-                self._processor = VoxtralProcessor.from_pretrained(self._model_id)
+                # Discard an in-flight load if cleanup() already ran: the
+                # model would otherwise resurrect after being released.
+                # Returning here unwinds the frame and drops the local
+                # references, so nothing keeps the model resident.
+                if self._cleaned_up:
+                    return
+                self._model = model
+                self._processor = processor
             print(f"Voxtral model loaded in {time.time() - start:.2f}s")
         # Top-level guard for third-party model loading: must never let a
         # load failure crash the app; the error is logged here.
@@ -137,8 +143,16 @@ class VoxtralTranscriber:
         }
 
     def cleanup(self) -> None:
-        """Release model resources."""
+        """Release model resources.
+
+        Sticks: once cleanup() has run, an in-flight background load
+        discards its result instead of repopulating the released model.
+        Note: the discarded load's model/processor references are held by
+        the load thread until it returns, so peak memory is transiently
+        ~2x the model during the load window after a mid-load cleanup.
+        """
         with self._model_lock:
+            self._cleaned_up = True
             if self._model is not None:
                 del self._model
                 self._model = None

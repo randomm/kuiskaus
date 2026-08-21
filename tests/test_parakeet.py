@@ -1,6 +1,10 @@
-"""Tests for ParakeetTranscriber."""
+"""Tests for ParakeetTranscriber.
 
-import sys
+No module-level sys.modules stubbing: parakeet_mlx is a real dependency on
+Apple Silicon and is imported lazily inside methods; tests patch at the
+method level so nothing leaks into the shared pytest process.
+"""
+
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -15,16 +19,6 @@ def make_mock_model():
     mock_result.text = "hello world"
     mock_model.generate.return_value = [mock_result]
     return mock_model
-
-
-# Mock hardware dependencies before importing kuiskaus modules
-sys.modules["pyaudio"] = MagicMock()
-sys.modules["mlx_whisper"] = MagicMock()
-sys.modules["mlx_whisper.load_models"] = MagicMock()
-sys.modules["parakeet_mlx"] = MagicMock()
-sys.modules["parakeet_mlx.audio"] = MagicMock()
-sys.modules["parakeet_mlx.audio"].get_logmel = MagicMock(return_value=MagicMock())
-sys.modules["parakeet_mlx"].from_pretrained = MagicMock(return_value=make_mock_model())
 
 
 class TestParakeetTranscriber:
@@ -98,3 +92,14 @@ class TestParakeetTranscriber:
         audio = np.zeros(16000, dtype=np.float32)
         with pytest.raises(RuntimeError, match="model failed to load"):
             t.transcribe(audio)
+
+
+def test_no_sys_modules_pollution_after_import():
+    """Importing and running this file must not leak MagicMock stubs into
+    sys.modules: a later import of a real dependency must see the real
+    module, not a MagicMock. A real module has a __file__ path; a
+    MagicMock injected into sys.modules does not."""
+    import parakeet_mlx
+
+    assert not isinstance(parakeet_mlx, MagicMock)
+    assert getattr(parakeet_mlx, "__file__", None) is not None

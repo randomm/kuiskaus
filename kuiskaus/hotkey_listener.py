@@ -4,6 +4,7 @@ from AppKit import NSEvent
 from PyObjCTools import AppHelper
 
 from .callback_dispatcher import CallbackDispatcher
+from .debug import DEBUG, _debug
 
 # Define event masks
 NSKeyDownMask = 1 << 10
@@ -55,15 +56,19 @@ class HotkeyListener:
 
     def _handle_event(self, event):
         """Handle keyboard events"""
-        print(
-            f"[DEBUG] Event handler called! Type: {event.type() if event else 'None'}"
+        _debug(
+            DEBUG,
+            "[DEBUG]",
+            f"Event handler called! Type: {event.type() if event else 'None'}",
         )
         try:
             event_type = event.type()
             flags = event.modifierFlags()
 
-            print(
-                f"[DEBUG] Event type: {event_type}, NSFlagsChangedMask: {NSFlagsChangedMask}"
+            _debug(
+                DEBUG,
+                "[DEBUG]",
+                f"Event type: {event_type}, NSFlagsChangedMask: {NSFlagsChangedMask}",
             )
 
             if event_type == NSFlagsChangedMask:
@@ -71,13 +76,15 @@ class HotkeyListener:
                 modifiers_pressed = self._check_modifiers(flags)
 
                 # Debug: print which modifiers are pressed
-                print(
-                    f"[DEBUG] Modifier flags: {flags}, Control+Option pressed: {modifiers_pressed}"
+                _debug(
+                    DEBUG,
+                    "[DEBUG]",
+                    f"Modifier flags: {flags}, Control+Option pressed: {modifiers_pressed}",
                 )
 
                 if modifiers_pressed and not self.is_pressed:
                     # Hotkey pressed
-                    print("[DEBUG] Hotkey pressed!")
+                    _debug(DEBUG, "[DEBUG]", "Hotkey pressed! (NSEvent)")
                     self.is_pressed = True
                     if self.on_press:
                         # Dispatch to the shared worker so press/release
@@ -86,7 +93,7 @@ class HotkeyListener:
 
                 elif not modifiers_pressed and self.is_pressed:
                     # Hotkey released
-                    print("[DEBUG] Hotkey released!")
+                    _debug(DEBUG, "[DEBUG]", "Hotkey released! (NSEvent)")
                     self.is_pressed = False
                     if self.on_release:
                         self._dispatcher.dispatch(self.on_release)

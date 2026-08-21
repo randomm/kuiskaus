@@ -15,9 +15,15 @@ from .audio_recorder import AudioRecorder
 from .hotkey_listener_cgevent import HotkeyListenerCGEvent
 from .parakeet_transcriber import ParakeetTranscriber
 from .postprocessor import clean_with_apfel
+from .silicon_check import check_apple_silicon
 from .text_inserter import TextInserter
 from .transcriber import Transcriber
 from .whisper_transcriber import WhisperTranscriber
+
+
+def _utcnow() -> datetime:
+    """Single source of aware-UTC now(); prevents naive-datetime subtraction errors."""
+    return datetime.now(tz=UTC)
 
 
 class KuiskausMenuBarApp(rumps.App):
@@ -44,6 +50,14 @@ class KuiskausMenuBarApp(rumps.App):
         self.enabled = True
         self.use_apfel: bool = False
         self._apfel_lock = threading.Lock()
+        # Guards self.transcriber: held across transcribe() calls; see
+        # _reload_model for the full rationale.
+        self._transcriber_lock = threading.Lock()
+        # Serializes reload threads: a superseded reload discards its
+        # constructor result instead of committing or tearing down a
+        # transcriber that a newer reload already swapped in (issue #22).
+        self._reload_lock = threading.Lock()
+        self._reload_generation = 0
 
         # Initialize hotkey listener with CGEventTap
         self.hotkey_listener = HotkeyListenerCGEvent(
@@ -53,7 +67,7 @@ class KuiskausMenuBarApp(rumps.App):
         # Stats
         self.total_transcriptions = 0
         self.total_recording_time = 0.0
-        self.session_start = datetime.now(tz=UTC)
+        self.session_start = _utcnow()
 
         # Setup menu
         self.setup_menu()
@@ -261,8 +275,11 @@ class KuiskausMenuBarApp(rumps.App):
     ) -> None:
         """Transcribe audio and insert text (runs in separate thread)"""
         try:
-            # Transcribe
-            result = self.transcriber.transcribe(audio_data)
+            # Hold the lock across transcribe() so _reload_model cannot
+            # cleanup() the model mid-inference (issue #22).
+            with self._transcriber_lock:
+                transcriber = self.transcriber
+                result = transcriber.transcribe(audio_data)
             text = result.get("text", "").strip()
 
             # Apply apfel cleanup if enabled
@@ -312,25 +329,102 @@ class KuiskausMenuBarApp(rumps.App):
         threading.Thread(target=self._reload_model, args=(model_name,)).start()
 
     def _reload_model(self, model_name: str):
-        """Reload the model in background"""
+        """Reload the model in background.
+
+        Reloads are serialized: each reload claims a generation under
+        _reload_lock and, after loading, re-checks that it is still the
+        latest. A superseded reload (one started while a newer reload is
+        already running) must not commit its constructor result — that
+        would roll back the newer reload's swap — and must not clean up
+        the transcriber it found at start, which may already be live by
+        then (issue #22). It DOES release its own (already loaded) model
+        via best-effort cleanup() before discarding, so a superseded
+        load never keeps a model resident.
+
+        Success is reported only for a transcriber that is actually
+        usable: Parakeet and Voxtral load in a background thread, so a
+        successful constructor can still mean a failed (or still
+        running) load; reporting the switch as done in that case would
+        leave the UI claiming a working model while transcription cannot
+        function (issue #22 review). An unusable result is discarded
+        with the same failure path a constructor error takes.
+        """
         try:
-            old_transcriber = self.transcriber
+            with self._reload_lock:
+                self._reload_generation += 1
+                generation = self._reload_generation
+
+            new_transcriber: Transcriber
             if model_name == "parakeet":
-                self.transcriber: Transcriber = ParakeetTranscriber()
+                new_transcriber = ParakeetTranscriber()
             elif model_name == "voxtral":
                 from .voxtral_transcriber import VoxtralTranscriber
 
-                self.transcriber: Transcriber = VoxtralTranscriber()
+                new_transcriber = VoxtralTranscriber()
             else:
-                self.transcriber: Transcriber = WhisperTranscriber(
-                    model_name=model_name
-                )
-            if not isinstance(self.transcriber, Transcriber):
+                new_transcriber = WhisperTranscriber(model_name=model_name)
+            if not isinstance(new_transcriber, Transcriber):
                 raise TypeError(
-                    f"Transcriber implementation {type(self.transcriber)} does not satisfy "
+                    f"Transcriber implementation {type(new_transcriber)} does not satisfy "
                     "the Transcriber protocol"
                 )
-            old_transcriber.cleanup()
+            # Background-load transcribers (Parakeet, Voxtral) swallow
+            # load errors into their own state: the constructor succeeds
+            # even when the model failed to load, so the reload must not
+            # report success for a dead model (issue #22 review). Verify
+            # against the REAL class (not the module attribute, which a
+            # test patch may have replaced with a mock — isinstance() vs
+            # a MagicMock raises TypeError): type() identity is stable
+            # for stub instances whose class is a plain class.
+            # Whisper loads eagerly in its constructor and raises on
+            # failure, so its model is ready there.
+            from .parakeet_transcriber import ParakeetTranscriber as _P
+            from .voxtral_transcriber import VoxtralTranscriber as _V
+
+            if type(new_transcriber) is _P:
+                new_transcriber._ensure_loaded()
+                if new_transcriber.model is None:
+                    new_transcriber.cleanup()
+                    raise RuntimeError("Model parakeet failed to load")
+            elif type(new_transcriber) is _V:
+                new_transcriber._ensure_loaded()
+                if new_transcriber._model is None:
+                    new_transcriber.cleanup()
+                    raise RuntimeError("Model voxtral failed to load")
+
+            with self._reload_lock:
+                superseded = generation != self._reload_generation
+            if superseded:
+                # A newer reload is already in flight; don't commit this
+                # (stale) result — it would roll back the newer reload's
+                # swap and tear down a transcriber that may already be
+                # live (issue #22). But the transcriber we just built IS
+                # ours to release: its model is fully loaded here
+                # (Parakeet/Whisper load in the constructor; for Voxtral
+                # the load thread is a daemon we own and cleanup() stops
+                # it), so release it before discarding.
+                try:
+                    new_transcriber.cleanup()
+                except Exception as e:  # noqa: BLE001 - logged; best-effort release
+                    print(f"⚠️  Superseded reload cleanup failed: {e}")
+                print(f"⚠️  Model reload to {model_name} superseded; discarding")
+                return
+
+            # Read, swap, then clean up the old transcriber: the worker
+            # holds _transcriber_lock for its entire transcribe() call, so
+            # the snapshot-and-swap isolates an in-flight worker from the
+            # teardown (it keeps its own reference and finishes on a live
+            # object). Cleanup of the old model can take seconds, so it
+            # runs outside the lock (issue #22). Best-effort guard, same
+            # as the superseded-reload branch above: a failing cleanup
+            # must not mask a successful swap (issue #22 review).
+            with self._transcriber_lock:
+                old_transcriber = self.transcriber
+                self.transcriber = new_transcriber
+            try:
+                old_transcriber.cleanup()
+            except Exception as e:  # noqa: BLE001 - logged; best-effort release
+                print(f"⚠️  Old transcriber cleanup failed: {e}")
 
             # A model switch never touches the microphone, so it must not
             # clear a live mic-error banner (#16 DoD: persists until the
@@ -349,7 +443,7 @@ class KuiskausMenuBarApp(rumps.App):
     @rumps.clicked("Statistics...")
     def show_stats(self, _):
         """Show statistics dialog"""
-        session_duration = (datetime.now(tz=UTC) - self.session_start).total_seconds()
+        session_duration = (_utcnow() - self.session_start).total_seconds()
         hours = int(session_duration // 3600)
         minutes = int((session_duration % 3600) // 60)
 
@@ -397,25 +491,20 @@ Version 1.0
         try:
             self.hotkey_listener.stop()
             self.audio_recorder.cleanup()
-            self.transcriber.cleanup()
+            with self._transcriber_lock:
+                transcriber = self.transcriber
+            # The transcriber cleanup runs OUTSIDE the transcriber lock:
+            # for background-load transcribers (Parakeet, Voxtral)
+            # cleanup() waits on the load thread, and that load can be a
+            # multi-minute model download — holding the lock while
+            # waiting would wedge every in-flight transcription worker
+            # (and therefore quit) on the same in-flight-load hazard as
+            # the reload path (issue #22 review). A worker still running
+            # keeps its own snapshot, so releasing the model out of lock
+            # is safe.
+            transcriber.cleanup()
         except Exception as e:  # noqa: BLE001 - logged; must not raise from quit
             print(f"Cleanup error: {e}")
-
-
-def check_apple_silicon():
-    """Check if running on Apple Silicon"""
-    try:
-        import subprocess
-
-        result = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return "Apple" in result.stdout
-    except (subprocess.SubprocessError, OSError):
-        return False
 
 
 def main():

@@ -1,19 +1,17 @@
 """Tests for VoxtralTranscriber."""
 
 import os
-import sys
+import threading
 import wave
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
-sys.modules["pyaudio"] = MagicMock()
-sys.modules["mlx_whisper"] = MagicMock()
-sys.modules["mlx_whisper.load_models"] = MagicMock()
-sys.modules["mlx_voxtral"] = MagicMock()
-sys.modules["parakeet_mlx"] = MagicMock()
-sys.modules["parakeet_mlx.audio"] = MagicMock()
+# NOTE: No module-level sys.modules stubbing here. The hardware deps
+# (pyaudio, mlx_voxtral, parakeet_mlx) are real on Apple Silicon and are
+# imported lazily inside methods; tests patch at the method level so
+# nothing leaks into the shared pytest process.
 
 
 class TestVoxtralTranscriber:
@@ -127,6 +125,89 @@ class TestVoxtralTranscriber:
         assert t._model is None
         assert t._processor is None
 
+    def test_cleanup_sticks_when_load_in_flight(self):
+        """cleanup() during an in-flight load must not be undone by the load.
+
+        Reproduction of the resurrection-after-cleanup race: cleanup() runs
+        while _load_model is still between "model loaded" and "model
+        stored"; without the _cleaned_up guard the load repopulates
+        _model/_processor afterwards.
+        """
+        # Warm the mlx_voxtral import on the main thread BEFORE starting
+        # the load thread: on a cold CI runner the first import of
+        # mlx_voxtral (which pulls in torch/transformers) takes far
+        # longer than the 5s gate budget, so leaving it for the thread
+        # made "load thread did not reach the gate" race against the
+        # import time (issue #22, CI run 32517118857). The thread's
+        # job is only to reach the patched from_pretrained, so the
+        # import cost must sit outside the timed window.
+        import mlx_voxtral  # noqa: F401  # warm-up; see note above
+
+        from kuiskaus.voxtral_transcriber import _MODEL_ID, VoxtralTranscriber
+
+        # The load thread blocks on `release` until the main thread has
+        # called cleanup() and set it — the exact in-flight window of the
+        # race. We use a plain bool + Event so the load thread can't
+        # accidentally see the flag as already-set.
+        release = threading.Event()
+
+        # load_model_gate: the first from_pretrained call (the model).
+        # load_processor_gate: the second from_pretrained call (the
+        # processor) — where the load is in flight, so the gate blocks
+        # there to hold the race window open.
+        def load_model_gate(_model_id: str) -> MagicMock:
+            assert _model_id == _MODEL_ID
+            return MagicMock()
+
+        def load_processor_gate(_model_id: str) -> MagicMock:
+            # Signal that the load is in flight, then block until released
+            gate.set()
+            release.wait(timeout=5)
+            assert _model_id == _MODEL_ID
+            return MagicMock()
+
+        gate = threading.Event()
+
+        # Suppress the auto-started background load so we can run
+        # _load_model deterministically on our own thread.
+        with patch("kuiskaus.voxtral_transcriber.VoxtralTranscriber._load_model"):
+            t = VoxtralTranscriber()
+
+        def load_with_gate():
+            # The mlx_voxtral import was already paid on the main thread
+            # above; from here on it is a sys.modules cache hit.
+            # patch.object targets the real class objects: _load_model
+            # does `from mlx_voxtral import ...`, which rebinds to the
+            # same real objects, so the attribute patches are visible
+            # inside it.
+            import mlx_voxtral as mv
+
+            with (
+                patch.object(
+                    mv.VoxtralForConditionalGeneration,
+                    "from_pretrained",
+                    side_effect=load_model_gate,
+                ),
+                patch.object(
+                    mv.VoxtralProcessor,
+                    "from_pretrained",
+                    side_effect=load_processor_gate,
+                ),
+            ):
+                t._load_model()
+
+        thread = threading.Thread(target=load_with_gate, daemon=True)
+        thread.start()
+        assert gate.wait(5), "load thread did not reach the gate"
+
+        t.cleanup()
+        release.set()  # release the load; it now stores (or discards) the model
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+        assert t._model is None, "model resurrected after cleanup()"
+        assert t._processor is None, "processor resurrected after cleanup()"
+
     def test_transcribe_raises_if_model_not_loaded(self):
         from kuiskaus.voxtral_transcriber import VoxtralTranscriber
 
@@ -155,3 +236,14 @@ class TestVoxtralTranscriber:
             assert samples[1] == -32768
         finally:
             os.unlink(path)
+
+
+def test_no_sys_modules_pollution_after_import():
+    """Importing and running this file must not leak MagicMock stubs into
+    sys.modules: a later import of a real dependency must see the real
+    module, not a MagicMock. A real module has a __file__ path; a
+    MagicMock injected into sys.modules does not."""
+    import mlx_voxtral
+
+    assert not isinstance(mlx_voxtral, MagicMock)
+    assert getattr(mlx_voxtral, "__file__", None) is not None

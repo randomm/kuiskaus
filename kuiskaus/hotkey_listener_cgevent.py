@@ -3,6 +3,7 @@ from collections.abc import Callable
 import Quartz
 
 from .callback_dispatcher import CallbackDispatcher
+from .debug import DEBUG, _debug
 
 
 class HotkeyListenerCGEvent:
@@ -52,15 +53,18 @@ class HotkeyListenerCGEvent:
                 flags = Quartz.CGEventGetFlags(event)
                 modifiers_pressed = self._check_modifiers(flags)
 
-                # Debug output
+                # Debug output: only when modifier flags changed
                 if flags != 0:
-                    print(
-                        f"[DEBUG CGEvent] Modifier flags: {flags}, Control+Option pressed: {modifiers_pressed}"
+                    _debug(
+                        DEBUG,
+                        "[DEBUG CGEvent]",
+                        f"Modifier flags: {flags}, "
+                        f"Control+Option pressed: {modifiers_pressed}",
                     )
 
                 if modifiers_pressed and not self.is_pressed:
                     # Hotkey pressed
-                    print("[DEBUG CGEvent] Hotkey pressed!")
+                    _debug(DEBUG, "[DEBUG CGEvent]", "Hotkey pressed! (CGEvent)")
                     self.is_pressed = True
                     if self.on_press:
                         # Enqueue; worker runs it in event order without
@@ -69,7 +73,7 @@ class HotkeyListenerCGEvent:
 
                 elif not modifiers_pressed and self.is_pressed:
                     # Hotkey released
-                    print("[DEBUG CGEvent] Hotkey released!")
+                    _debug(DEBUG, "[DEBUG CGEvent]", "Hotkey released! (CGEvent)")
                     self.is_pressed = False
                     if self.on_release:
                         self._dispatcher.dispatch(self.on_release)
