@@ -6,6 +6,12 @@ manually via `./run_tests.sh --hardware`.
 
 Use collect_ignore (not addopts --ignore) so collection stays independent
 of pyaudio availability — tests/test_audio.py imports pyaudio at module top.
+
+Collect_ignore entries are validated at configure time: the check raises
+if an entry no longer matches a file on disk. An entry must therefore land
+in the same PR as the file it names (deleting a hardware script and
+updating this list atomically), so a stale entry can never silently let a
+hardware script into collection.
 """
 
 from pathlib import Path

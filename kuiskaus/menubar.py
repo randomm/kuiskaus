@@ -334,9 +334,12 @@ class KuiskausMenuBarApp(rumps.App):
         Reloads are serialized: each reload claims a generation under
         _reload_lock and, after loading, re-checks that it is still the
         latest. A superseded reload (one started while a newer reload is
-        already running) abandons its constructor result without
-        committing it or cleaning up the transcriber it found at start —
-        that transcriber may already be live by then (issue #22).
+        already running) must not commit its constructor result — that
+        would roll back the newer reload's swap — and must not clean up
+        the transcriber it found at start, which may already be live by
+        then (issue #22). It DOES release its own (already loaded) model
+        via best-effort cleanup() before discarding, so a superseded
+        load never keeps a model resident.
         """
         try:
             with self._reload_lock:
@@ -364,8 +367,15 @@ class KuiskausMenuBarApp(rumps.App):
                 # A newer reload is already in flight; don't commit this
                 # (stale) result — it would roll back the newer reload's
                 # swap and tear down a transcriber that may already be
-                # live (issue #22).
-                del new_transcriber
+                # live (issue #22). But the transcriber we just built IS
+                # ours to release: its model is fully loaded here
+                # (Parakeet/Whisper load in the constructor; for Voxtral
+                # the load thread is a daemon we own and cleanup() stops
+                # it), so release it before discarding.
+                try:
+                    new_transcriber.cleanup()
+                except Exception as e:  # noqa: BLE001 - logged; best-effort release
+                    print(f"⚠️  Superseded reload cleanup failed: {e}")
                 print(f"⚠️  Model reload to {model_name} superseded; discarding")
                 return
 
@@ -378,9 +388,6 @@ class KuiskausMenuBarApp(rumps.App):
             with self._transcriber_lock:
                 old_transcriber = self.transcriber
                 self.transcriber = new_transcriber
-            # Drop our last reference so the (now live) transcriber is
-            # reachable only via self.transcriber.
-            del new_transcriber
             old_transcriber.cleanup()
 
             # A model switch never touches the microphone, so it must not

@@ -24,8 +24,7 @@ class VoxtralNotLoadedError(RuntimeError):
 class VoxtralTranscriber:
     """Voxtral Realtime speech-to-text transcriber using mlx-voxtral."""
 
-    def __init__(self, model_id: str = _MODEL_ID) -> None:
-        self._model_id = model_id
+    def __init__(self) -> None:
         self._model: VoxtralForConditionalGeneration | None = None
         self._processor: VoxtralProcessor | None = None
         self._model_lock = threading.Lock()
@@ -35,21 +34,19 @@ class VoxtralTranscriber:
 
     def _load_model(self) -> None:
         """Load Voxtral model and processor in background."""
-        print(f"Loading Voxtral model: {self._model_id}")
+        print(f"Loading Voxtral model: {_MODEL_ID}")
         start = time.time()
         try:
             from mlx_voxtral import VoxtralForConditionalGeneration, VoxtralProcessor
 
-            model = VoxtralForConditionalGeneration.from_pretrained(self._model_id)
-            processor = VoxtralProcessor.from_pretrained(self._model_id)
+            model = VoxtralForConditionalGeneration.from_pretrained(_MODEL_ID)
+            processor = VoxtralProcessor.from_pretrained(_MODEL_ID)
             with self._model_lock:
                 # Discard an in-flight load if cleanup() already ran: the
                 # model would otherwise resurrect after being released.
+                # Returning here unwinds the frame and drops the local
+                # references, so nothing keeps the model resident.
                 if self._cleaned_up:
-                    # Drop the freshly loaded objects explicitly; they
-                    # would otherwise stay referenced (and resident) until
-                    # this load thread's frame unwinds.
-                    del model, processor
                     return
                 self._model = model
                 self._processor = processor

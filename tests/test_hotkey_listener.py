@@ -29,6 +29,32 @@ _MODULE_PATH = os.path.join(
 )
 
 
+def _make_package_stub() -> ModuleType:
+    """Minimal package stand-in for the `kuiskaus` name.
+
+    Only ``__path__`` is set so relative imports (``from .debug import
+    DEBUG, debug``) inside the module under test resolve against the real
+    kuiskaus/ source directory.
+    """
+    pkg = ModuleType("kuiskaus")
+    pkg.__path__ = [os.path.join(os.path.dirname(__file__), "..", "kuiskaus")]
+    return pkg
+
+
+def _load_real_submodule(monkeypatch: pytest.MonkeyPatch, name: str) -> ModuleType:
+    """Load a stdlib-only kuiskaus submodule from disk into sys.modules."""
+    rel = os.path.join("..", *name.split("."))
+    spec = importlib.util.spec_from_file_location(
+        name,
+        os.path.join(os.path.dirname(__file__), rel + ".py"),
+        submodule_search_locations=[os.path.join(os.path.dirname(__file__), rel)],
+    )
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, mod)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _make_appkit_stub() -> ModuleType:
     appkit = ModuleType("AppKit")
 
@@ -51,21 +77,14 @@ def _make_appkit_stub() -> ModuleType:
 
 def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     """Stub the kuiskaus package chain and load hotkey_listener directly."""
-    # Load the real callback_dispatcher (stdlib-only) so the module under
-    # test can import it normally.
-    dispatcher_spec = importlib.util.spec_from_file_location(
-        "kuiskaus.callback_dispatcher",
-        os.path.join(
-            os.path.dirname(__file__), "..", "kuiskaus", "callback_dispatcher.py"
-        ),
-    )
-    dispatcher_mod = importlib.util.module_from_spec(dispatcher_spec)
-    monkeypatch.setitem(sys.modules, "kuiskaus.callback_dispatcher", dispatcher_mod)
-    dispatcher_spec.loader.exec_module(dispatcher_mod)
+    # Load the real stdlib-only submodules (callback_dispatcher, debug) so
+    # the module under test can import them normally.
+    for name in ("kuiskaus.callback_dispatcher", "kuiskaus.debug"):
+        _load_real_submodule(monkeypatch, name)
 
-    # Stub the heavy submodules.
+    # Stub the heavy submodules (and the package itself, as a minimal
+    # package stub so relative imports resolve against its __path__).
     for name in (
-        "kuiskaus",
         "kuiskaus.audio_recorder",
         "kuiskaus.hotkey_listener",
         "kuiskaus.parakeet_transcriber",
@@ -75,6 +94,7 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
         "kuiskaus.whisper_transcriber",
     ):
         monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    monkeypatch.setitem(sys.modules, "kuiskaus", _make_package_stub())
 
     monkeypatch.setitem(sys.modules, "AppKit", _make_appkit_stub())
     pyobjc = ModuleType("PyObjCTools")
@@ -245,8 +265,8 @@ class TestDebugGating:
         """KUISKAUS_DEBUG=1 at import time enables DEBUG (issue #22 wiring).
 
         The constant is read once at import, so the env var must be set
-        BEFORE the module loads; the shared autouse fixture clears it
-        afterwards.
+        BEFORE the module loads; the shared autouse fixture clears the env
+        var afterwards.
         """
         monkeypatch.setenv("KUISKAUS_DEBUG", "1")
         module = _install_stubs(monkeypatch)

@@ -356,19 +356,7 @@ def test_reload_model_exception_preserves_banner_when_last_error_set(app):
 def _parked_worker(app, old):
     """Park a real _transcribe_and_insert worker inside old.transcribe().
 
-    Returns a dict with the worker thread and the events the test needs
-    to drive it:
-
-    - parked:         set once the worker is inside transcribe() (holding
-                      the transcriber lock for the entire call)
-    - release_event:  set to let the worker finish transcribe()
-    - worker_done:    set once the worker has finished
-
-    The worker snapshots app.transcriber (= old) at start and holds
-    _transcriber_lock for the entire transcribe() call, so any
-    _reload_model running concurrently is blocked on the lock until the
-    worker releases it. Both reload tests share this scaffold; the
-    deterministic events replace the old fixed sleeps.
+    Returns {"worker", "parked", "release_event", "worker_done"}.
     """
     parked = threading.Event()
     release_event = threading.Event()
@@ -507,10 +495,10 @@ def test_reload_model_serializes_concurrent_reloads(app):
     # B's swap is the final state; A's stale result was discarded.
     assert app.transcriber is b
     # A's stale constructor result was never committed (it is not the
-    # live transcriber) and never cleaned up: A was superseded by B.
-    assert not a2.cleanup.call_args, (
-        "superseded reload cleaned up its stale constructor result"
-    )
+    # live transcriber) and was released exactly once: a superseded
+    # reload must clean up its own (already loaded) model before
+    # discarding it, but must never touch the transcriber B made live.
+    a2.cleanup.assert_called_once()
     # B's old transcriber (the original) was cleaned up exactly once.
     original.cleanup.assert_called_once()
 

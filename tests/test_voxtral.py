@@ -133,7 +133,7 @@ class TestVoxtralTranscriber:
         stored"; without the _cleaned_up guard the load repopulates
         _model/_processor afterwards.
         """
-        from kuiskaus.voxtral_transcriber import VoxtralTranscriber
+        from kuiskaus.voxtral_transcriber import _MODEL_ID, VoxtralTranscriber
 
         # The load thread blocks on `release` until the main thread has
         # called cleanup() and set it — the exact in-flight window of the
@@ -145,13 +145,15 @@ class TestVoxtralTranscriber:
         # load_processor_gate: the second from_pretrained call (the
         # processor) — where the load is in flight, so the gate blocks
         # there to hold the race window open.
-        def load_model_gate(_model_id):
+        def load_model_gate(_model_id: str) -> MagicMock:
+            assert _model_id == _MODEL_ID
             return MagicMock()
 
-        def load_processor_gate(_model_id):
+        def load_processor_gate(_model_id: str) -> MagicMock:
             # Signal that the load is in flight, then block until released
             gate.set()
             release.wait(timeout=5)
+            assert _model_id == _MODEL_ID
             return MagicMock()
 
         gate = threading.Event()
