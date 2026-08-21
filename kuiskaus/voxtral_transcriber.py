@@ -29,6 +29,7 @@ class VoxtralTranscriber:
         self._model: VoxtralForConditionalGeneration | None = None
         self._processor: VoxtralProcessor | None = None
         self._model_lock = threading.Lock()
+        self._cleaned_up = False
         self._load_thread = threading.Thread(target=self._load_model, daemon=True)
         self._load_thread.start()
 
@@ -39,11 +40,15 @@ class VoxtralTranscriber:
         try:
             from mlx_voxtral import VoxtralForConditionalGeneration, VoxtralProcessor
 
+            model = VoxtralForConditionalGeneration.from_pretrained(self._model_id)
+            processor = VoxtralProcessor.from_pretrained(self._model_id)
             with self._model_lock:
-                self._model = VoxtralForConditionalGeneration.from_pretrained(
-                    self._model_id
-                )
-                self._processor = VoxtralProcessor.from_pretrained(self._model_id)
+                # Discard an in-flight load if cleanup() already ran: the
+                # model would otherwise resurrect after being released.
+                if self._cleaned_up:
+                    return
+                self._model = model
+                self._processor = processor
             print(f"Voxtral model loaded in {time.time() - start:.2f}s")
         # Top-level guard for third-party model loading: must never let a
         # load failure crash the app; the error is logged here.
@@ -137,8 +142,13 @@ class VoxtralTranscriber:
         }
 
     def cleanup(self) -> None:
-        """Release model resources."""
+        """Release model resources.
+
+        Sticks: once cleanup() has run, an in-flight background load
+        discards its result instead of repopulating the released model.
+        """
         with self._model_lock:
+            self._cleaned_up = True
             if self._model is not None:
                 del self._model
                 self._model = None

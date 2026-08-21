@@ -124,27 +124,6 @@ def _blocking_stream(read_error: Exception, release_event: threading.Event):
     return stream
 
 
-def _capture_thread(recorder):
-    """Wait until start_recording()'s spawned worker has set
-    recorder.recording_thread, then return it.
-
-    start_recording() sets the attribute and returns BEFORE the worker
-    thread can start and -- in the fast-failure cases (both opens raise
-    immediately) -- finish and clear the attribute back to None. The
-    test cannot observe a thread that has already torn itself down,
-    which is exactly the race that made these tests flaky. Bounded:
-    if the worker never sets the attribute within 2s the test fails
-    loudly instead of hanging the suite.
-    """
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        thread = recorder.recording_thread
-        if thread is not None:
-            return thread
-        time.sleep(0.01)
-    raise AssertionError("recording_thread was never set by the worker")
-
-
 # ---------------------------------------------------------------------------
 # Never wedge: a failed open must not kill the worker silently
 # ---------------------------------------------------------------------------

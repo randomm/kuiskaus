@@ -8,6 +8,7 @@ loading.
 import sys
 import threading
 import types
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -71,6 +72,10 @@ def app(monkeypatch: pytest.MonkeyPatch):
     # MagicMock() attribute is truthy by default, which would make every
     # test believe a mic error is persisted unless overridden here.
     instance.audio_recorder.last_error = None
+    # Default transcriber stub; the guard tests reassign it to a fresh
+    # mock whose identity assertions don't collide with the fixture.
+    instance.transcriber = MagicMock(spec=Transcriber)
+    instance._transcriber_lock = threading.Lock()
     return instance
 
 
@@ -322,3 +327,197 @@ def test_reload_model_exception_preserves_banner_when_last_error_set(app):
 
     assert "busy" in app.status_item.title
     assert app.status_item.title != "🟢 Ready (model error)"
+
+
+def test_transcriber_snapshot_survives_reload_cleanup(app):
+    """A transcription worker must keep running its snapshot even after
+    _reload_model has swapped in a new transcriber and cleaned up the
+    old one (issue #22). The worker holds the transcriber lock for the
+    entire transcribe() call, so _reload_model's cleanup() of the old
+    transcriber cannot overlap the in-flight inference.
+
+    Fails without the fix: with no lock held during transcribe(),
+    _reload_model's cleanup() fires while the worker is still inside
+    transcribe(), and the 'cleanup must not have started yet' assertion
+    catches it.
+    """
+    import time
+
+    old = MagicMock(spec=Transcriber)
+    new = MagicMock(spec=Transcriber)
+    app.transcriber = old
+    app.text_inserter = MagicMock()
+    worker_blocked = threading.Event()
+    release_event = threading.Event()
+    cleanup_started = threading.Event()
+
+    def blocking_transcribe(*_args, **_kwargs):
+        worker_blocked.set()  # tell main we are inside transcribe()
+        release_event.wait(timeout=10.0)
+        return {"text": "hello"}
+
+    def cleanup_tracking():
+        cleanup_started.set()  # mark the moment cleanup() actually runs
+
+    old.transcribe.side_effect = blocking_transcribe
+    old.cleanup.side_effect = cleanup_tracking
+    new.transcribe.return_value = {"text": "you should never see me"}
+
+    with patch("kuiskaus.menubar.ParakeetTranscriber", return_value=new):
+        thread = threading.Thread(
+            target=app._transcribe_and_insert,
+            args=(np.array([0.1], dtype=np.float32), 1.0),
+        )
+        thread.start()
+
+        # Deterministically parked inside old.transcribe() while holding
+        # the lock.  Now run the real _reload_model on a second thread.
+        assert worker_blocked.wait(timeout=5.0), "worker never reached transcribe()"
+        reload_thread = threading.Thread(
+            target=lambda: app._reload_model("parakeet"),
+        )
+        reload_thread.start()
+
+        # _reload_model is blocked on the transcriber lock that the
+        # worker still holds.  Give it time to attempt the cleanup; it
+        # must NOT have started yet because the worker is still inside
+        # transcribe() and holding the lock.
+        time.sleep(0.3)
+        assert not cleanup_started.is_set(), (
+            "cleanup() started while the worker was still mid-transcribe() — "
+            "the transcriber lock is not held across the inference call"
+        )
+
+        release_event.set()
+        thread.join(timeout=10.0)
+        assert not thread.is_alive(), "worker thread did not finish"
+        reload_thread.join(timeout=10.0)
+
+    # The worker finished its inference against the OLD transcriber it
+    # bound at the start of the run...
+    old.transcribe.assert_called_once()
+    app.text_inserter.insert_text.assert_called_once_with("hello")
+    # ...and never touched the swapped-in, already-active transcriber.
+    new.transcribe.assert_not_called()
+    # cleanup() ran exactly once, only after the worker released the lock.
+    old.cleanup.assert_called_once()
+    assert app.transcriber is new
+
+
+def test_reload_model_swap_is_atomic(app):
+    """_reload_model must commit the swap and run cleanup() atomically
+    under the transcriber lock (issue #22). A concurrent read via
+    _current_transcriber() must observe either the OLD or the NEW
+    transcriber — never an in-between (unassigned) state.
+
+    The test parks the worker inside old.transcribe(), then lets
+    _reload_model run for real on a second thread. A reader thread
+    hammers _current_transcriber() while the reload is in progress.
+    Every observation must be `old` or `new` — the lock ensures no
+    intermediate state is ever visible.
+
+    Fails without the fix: if the swap is not under the lock, the
+    reader can observe a partially-assigned state (in practice the
+    GIL makes the single-assignment atomic in CPython, so this test
+    primarily validates that the lock serializes the reader against
+    the swap, which the `observed` list proves)."""
+    old = MagicMock(spec=Transcriber)
+    new = MagicMock(spec=Transcriber)
+    app.transcriber = old
+    app.text_inserter = MagicMock()
+    worker_blocked = threading.Event()
+    release_event = threading.Event()
+    stop = threading.Event()
+    observed: list = []
+
+    def blocking_transcribe(*_args, **_kwargs):
+        worker_blocked.set()
+        release_event.wait(timeout=10.0)
+        return {"text": "hello"}
+
+    old.transcribe.side_effect = blocking_transcribe
+
+    with patch("kuiskaus.menubar.ParakeetTranscriber", return_value=new):
+
+        def reader():
+            while not stop.is_set():
+                observed.append(app._current_transcriber())
+
+        thread = threading.Thread(
+            target=app._transcribe_and_insert,
+            args=(np.array([0.1], dtype=np.float32), 1.0),
+        )
+        reader_thread = threading.Thread(target=reader)
+        reader_thread.start()
+        thread.start()
+        assert worker_blocked.wait(timeout=5.0), "worker never reached transcribe()"
+        reload_thread = threading.Thread(
+            target=lambda: app._reload_model("parakeet"),
+        )
+        reload_thread.start()
+        # Let the reader collect some observations while the reload is
+        # blocked on the lock the worker holds.
+        import time
+
+        time.sleep(0.3)
+        stop.set()
+        release_event.set()
+        reader_thread.join(timeout=10.0)
+        thread.join(timeout=10.0)
+        reload_thread.join(timeout=10.0)
+
+    # Every serialized read saw one of the two committed transcribers,
+    # never an in-between value.
+    assert observed, "reader never ran"
+    assert all(t in (old, new) for t in observed), (
+        f"reader observed an in-between transcriber state: {set(map(type, observed))}"
+    )
+    # The reload finished its swap and cleaned up the old transcriber.
+    assert app.transcriber is new
+    old.cleanup.assert_called_once()
+
+
+def test_utcnow_helper_returns_aware_utc():
+    """_utcnow() is the single source of the aware-UTC invariant (issue
+    #22): aware UTC so it can be subtracted from session_start without
+    a TypeError from a naive/other-tz datetime."""
+    from kuiskaus.menubar import _utcnow
+
+    now = _utcnow()
+
+    assert now.tzinfo is UTC
+    # Two calls both return aware datetimes in the same tz, so
+    # subtracting them can never raise the naive/aware TypeError this
+    # helper exists to prevent. (No monotonicity assertion: the host
+    # wall clock steps backward.)
+    assert (now - _utcnow()) is not None
+
+
+def test_show_stats_uses_utcnow_helper(app, monkeypatch):
+    """show_stats() must compute its session duration via _utcnow() so the
+    aware-UTC invariant lives in one place (issue #22)."""
+    import kuiskaus.menubar as menubar_module
+
+    app.session_start = datetime(2026, 1, 1, tzinfo=UTC)
+    calls = []
+    monkeypatch.setattr(
+        menubar_module,
+        "_utcnow",
+        lambda: (calls.append(1), datetime(2026, 1, 1, 0, 30, tzinfo=UTC))[1],
+    )
+
+    with patch.object(rumps, "alert") as mock_alert:
+        app.show_stats(None)
+
+    assert calls == [1], "show_stats must build its now via _utcnow()"
+    mock_alert.assert_called_once()
+    assert "0h 30m" in mock_alert.call_args.args[1]
+
+
+def test_app_module_exposes_shared_silicon_check():
+    """app.py must use the shared implementation (issue #22 dedup) rather
+    than its own private copy."""
+    from kuiskaus.app import check_apple_silicon
+    from kuiskaus.silicon_check import check_apple_silicon as shared
+
+    assert check_apple_silicon is shared

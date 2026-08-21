@@ -14,6 +14,7 @@ from .audio_recorder import AudioRecorder
 from .hotkey_listener import HotkeyListener
 from .parakeet_transcriber import ParakeetTranscriber
 from .postprocessor import clean_with_apfel
+from .silicon_check import check_apple_silicon
 from .text_inserter import TextInserter
 from .transcriber import Transcriber
 from .whisper_transcriber import WhisperTranscriber
@@ -231,22 +232,6 @@ class KuiskausApp:
         self.transcriber.cleanup()
         self.print_stats()
         print("👋 Goodbye!")
-
-
-def check_apple_silicon():
-    """Check if running on Apple Silicon"""
-    try:
-        import subprocess
-
-        result = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return "Apple" in result.stdout
-    except (subprocess.SubprocessError, OSError):
-        return False
 
 
 def main():

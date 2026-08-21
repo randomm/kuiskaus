@@ -1,8 +1,13 @@
+import os
 from collections.abc import Callable
 
 import Quartz
 
 from .callback_dispatcher import CallbackDispatcher
+
+# Per-event [DEBUG] output is off by default; any non-empty value of
+# KUISKAUS_DEBUG enables it (issue #22). Read once at import.
+DEBUG = bool(os.environ.get("KUISKAUS_DEBUG"))
 
 
 class HotkeyListenerCGEvent:
@@ -53,14 +58,15 @@ class HotkeyListenerCGEvent:
                 modifiers_pressed = self._check_modifiers(flags)
 
                 # Debug output
-                if flags != 0:
+                if DEBUG and flags != 0:
                     print(
                         f"[DEBUG CGEvent] Modifier flags: {flags}, Control+Option pressed: {modifiers_pressed}"
                     )
 
                 if modifiers_pressed and not self.is_pressed:
                     # Hotkey pressed
-                    print("[DEBUG CGEvent] Hotkey pressed!")
+                    if DEBUG:
+                        print("[DEBUG CGEvent] Hotkey pressed!")
                     self.is_pressed = True
                     if self.on_press:
                         # Enqueue; worker runs it in event order without
@@ -69,7 +75,8 @@ class HotkeyListenerCGEvent:
 
                 elif not modifiers_pressed and self.is_pressed:
                     # Hotkey released
-                    print("[DEBUG CGEvent] Hotkey released!")
+                    if DEBUG:
+                        print("[DEBUG CGEvent] Hotkey released!")
                     self.is_pressed = False
                     if self.on_release:
                         self._dispatcher.dispatch(self.on_release)

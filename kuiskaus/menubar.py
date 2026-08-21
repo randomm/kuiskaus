@@ -15,9 +15,19 @@ from .audio_recorder import AudioRecorder
 from .hotkey_listener_cgevent import HotkeyListenerCGEvent
 from .parakeet_transcriber import ParakeetTranscriber
 from .postprocessor import clean_with_apfel
+from .silicon_check import check_apple_silicon
 from .text_inserter import TextInserter
 from .transcriber import Transcriber
 from .whisper_transcriber import WhisperTranscriber
+
+
+def _utcnow() -> datetime:
+    """The one place the app builds a current-time datetime.
+
+    Every comparison against session/recording state assumes aware
+    UTC datetimes; a naive datetime would raise TypeError. Keeping the
+    invariant here (issue #22) instead of at each call site."""
+    return datetime.now(tz=UTC)
 
 
 class KuiskausMenuBarApp(rumps.App):
@@ -44,6 +54,10 @@ class KuiskausMenuBarApp(rumps.App):
         self.enabled = True
         self.use_apfel: bool = False
         self._apfel_lock = threading.Lock()
+        # Guards self.transcriber: a worker thread snapshots it at the
+        # start of work, _reload_model swaps it while holding the lock
+        # (issue #22: an unguarded swap races a worker mid-inference).
+        self._transcriber_lock = threading.Lock()
 
         # Initialize hotkey listener with CGEventTap
         self.hotkey_listener = HotkeyListenerCGEvent(
@@ -53,7 +67,7 @@ class KuiskausMenuBarApp(rumps.App):
         # Stats
         self.total_transcriptions = 0
         self.total_recording_time = 0.0
-        self.session_start = datetime.now(tz=UTC)
+        self.session_start = _utcnow()
 
         # Setup menu
         self.setup_menu()
@@ -261,8 +275,15 @@ class KuiskausMenuBarApp(rumps.App):
     ) -> None:
         """Transcribe audio and insert text (runs in separate thread)"""
         try:
-            # Transcribe
-            result = self.transcriber.transcribe(audio_data)
+            # Hold the transcriber lock for the entire inference call so
+            # _reload_model cannot swap self.transcriber and run
+            # old_transcriber.cleanup() while this worker is still
+            # mid-transcribe() on that same object (issue #22).
+            # Only transcribe() is serialized; apfel and insertion run
+            # outside the lock since they don't touch the transcriber.
+            with self._transcriber_lock:
+                transcriber = self.transcriber
+                result = transcriber.transcribe(audio_data)
             text = result.get("text", "").strip()
 
             # Apply apfel cleanup if enabled
@@ -300,6 +321,11 @@ class KuiskausMenuBarApp(rumps.App):
             if not self.audio_recorder.last_error:
                 self.update_status("🟢 Ready (error)")
 
+    def _current_transcriber(self) -> Transcriber:
+        """Read self.transcriber under the transcriber lock."""
+        with self._transcriber_lock:
+            return self.transcriber
+
     def update_status(self, status: str):
         """Update the status menu item"""
         self.status_item.title = status
@@ -314,23 +340,28 @@ class KuiskausMenuBarApp(rumps.App):
     def _reload_model(self, model_name: str):
         """Reload the model in background"""
         try:
-            old_transcriber = self.transcriber
+            new_transcriber: Transcriber
             if model_name == "parakeet":
-                self.transcriber: Transcriber = ParakeetTranscriber()
+                new_transcriber = ParakeetTranscriber()
             elif model_name == "voxtral":
                 from .voxtral_transcriber import VoxtralTranscriber
 
-                self.transcriber: Transcriber = VoxtralTranscriber()
+                new_transcriber = VoxtralTranscriber()
             else:
-                self.transcriber: Transcriber = WhisperTranscriber(
-                    model_name=model_name
-                )
-            if not isinstance(self.transcriber, Transcriber):
+                new_transcriber = WhisperTranscriber(model_name=model_name)
+            if not isinstance(new_transcriber, Transcriber):
                 raise TypeError(
-                    f"Transcriber implementation {type(self.transcriber)} does not satisfy "
+                    f"Transcriber implementation {type(new_transcriber)} does not satisfy "
                     "the Transcriber protocol"
                 )
-            old_transcriber.cleanup()
+            # Read, swap AND clean up the old transcriber all while holding
+            # the lock: an in-flight worker holds the lock while it calls
+            # transcribe(), so the worker cannot run inference on a
+            # transcriber that is being torn down (issue #22).
+            with self._transcriber_lock:
+                old_transcriber = self.transcriber
+                self.transcriber = new_transcriber
+                old_transcriber.cleanup()
 
             # A model switch never touches the microphone, so it must not
             # clear a live mic-error banner (#16 DoD: persists until the
@@ -349,7 +380,7 @@ class KuiskausMenuBarApp(rumps.App):
     @rumps.clicked("Statistics...")
     def show_stats(self, _):
         """Show statistics dialog"""
-        session_duration = (datetime.now(tz=UTC) - self.session_start).total_seconds()
+        session_duration = (_utcnow() - self.session_start).total_seconds()
         hours = int(session_duration // 3600)
         minutes = int((session_duration % 3600) // 60)
 
@@ -397,25 +428,9 @@ Version 1.0
         try:
             self.hotkey_listener.stop()
             self.audio_recorder.cleanup()
-            self.transcriber.cleanup()
+            self._current_transcriber().cleanup()
         except Exception as e:  # noqa: BLE001 - logged; must not raise from quit
             print(f"Cleanup error: {e}")
-
-
-def check_apple_silicon():
-    """Check if running on Apple Silicon"""
-    try:
-        import subprocess
-
-        result = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return "Apple" in result.stdout
-    except (subprocess.SubprocessError, OSError):
-        return False
 
 
 def main():

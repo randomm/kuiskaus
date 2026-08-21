@@ -51,6 +51,9 @@ def _make_appkit_stub() -> ModuleType:
 
 def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     """Stub the kuiskaus package chain and load hotkey_listener directly."""
+    # Reset the env var so the module-level DEBUG constant is deterministic
+    # per test (issue #22).
+    monkeypatch.delenv("KUISKAUS_DEBUG", raising=False)
     # Load the real callback_dispatcher (stdlib-only) so the module under
     # test can import it normally.
     dispatcher_spec = importlib.util.spec_from_file_location(
@@ -214,6 +217,24 @@ class TestHotkeyListenerDispatch:
         listener._dispatcher.stop()
         listener._dispatcher.stop()  # must not raise
 
+
+class TestDebugGating:
+    """Per-event [DEBUG] prints are opt-in via KUISKAUS_DEBUG (issue #22)."""
+
+    def test_debug_output_off_by_default(self, listener_module, capsys):
+        _feed(_make_listener(listener_module), True, False)
+        captured = capsys.readouterr().out
+        assert "[DEBUG]" not in captured
+
+    def test_debug_output_on_when_enabled(self, listener_module, monkeypatch, capsys):
+        monkeypatch.setattr(listener_module, "DEBUG", True)
+        _feed(_make_listener(listener_module), True, False)
+        captured = capsys.readouterr().out
+        assert "[DEBUG] Hotkey pressed!" in captured
+        assert "[DEBUG] Hotkey released!" in captured
+
+
+class TestRunLoopGuard:
     def test_run_loop_guard_survives(self, listener_module):
         """A raising event handler must not crash the run loop."""
         listener = _make_listener(listener_module)
