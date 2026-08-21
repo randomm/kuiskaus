@@ -1,0 +1,49 @@
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# No workflow-level paths filter: a skipped workflow reports no status at
+# all and would block a PR forever against the required check.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Job id doubles as the status check name — no `name:` key, so the
+  # required check is exactly `quality-gates`.
+  quality-gates:
+    # Apple Silicon runner; pinned (not `macos-latest`, which silently
+    # migrated to macOS 26).
+    runs-on: macos-15
+    # >2x the measured 4-6 min cold `uv sync` install.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # PyAudio ships sdist only on macOS and builds from source against
+      # PortAudio, so install and verify it before syncing.
+      - run: brew install portaudio
+      - run: test -f /opt/homebrew/opt/portaudio/lib/libportaudio.dylib
+      - run: test -f /opt/homebrew/opt/portaudio/include/portaudio.h
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.9.x"
+          python-version: "3.11"
+          enable-cache: true
+
+      # `uv lock --check` before install: a stale lockfile then produces a
+      # precise "lockfile is stale" message instead of an install error.
+      - run: uv lock --check
+      - run: uv sync --frozen
+
+      # The four documented gates, cheap to expensive, verbatim from
+      # AGENTS.md "Pre-Push Quality Gates".
+      - run: uv run ruff check kuiskaus/ tests/
+      - run: uv run ruff format --check kuiskaus/ tests/
+      - run: uv run ty check kuiskaus/
+      - run: ./run_tests.sh
