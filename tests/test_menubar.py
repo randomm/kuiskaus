@@ -37,6 +37,62 @@ class _FakeCGEventListener:
         pass
 
 
+def _fake_parakeet_transcriber_class():
+    """Real class (not a MagicMock) standing in for ParakeetTranscriber.
+
+    _reload_model compares the constructor result's exact type (type()
+    identity) against the real ParakeetTranscriber class to decide
+    whether the background load must be verified; a MagicMock stub can
+    never satisfy that identity, so the stub needs a real class. Instances report a loaded model
+    unless configured otherwise (the unusable-model test flips them).
+    _load_model is a no-op stub: real ParakeetTranscriber runs the model
+    load on a background thread, and the tests suppress it exactly as
+    they do for the real class.
+    """
+
+    class ParakeetTranscriberStub:
+        def __init__(self) -> None:
+            self.model: object = MagicMock(name="parakeet-model")
+
+        def transcribe(self, audio, **kwargs):
+            return {"text": ""}
+
+        def cleanup(self) -> None:
+            self.model = None
+
+        def _ensure_loaded(self) -> None:
+            if self.model is None:
+                raise RuntimeError("Parakeet model failed to load")
+
+        def _load_model(self) -> None:
+            pass
+
+    return ParakeetTranscriberStub
+
+
+def _fake_whisper_transcriber_class():
+    """Real class (not a MagicMock) standing in for WhisperTranscriber.
+
+    The fixture's default reload target is "whisper" (the app's default
+    model), and menubar's reload path compares the constructor result's
+    exact type (type() identity) against the real WhisperTranscriber
+    class; a MagicMock stub can never satisfy that identity, so the stub
+    needs a real class.
+    """
+
+    class WhisperTranscriberStub:
+        def __init__(self, model_name: str = "turbo", device=None) -> None:
+            self.model_name = model_name
+
+        def transcribe(self, audio, **kwargs):
+            return {"text": ""}
+
+        def cleanup(self) -> None:
+            pass
+
+    return WhisperTranscriberStub
+
+
 def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub hardware/model dependencies before importing menubar."""
     fake_quartz = types.ModuleType("Quartz")
@@ -51,18 +107,33 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_audio = types.ModuleType("kuiskaus.audio_recorder")
     fake_audio.AudioRecorder = MagicMock()
 
-    # spec=Transcriber so real isinstance(..., Transcriber) protocol checks
-    # in menubar.py (__init__ and _reload_model) pass against these stubs,
-    # same as they would against a real transcriber implementation.
+    # Real class (see _fake_parakeet_transcriber_class): menubar's
+    # type() identity check on the reload path needs a real class
+    # identity, and the instances satisfy the Transcriber protocol for
+    # the isinstance(..., Transcriber) check. The class is also patched
+    # directly onto the already-imported menubar module so the reload
+    # path and the __init__ path see the same stub identity.
     fake_parakeet = types.ModuleType("kuiskaus.parakeet_transcriber")
-    fake_parakeet.ParakeetTranscriber = MagicMock(
-        return_value=MagicMock(spec=Transcriber)
-    )
+    parakeet_cls = _fake_parakeet_transcriber_class()
+    fake_parakeet.ParakeetTranscriber = parakeet_cls
+
+    try:
+        import kuiskaus.menubar as _menubar
+
+        monkeypatch.setattr(_menubar, "ParakeetTranscriber", parakeet_cls)
+    except ImportError:
+        pass  # menubar not imported yet; the sys.modules stub covers it
 
     fake_whisper = types.ModuleType("kuiskaus.whisper_transcriber")
-    fake_whisper.WhisperTranscriber = MagicMock(
-        return_value=MagicMock(spec=Transcriber)
-    )
+    whisper_cls = _fake_whisper_transcriber_class()
+    fake_whisper.WhisperTranscriber = whisper_cls
+
+    try:
+        import kuiskaus.menubar as _menubar
+
+        monkeypatch.setattr(_menubar, "WhisperTranscriber", whisper_cls)
+    except ImportError:
+        pass  # menubar not imported yet; the sys.modules stub covers it
 
     fake_text = types.ModuleType("kuiskaus.text_inserter")
     fake_text.TextInserter = MagicMock()
@@ -318,11 +389,16 @@ def test_reload_model_success_preserves_banner_when_last_error_set(app):
     is live, a successful model reload must not silently clear it (#16
     DoD: persists until the next successful *recording*, not a model
     switch)."""
-    app.transcriber = MagicMock()
+    # spec=Transcriber so an attribute that does not exist on the
+    # protocol raises instead of silently succeeding (same defect class
+    # as the bare-MagicMock last_error fixture bug, issue #22 review).
+    app.transcriber = MagicMock(spec=Transcriber)
     app.audio_recorder.last_error = "microphone busy — recording did not start"
     app.status_item.title = f"🔴 {app.audio_recorder.last_error}"
 
-    app._reload_model("parakeet")
+    with patch("kuiskaus.menubar.ParakeetTranscriber") as mock_ctor:
+        mock_ctor.return_value = app.transcriber
+        app._reload_model("parakeet")
 
     assert "busy" in app.status_item.title
     assert app.status_item.title != "🟢 Ready"
@@ -331,10 +407,12 @@ def test_reload_model_success_preserves_banner_when_last_error_set(app):
 def test_reload_model_success_clears_ready_without_last_error(app):
     """Without a persisted mic error, a successful model reload still
     resets the status to Ready."""
-    app.transcriber = MagicMock()
+    app.transcriber = MagicMock(spec=Transcriber)
     app.audio_recorder.last_error = None
 
-    app._reload_model("parakeet")
+    with patch("kuiskaus.menubar.ParakeetTranscriber") as mock_ctor:
+        mock_ctor.return_value = app.transcriber
+        app._reload_model("parakeet")
 
     assert app.status_item.title == "🟢 Ready"
 
@@ -342,7 +420,7 @@ def test_reload_model_success_clears_ready_without_last_error(app):
 def test_reload_model_exception_preserves_banner_when_last_error_set(app):
     """A model-reload failure must not clobber a live mic-error banner
     either -- same rationale as the success path above."""
-    app.transcriber = MagicMock()
+    app.transcriber = MagicMock(spec=Transcriber)
     app.transcriber.cleanup.side_effect = RuntimeError("boom")
     app.audio_recorder.last_error = "microphone busy — recording did not start"
     app.status_item.title = f"🔴 {app.audio_recorder.last_error}"
@@ -353,10 +431,48 @@ def test_reload_model_exception_preserves_banner_when_last_error_set(app):
     assert app.status_item.title != "🟢 Ready (model error)"
 
 
+def test_reload_model_unusable_model_reports_failure(app):
+    """A reload whose new transcriber's background load FAILED must not
+    report success (issue #22 review): the swap must not commit (the
+    old transcriber keeps serving), and the failure must surface via
+    update_status — not a '✅ Model changed' log."""
+    from kuiskaus.parakeet_transcriber import ParakeetTranscriber as RealParakeet
+
+    original = MagicMock(spec=Transcriber)
+    # A REAL ParakeetTranscriber with the load thread suppressed and the
+    # model forced to None: the reload's type() identity check must run
+    # its load verification on it (a bare MagicMock can't satisfy the
+    # real-class identity check by design). With the guard removed the
+    # reload would commit this dead transcriber and claim success.
+    with patch("kuiskaus.parakeet_transcriber.ParakeetTranscriber._load_model"):
+        failed = RealParakeet()
+    failed.model = None  # simulate a failed background load
+    app.transcriber = original
+
+    import kuiskaus.menubar as menubar_module
+
+    with patch.object(menubar_module, "ParakeetTranscriber", return_value=failed):
+        app._reload_model("parakeet")
+
+    # The unusable transcriber was never committed and the live one was
+    # never torn down by the failed reload.
+    assert app.transcriber is original
+    original.cleanup.assert_not_called()
+    # The unusable model was released before discarding (no dead model
+    # left resident).
+    assert failed.model is None
+    # The failure surfaced through the existing status mechanism
+    # ("Log instead of notification"), as a model error, not Ready.
+    assert app.status_item.title == "🟢 Ready (model error)"
+
+
 def _parked_worker(app, old):
     """Park a real _transcribe_and_insert worker inside old.transcribe().
 
     Returns {"worker", "parked", "release_event", "worker_done"}.
+    "parked" means the worker is inside transcribe() (with the
+    transcriber lock held by the fixed source); "release_event" lets it
+    finish; "worker_done" is set when transcribe() returns.
     """
     parked = threading.Event()
     release_event = threading.Event()
@@ -391,44 +507,61 @@ def test_transcriber_snapshot_survives_reload_cleanup(app):
     entire transcribe() call, so _reload_model's cleanup() of the old
     transcriber cannot overlap the in-flight inference.
 
+    Deterministic by construction: the reload thread is started while
+    the worker is parked inside transcribe(), and the mock cleanup()
+    records — at the exact moment it runs — whether the worker had
+    already returned from transcribe() (worker_done). In the fixed
+    source the reload blocks on the transcriber lock the worker holds
+    across transcribe(), so cleanup() can only run after the worker
+    released it, i.e. after worker_done is set: the recorded value is
+    always True and the assertion passes. If the lock-across-
+    transcribe guard is removed, the reload needs no lock to swap and
+    clean up, so cleanup() can run while the worker is still inside
+    transcribe(): the recorded value is False and the assertion fails.
+    The recording happens inside cleanup(), so there is no check window
+    for the main thread to race in — the ordering is captured at the
+    point where it happens.
+
     Fails without the fix: with no lock held during transcribe(),
     _reload_model's cleanup() fires while the worker is still inside
-    transcribe(), and the 'cleanup must not have started yet' assertion
+    transcribe(), and the 'cleanup must have seen worker_done' assertion
     catches it.
     """
     old = MagicMock(spec=Transcriber)
     new = MagicMock(spec=Transcriber)
     app.transcriber = old
     scaffold = _parked_worker(app, old)
-    cleanup_started = threading.Event()
     cleanup_gate = threading.Event()
-    # Block cleanup() so the 'must not have started yet' check below is
-    # deterministic: if the (buggy) reload ever reached cleanup() while
-    # the worker was mid-transcribe(), the gate would be set here.
-    old.cleanup.side_effect = lambda: (
-        cleanup_started.set(),
-        cleanup_gate.wait(timeout=10.0),
-    )
+    # Recorded by the mock cleanup() at the moment it runs: had the
+    # worker already returned from transcribe()?
+    cleanup_saw_worker_done = []
+
+    def gated_cleanup():
+        cleanup_saw_worker_done.append(scaffold["worker_done"].is_set())
+        cleanup_gate.wait(timeout=10.0)
+
+    old.cleanup.side_effect = gated_cleanup
     new.transcribe.return_value = {"text": "you should never see me"}
 
     with patch("kuiskaus.menubar.ParakeetTranscriber", return_value=new):
         scaffold["worker"].start()
         # Deterministically parked inside old.transcribe() while holding
-        # the transcriber lock.
+        # the transcriber lock (fixed source), or just parked inside
+        # old.transcribe() without the lock (broken source).
         assert scaffold["parked"].wait(timeout=5.0), "worker never reached transcribe()"
+        # Start the reload while the worker is still inside transcribe():
+        # in the fixed source it blocks on the transcriber lock; in the
+        # broken source it proceeds straight to the swap and cleanup().
         reload_thread = threading.Thread(
             target=lambda: app._reload_model("parakeet"),
         )
         reload_thread.start()
         # The worker now finishes transcribe() and releases the lock;
         # the reload (blocked on the lock the whole time) commits its
-        # swap and then runs cleanup() — which blocks on the gate.
+        # swap and then runs cleanup() — which records worker_done and
+        # blocks on the gate.
         scaffold["release_event"].set()
         assert scaffold["worker_done"].wait(timeout=10.0), "worker never finished"
-        assert not cleanup_started.is_set(), (
-            "cleanup() started while the worker was still mid-transcribe() — "
-            "the transcriber lock is not held across the inference call"
-        )
         # Let the reload finish its (now unblocked) cleanup.
         cleanup_gate.set()
         reload_thread.join(timeout=10.0)
@@ -440,8 +573,16 @@ def test_transcriber_snapshot_survives_reload_cleanup(app):
     app.text_inserter.insert_text.assert_called_once_with("hello")
     # ...and never touched the swapped-in, already-active transcriber.
     new.transcribe.assert_not_called()
-    # cleanup() ran exactly once, only after the worker released the lock.
+    # cleanup() ran exactly once.
     old.cleanup.assert_called_once()
+    # The invariant the test proves: cleanup() ran only after the worker
+    # had returned from transcribe() (released the transcriber lock).
+    # Recorded inside cleanup() itself, so there is no main-thread check
+    # window to race against.
+    assert cleanup_saw_worker_done and cleanup_saw_worker_done[0], (
+        "cleanup() ran while the worker was still mid-transcribe() — "
+        "the transcriber lock is not held across the inference call"
+    )
     assert app.transcriber is new
 
 

@@ -4,13 +4,7 @@ from AppKit import NSEvent
 from PyObjCTools import AppHelper
 
 from .callback_dispatcher import CallbackDispatcher
-from .debug import DEBUG, debug
-
-
-def _debug(*args: object) -> None:
-    """Emit [DEBUG]-tagged output only when KUISKAUS_DEBUG is enabled."""
-    debug(DEBUG, "[DEBUG]", *args)
-
+from .debug import DEBUG, _debug
 
 # Define event masks
 NSKeyDownMask = 1 << 10
@@ -90,7 +84,7 @@ class HotkeyListener:
 
                 if modifiers_pressed and not self.is_pressed:
                     # Hotkey pressed
-                    _debug(DEBUG, "[DEBUG]", "Hotkey pressed!")
+                    _debug(DEBUG, "[DEBUG]", "Hotkey pressed! (NSEvent)")
                     self.is_pressed = True
                     if self.on_press:
                         # Dispatch to the shared worker so press/release
@@ -99,7 +93,7 @@ class HotkeyListener:
 
                 elif not modifiers_pressed and self.is_pressed:
                     # Hotkey released
-                    _debug(DEBUG, "[DEBUG]", "Hotkey released!")
+                    _debug(DEBUG, "[DEBUG]", "Hotkey released! (NSEvent)")
                     self.is_pressed = False
                     if self.on_release:
                         self._dispatcher.dispatch(self.on_release)

@@ -22,3 +22,13 @@ def debug(enabled: bool, *args: object) -> None:
     """
     if enabled:
         print(*args)
+
+
+def _debug(enabled: bool, tag: str, *args: object) -> None:
+    """Gated debug line with the module's tag exactly once.
+
+    Shared by both hotkey listeners (issue #22): the listener passes its
+    module-level ``DEBUG`` binding and its own tag, so the tag appears
+    exactly once per line (the listeners used to supply it twice).
+    """
+    debug(enabled, tag, *args)

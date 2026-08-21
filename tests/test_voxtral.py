@@ -133,6 +133,16 @@ class TestVoxtralTranscriber:
         stored"; without the _cleaned_up guard the load repopulates
         _model/_processor afterwards.
         """
+        # Warm the mlx_voxtral import on the main thread BEFORE starting
+        # the load thread: on a cold CI runner the first import of
+        # mlx_voxtral (which pulls in torch/transformers) takes far
+        # longer than the 5s gate budget, so leaving it for the thread
+        # made "load thread did not reach the gate" race against the
+        # import time (issue #22, CI run 32517118857). The thread's
+        # job is only to reach the patched from_pretrained, so the
+        # import cost must sit outside the timed window.
+        import mlx_voxtral  # noqa: F401  # warm-up; see note above
+
         from kuiskaus.voxtral_transcriber import _MODEL_ID, VoxtralTranscriber
 
         # The load thread blocks on `release` until the main thread has
@@ -164,9 +174,12 @@ class TestVoxtralTranscriber:
             t = VoxtralTranscriber()
 
         def load_with_gate():
-            # patch.object targets the real class objects: _load_model does
-            # `from mlx_voxtral import ...`, which rebinds to the same real
-            # objects, so the attribute patches are visible inside it.
+            # The mlx_voxtral import was already paid on the main thread
+            # above; from here on it is a sys.modules cache hit.
+            # patch.object targets the real class objects: _load_model
+            # does `from mlx_voxtral import ...`, which rebinds to the
+            # same real objects, so the attribute patches are visible
+            # inside it.
             import mlx_voxtral as mv
 
             with (

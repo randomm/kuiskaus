@@ -3,12 +3,7 @@ from collections.abc import Callable
 import Quartz
 
 from .callback_dispatcher import CallbackDispatcher
-from .debug import DEBUG, debug
-
-
-def _debug(*args: object) -> None:
-    """Emit [DEBUG CGEvent]-tagged output only when KUISKAUS_DEBUG is enabled."""
-    debug(DEBUG, "[DEBUG CGEvent]", *args)
+from .debug import DEBUG, _debug
 
 
 class HotkeyListenerCGEvent:
@@ -63,12 +58,13 @@ class HotkeyListenerCGEvent:
                     _debug(
                         DEBUG,
                         "[DEBUG CGEvent]",
-                        f"Modifier flags: {flags}, Control+Option pressed: {modifiers_pressed}",
+                        f"Modifier flags: {flags}, "
+                        f"Control+Option pressed: {modifiers_pressed}",
                     )
 
                 if modifiers_pressed and not self.is_pressed:
                     # Hotkey pressed
-                    _debug(DEBUG, "[DEBUG CGEvent]", "Hotkey pressed!")
+                    _debug(DEBUG, "[DEBUG CGEvent]", "Hotkey pressed! (CGEvent)")
                     self.is_pressed = True
                     if self.on_press:
                         # Enqueue; worker runs it in event order without
@@ -77,7 +73,7 @@ class HotkeyListenerCGEvent:
 
                 elif not modifiers_pressed and self.is_pressed:
                     # Hotkey released
-                    _debug(DEBUG, "[DEBUG CGEvent]", "Hotkey released!")
+                    _debug(DEBUG, "[DEBUG CGEvent]", "Hotkey released! (CGEvent)")
                     self.is_pressed = False
                     if self.on_release:
                         self._dispatcher.dispatch(self.on_release)

@@ -243,8 +243,8 @@ class TestDebugGating:
     expression fails in either direction.
     """
 
-    PRESS_PRINT = "[DEBUG] Hotkey pressed!"
-    RELEASE_PRINT = "[DEBUG] Hotkey released!"
+    PRESS_PRINT = "[DEBUG] Hotkey pressed! (NSEvent)"
+    RELEASE_PRINT = "[DEBUG] Hotkey released! (NSEvent)"
 
     def test_debug_output_off_by_default(self, listener_module, capsys):
         _feed(_make_listener(listener_module), True, False)

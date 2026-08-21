@@ -276,8 +276,8 @@ class TestDebugGating:
     expression fails in either direction.
     """
 
-    PRESS_PRINT = "[DEBUG CGEvent] Hotkey pressed!"
-    RELEASE_PRINT = "[DEBUG CGEvent] Hotkey released!"
+    PRESS_PRINT = "[DEBUG CGEvent] Hotkey pressed! (CGEvent)"
+    RELEASE_PRINT = "[DEBUG CGEvent] Hotkey released! (CGEvent)"
 
     def test_debug_output_off_by_default(self, listener_module, capsys):
         listener = _make_listener(listener_module)

@@ -340,6 +340,14 @@ class KuiskausMenuBarApp(rumps.App):
         then (issue #22). It DOES release its own (already loaded) model
         via best-effort cleanup() before discarding, so a superseded
         load never keeps a model resident.
+
+        Success is reported only for a transcriber that is actually
+        usable: Parakeet and Voxtral load in a background thread, so a
+        successful constructor can still mean a failed (or still
+        running) load; reporting the switch as done in that case would
+        leave the UI claiming a working model while transcription cannot
+        function (issue #22 review). An unusable result is discarded
+        with the same failure path a constructor error takes.
         """
         try:
             with self._reload_lock:
@@ -360,6 +368,29 @@ class KuiskausMenuBarApp(rumps.App):
                     f"Transcriber implementation {type(new_transcriber)} does not satisfy "
                     "the Transcriber protocol"
                 )
+            # Background-load transcribers (Parakeet, Voxtral) swallow
+            # load errors into their own state: the constructor succeeds
+            # even when the model failed to load, so the reload must not
+            # report success for a dead model (issue #22 review). Verify
+            # against the REAL class (not the module attribute, which a
+            # test patch may have replaced with a mock — isinstance() vs
+            # a MagicMock raises TypeError): type() identity is stable
+            # for stub instances whose class is a plain class.
+            # Whisper loads eagerly in its constructor and raises on
+            # failure, so its model is ready there.
+            from .parakeet_transcriber import ParakeetTranscriber as _P
+            from .voxtral_transcriber import VoxtralTranscriber as _V
+
+            if type(new_transcriber) is _P:
+                new_transcriber._ensure_loaded()
+                if new_transcriber.model is None:
+                    new_transcriber.cleanup()
+                    raise RuntimeError("Model parakeet failed to load")
+            elif type(new_transcriber) is _V:
+                new_transcriber._ensure_loaded()
+                if new_transcriber._model is None:
+                    new_transcriber.cleanup()
+                    raise RuntimeError("Model voxtral failed to load")
 
             with self._reload_lock:
                 superseded = generation != self._reload_generation
@@ -384,11 +415,16 @@ class KuiskausMenuBarApp(rumps.App):
             # the snapshot-and-swap isolates an in-flight worker from the
             # teardown (it keeps its own reference and finishes on a live
             # object). Cleanup of the old model can take seconds, so it
-            # runs outside the lock (issue #22).
+            # runs outside the lock (issue #22). Best-effort guard, same
+            # as the superseded-reload branch above: a failing cleanup
+            # must not mask a successful swap (issue #22 review).
             with self._transcriber_lock:
                 old_transcriber = self.transcriber
                 self.transcriber = new_transcriber
-            old_transcriber.cleanup()
+            try:
+                old_transcriber.cleanup()
+            except Exception as e:  # noqa: BLE001 - logged; best-effort release
+                print(f"⚠️  Old transcriber cleanup failed: {e}")
 
             # A model switch never touches the microphone, so it must not
             # clear a live mic-error banner (#16 DoD: persists until the
@@ -456,7 +492,17 @@ Version 1.0
             self.hotkey_listener.stop()
             self.audio_recorder.cleanup()
             with self._transcriber_lock:
-                self.transcriber.cleanup()
+                transcriber = self.transcriber
+            # The transcriber cleanup runs OUTSIDE the transcriber lock:
+            # for background-load transcribers (Parakeet, Voxtral)
+            # cleanup() waits on the load thread, and that load can be a
+            # multi-minute model download — holding the lock while
+            # waiting would wedge every in-flight transcription worker
+            # (and therefore quit) on the same in-flight-load hazard as
+            # the reload path (issue #22 review). A worker still running
+            # keeps its own snapshot, so releasing the model out of lock
+            # is safe.
+            transcriber.cleanup()
         except Exception as e:  # noqa: BLE001 - logged; must not raise from quit
             print(f"Cleanup error: {e}")
 
