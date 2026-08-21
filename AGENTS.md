@@ -192,7 +192,7 @@ uv lock                # Regenerate uv.lock after editing pyproject.toml
 Agents MAY merge pull requests, but ONLY when every condition below holds:
 
 1. **All quality gates pass locally, with no exceptions** — `./run_tests.sh`, `uv run ruff check kuiskaus/ tests/`, `uv run ty check kuiskaus/`, `uv run ruff format --check kuiskaus/ tests/`. There is no exemption mechanism and no such thing as a "known-failing" gate: a red gate blocks the merge, full stop.
-2. **CI passes**, where CI exists.
+2. **The `quality-gates` CI check is green** for the PR's HEAD (and for `main` when pushing to it). A red or missing `quality-gates` status blocks the merge, full stop.
 3. **Any adversarial or code-review gate attached to the work returned an approving verdict.**
 4. **The diff stays within the scope its issue declares.** A PR touching files outside the issue's stated scope or diff budget must be halted and reported — never merged, and never merged "because the extra changes look harmless".
 
