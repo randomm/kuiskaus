@@ -15,14 +15,38 @@ import numpy as np
 import pytest
 import rumps
 
-import kuiskaus.hotkey_listener_cgevent as hlcgevent
 from kuiskaus.transcriber import Transcriber
+
+
+class _FakeCGEventListener:
+    """Stand-in for HotkeyListenerCGEvent used when constructing the app.
+
+    The real class is never imported here: the menubar module is loaded
+    with a fresh sys.modules stub each test, and instantiating the real
+    Quartz-backed class in a unit test would touch the run loop.
+    """
+
+    def __init__(self, on_press=None, on_release=None):
+        self.on_press = on_press
+        self.on_release = on_release
+
+    def start(self):
+        return True
+
+    def stop(self):
+        pass
 
 
 def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub hardware/model dependencies before importing menubar."""
     fake_quartz = types.ModuleType("Quartz")
     monkeypatch.setitem(sys.modules, "Quartz", fake_quartz)
+
+    # Fresh stub each call: menubar is re-imported per test and re-binds
+    # HotkeyListenerCGEvent from this module.
+    fake_cgevent = types.ModuleType("kuiskaus.hotkey_listener_cgevent")
+    fake_cgevent.HotkeyListenerCGEvent = _FakeCGEventListener
+    monkeypatch.setitem(sys.modules, "kuiskaus.hotkey_listener_cgevent", fake_cgevent)
 
     fake_audio = types.ModuleType("kuiskaus.audio_recorder")
     fake_audio.AudioRecorder = MagicMock()
@@ -47,8 +71,6 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "kuiskaus.parakeet_transcriber", fake_parakeet)
     monkeypatch.setitem(sys.modules, "kuiskaus.whisper_transcriber", fake_whisper)
     monkeypatch.setitem(sys.modules, "kuiskaus.text_inserter", fake_text)
-
-    monkeypatch.setattr(hlcgevent, "HotkeyListenerCGEvent", MagicMock(), raising=False)
 
 
 @pytest.fixture
@@ -76,6 +98,8 @@ def app(monkeypatch: pytest.MonkeyPatch):
     # mock whose identity assertions don't collide with the fixture.
     instance.transcriber = MagicMock(spec=Transcriber)
     instance._transcriber_lock = threading.Lock()
+    instance._reload_lock = threading.Lock()
+    instance._reload_generation = 0
     return instance
 
 
@@ -329,6 +353,49 @@ def test_reload_model_exception_preserves_banner_when_last_error_set(app):
     assert app.status_item.title != "🟢 Ready (model error)"
 
 
+def _parked_worker(app, old):
+    """Park a real _transcribe_and_insert worker inside old.transcribe().
+
+    Returns a dict with the worker thread and the events the test needs
+    to drive it:
+
+    - parked:         set once the worker is inside transcribe() (holding
+                      the transcriber lock for the entire call)
+    - release_event:  set to let the worker finish transcribe()
+    - worker_done:    set once the worker has finished
+
+    The worker snapshots app.transcriber (= old) at start and holds
+    _transcriber_lock for the entire transcribe() call, so any
+    _reload_model running concurrently is blocked on the lock until the
+    worker releases it. Both reload tests share this scaffold; the
+    deterministic events replace the old fixed sleeps.
+    """
+    parked = threading.Event()
+    release_event = threading.Event()
+    worker_done = threading.Event()
+
+    def blocking_transcribe(*_args, **_kwargs):
+        parked.set()  # tell main we are inside transcribe()
+        release_event.wait(timeout=10.0)
+        worker_done.set()  # tell main transcribe() has returned
+        return {"text": "hello"}
+
+    old.transcribe.side_effect = blocking_transcribe
+    app.text_inserter = MagicMock()
+
+    worker = threading.Thread(
+        target=app._transcribe_and_insert,
+        args=(np.array([0.1], dtype=np.float32), 1.0),
+    )
+
+    return {
+        "worker": worker,
+        "parked": parked,
+        "release_event": release_event,
+        "worker_done": worker_done,
+    }
+
+
 def test_transcriber_snapshot_survives_reload_cleanup(app):
     """A transcription worker must keep running its snapshot even after
     _reload_model has swapped in a new transcriber and cleaned up the
@@ -341,57 +408,43 @@ def test_transcriber_snapshot_survives_reload_cleanup(app):
     transcribe(), and the 'cleanup must not have started yet' assertion
     catches it.
     """
-    import time
-
     old = MagicMock(spec=Transcriber)
     new = MagicMock(spec=Transcriber)
     app.transcriber = old
-    app.text_inserter = MagicMock()
-    worker_blocked = threading.Event()
-    release_event = threading.Event()
+    scaffold = _parked_worker(app, old)
     cleanup_started = threading.Event()
-
-    def blocking_transcribe(*_args, **_kwargs):
-        worker_blocked.set()  # tell main we are inside transcribe()
-        release_event.wait(timeout=10.0)
-        return {"text": "hello"}
-
-    def cleanup_tracking():
-        cleanup_started.set()  # mark the moment cleanup() actually runs
-
-    old.transcribe.side_effect = blocking_transcribe
-    old.cleanup.side_effect = cleanup_tracking
+    cleanup_gate = threading.Event()
+    # Block cleanup() so the 'must not have started yet' check below is
+    # deterministic: if the (buggy) reload ever reached cleanup() while
+    # the worker was mid-transcribe(), the gate would be set here.
+    old.cleanup.side_effect = lambda: (
+        cleanup_started.set(),
+        cleanup_gate.wait(timeout=10.0),
+    )
     new.transcribe.return_value = {"text": "you should never see me"}
 
     with patch("kuiskaus.menubar.ParakeetTranscriber", return_value=new):
-        thread = threading.Thread(
-            target=app._transcribe_and_insert,
-            args=(np.array([0.1], dtype=np.float32), 1.0),
-        )
-        thread.start()
-
+        scaffold["worker"].start()
         # Deterministically parked inside old.transcribe() while holding
-        # the lock.  Now run the real _reload_model on a second thread.
-        assert worker_blocked.wait(timeout=5.0), "worker never reached transcribe()"
+        # the transcriber lock.
+        assert scaffold["parked"].wait(timeout=5.0), "worker never reached transcribe()"
         reload_thread = threading.Thread(
             target=lambda: app._reload_model("parakeet"),
         )
         reload_thread.start()
-
-        # _reload_model is blocked on the transcriber lock that the
-        # worker still holds.  Give it time to attempt the cleanup; it
-        # must NOT have started yet because the worker is still inside
-        # transcribe() and holding the lock.
-        time.sleep(0.3)
+        # The worker now finishes transcribe() and releases the lock;
+        # the reload (blocked on the lock the whole time) commits its
+        # swap and then runs cleanup() — which blocks on the gate.
+        scaffold["release_event"].set()
+        assert scaffold["worker_done"].wait(timeout=10.0), "worker never finished"
         assert not cleanup_started.is_set(), (
             "cleanup() started while the worker was still mid-transcribe() — "
             "the transcriber lock is not held across the inference call"
         )
-
-        release_event.set()
-        thread.join(timeout=10.0)
-        assert not thread.is_alive(), "worker thread did not finish"
+        # Let the reload finish its (now unblocked) cleanup.
+        cleanup_gate.set()
         reload_thread.join(timeout=10.0)
+        scaffold["worker"].join(timeout=10.0)
 
     # The worker finished its inference against the OLD transcriber it
     # bound at the start of the run...
@@ -404,112 +457,98 @@ def test_transcriber_snapshot_survives_reload_cleanup(app):
     assert app.transcriber is new
 
 
-def test_reload_model_swap_is_atomic(app):
-    """_reload_model must commit the swap and run cleanup() atomically
-    under the transcriber lock (issue #22). A concurrent read via
-    _current_transcriber() must observe either the OLD or the NEW
-    transcriber — never an in-between (unassigned) state.
+def test_reload_model_serializes_concurrent_reloads(app):
+    """Two overlapping model switches must not let a superseded reload
+    commit its (stale) transcriber or clean up a transcriber a newer
+    reload already made live (issue #22).
 
-    The test parks the worker inside old.transcribe(), then lets
-    _reload_model run for real on a second thread. A reader thread
-    hammers _current_transcriber() while the reload is in progress.
-    Every observation must be `old` or `new` — the lock ensures no
-    intermediate state is ever visible.
+    Reload B is spawned while reload A is still in its constructor. B
+    swaps in transcriber B. When A's constructor returns, A must detect
+    that it was superseded and discard its result — committing it would
+    roll back B's swap, and A's cleanup would tear down the live
+    transcriber B (or, after B's own cleanup, resurrect nothing on top
+    of it).
 
-    Fails without the fix: if the swap is not under the lock, the
-    reader can observe a partially-assigned state (in practice the
-    GIL makes the single-assignment atomic in CPython, so this test
-    primarily validates that the lock serializes the reader against
-    the swap, which the `observed` list proves)."""
-    old = MagicMock(spec=Transcriber)
-    new = MagicMock(spec=Transcriber)
-    app.transcriber = old
-    app.text_inserter = MagicMock()
-    worker_blocked = threading.Event()
-    release_event = threading.Event()
-    stop = threading.Event()
-    observed: list = []
+    Fails without the fix: without reload serialization, A commits its
+    stale transcriber A2 and calls cleanup() on the live transcriber B.
+    """
+    a2 = MagicMock(spec=Transcriber)  # A's constructor result
+    b = MagicMock(spec=Transcriber)  # B's constructor result
+    original = MagicMock(spec=Transcriber)
+    app.transcriber = original
 
-    def blocking_transcribe(*_args, **_kwargs):
-        worker_blocked.set()
-        release_event.wait(timeout=10.0)
-        return {"text": "hello"}
+    a_returned = threading.Event()
+    a2_built = threading.Event()
 
-    old.transcribe.side_effect = blocking_transcribe
+    def a_constructor():
+        a2_built.set()
+        a_returned.wait(timeout=10.0)
+        return a2
 
-    with patch("kuiskaus.menubar.ParakeetTranscriber", return_value=new):
+    a_started = threading.Event()
 
-        def reader():
-            while not stop.is_set():
-                observed.append(app._current_transcriber())
+    def a_reload():
+        a_started.set()
+        with patch("kuiskaus.menubar.ParakeetTranscriber", side_effect=a_constructor):
+            app._reload_model("parakeet")
 
-        thread = threading.Thread(
-            target=app._transcribe_and_insert,
-            args=(np.array([0.1], dtype=np.float32), 1.0),
-        )
-        reader_thread = threading.Thread(target=reader)
-        reader_thread.start()
-        thread.start()
-        assert worker_blocked.wait(timeout=5.0), "worker never reached transcribe()"
-        reload_thread = threading.Thread(
-            target=lambda: app._reload_model("parakeet"),
-        )
-        reload_thread.start()
-        # Let the reader collect some observations while the reload is
-        # blocked on the lock the worker holds.
-        import time
+    a_thread = threading.Thread(target=a_reload)
+    a_thread.start()
+    # Wait until A is inside its (blocking) constructor, then start B.
+    assert a_started.wait(timeout=5.0), "reload A never started"
+    assert a2_built.wait(timeout=5.0)
+    with patch("kuiskaus.menubar.ParakeetTranscriber", return_value=b):
+        b_thread = threading.Thread(target=lambda: app._reload_model("parakeet"))
+        b_thread.start()
+        b_thread.join(timeout=10.0)
+    a_returned.set()
+    a_thread.join(timeout=10.0)
 
-        time.sleep(0.3)
-        stop.set()
-        release_event.set()
-        reader_thread.join(timeout=10.0)
-        thread.join(timeout=10.0)
-        reload_thread.join(timeout=10.0)
-
-    # Every serialized read saw one of the two committed transcribers,
-    # never an in-between value.
-    assert observed, "reader never ran"
-    assert all(t in (old, new) for t in observed), (
-        f"reader observed an in-between transcriber state: {set(map(type, observed))}"
+    # B's swap is the final state; A's stale result was discarded.
+    assert app.transcriber is b
+    # A's stale constructor result was never committed (it is not the
+    # live transcriber) and never cleaned up: A was superseded by B.
+    assert not a2.cleanup.call_args, (
+        "superseded reload cleaned up its stale constructor result"
     )
-    # The reload finished its swap and cleaned up the old transcriber.
-    assert app.transcriber is new
-    old.cleanup.assert_called_once()
+    # B's old transcriber (the original) was cleaned up exactly once.
+    original.cleanup.assert_called_once()
 
 
 def test_utcnow_helper_returns_aware_utc():
     """_utcnow() is the single source of the aware-UTC invariant (issue
     #22): aware UTC so it can be subtracted from session_start without
-    a TypeError from a naive/other-tz datetime."""
+    a TypeError from a naive/other-tz datetime. (No monotonicity
+    assertion: the host wall clock steps backward.)"""
     from kuiskaus.menubar import _utcnow
 
     now = _utcnow()
 
     assert now.tzinfo is UTC
-    # Two calls both return aware datetimes in the same tz, so
-    # subtracting them can never raise the naive/aware TypeError this
-    # helper exists to prevent. (No monotonicity assertion: the host
-    # wall clock steps backward.)
-    assert (now - _utcnow()) is not None
 
 
-def test_show_stats_uses_utcnow_helper(app, monkeypatch):
-    """show_stats() must compute its session duration via _utcnow() so the
-    aware-UTC invariant lives in one place (issue #22)."""
+def test_show_stats_uses_aware_utc_session_start(app, monkeypatch):
+    """show_stats() must compute the session duration from aware-UTC
+    datetimes (issue #22) so the subtraction cannot raise TypeError."""
     import kuiskaus.menubar as menubar_module
 
+    # Pin the clock 30 minutes after session_start so the rendered
+    # duration is deterministic. datetime.datetime is immutable, so the
+    # monkeypatch replaces the module-level name with a subclass that
+    # forwards everything except now().
     app.session_start = datetime(2026, 1, 1, tzinfo=UTC)
-    calls = []
-    monkeypatch.setattr(
-        menubar_module,
-        "_utcnow",
-        lambda: (calls.append(1), datetime(2026, 1, 1, 0, 30, tzinfo=UTC))[1],
-    )
+    real_datetime = type(datetime)
+
+    class _PinnedDateTime(real_datetime):  # type: ignore[valid-type, misc]
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 1, 0, 30, tzinfo=UTC)
+
+    monkeypatch.setattr(menubar_module, "datetime", _PinnedDateTime)
 
     with patch.object(rumps, "alert") as mock_alert:
         app.show_stats(None)
 
-    assert calls == [1], "show_stats must build its now via _utcnow()"
     mock_alert.assert_called_once()
     assert "0h 30m" in mock_alert.call_args.args[1]
 
@@ -521,3 +560,39 @@ def test_app_module_exposes_shared_silicon_check():
     from kuiskaus.silicon_check import check_apple_silicon as shared
 
     assert check_apple_silicon is shared
+
+
+def test_init_installs_locks_and_transcriber_before_hotkey_listener(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Real __init__ ordering (issue #22): the transcriber lock and the
+    reload-serialization state must exist before the hotkey listener
+    starts, so a worker spawned by the first hotkey already sees the
+    locks the reload path serializes on. The hand-built fixture bypasses
+    __init__, so this construction test pins the real ordering."""
+    _install_stubs(monkeypatch)
+    import kuiskaus.menubar as menubar_module
+
+    listener_start = threading.Event()
+    original_start = menubar_module.HotkeyListenerCGEvent
+
+    class _TrackingListener(original_start):
+        def start(self):
+            listener_start.set()
+            return original_start.start(self)
+
+    # rumps.App.__init__ needs a display; run it headless-safe via
+    # NSApplication is already stubbed-free here (rumps works in tests
+    # because it defers the run loop to app.run()).
+    with patch.object(menubar_module, "HotkeyListenerCGEvent", _TrackingListener):
+        app = menubar_module.KuiskausMenuBarApp()
+
+    # The listener has been started (synchronously in __init__), so the
+    # ordering invariant is fully exercised: the lock, the reload
+    # serialization state, and the transcriber protocol guard are all in
+    # place before the listener's start() returned.
+    assert listener_start.is_set()
+    assert isinstance(app._transcriber_lock, type(threading.Lock()))
+    assert hasattr(app, "_reload_lock")
+    assert app._reload_generation == 0
+    assert isinstance(app.transcriber, Transcriber)

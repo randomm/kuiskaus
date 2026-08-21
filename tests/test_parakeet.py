@@ -97,7 +97,9 @@ class TestParakeetTranscriber:
 def test_no_sys_modules_pollution_after_import():
     """Importing and running this file must not leak MagicMock stubs into
     sys.modules: a later import of a real dependency must see the real
-    module, not a MagicMock."""
+    module, not a MagicMock. A real module has a __file__ path; a
+    MagicMock injected into sys.modules does not."""
     import parakeet_mlx
 
     assert not isinstance(parakeet_mlx, MagicMock)
+    assert getattr(parakeet_mlx, "__file__", None) is not None

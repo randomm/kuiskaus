@@ -17,8 +17,18 @@ def test_true_on_apple_brand_string():
         return_value=subprocess.CompletedProcess(
             args=[], returncode=0, stdout="Apple M3\n"
         ),
-    ) as mock_run:
+    ):
         assert check_apple_silicon() is True
+
+
+def test_calls_sysctl_with_correct_args():
+    with patch(
+        "kuiskaus.silicon_check.subprocess.run",
+        return_value=subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Apple M3\n"
+        ),
+    ) as mock_run:
+        check_apple_silicon()
 
     mock_run.assert_called_once_with(
         ["sysctl", "-n", "machdep.cpu.brand_string"],

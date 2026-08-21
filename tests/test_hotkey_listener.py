@@ -51,9 +51,6 @@ def _make_appkit_stub() -> ModuleType:
 
 def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     """Stub the kuiskaus package chain and load hotkey_listener directly."""
-    # Reset the env var so the module-level DEBUG constant is deterministic
-    # per test (issue #22).
-    monkeypatch.delenv("KUISKAUS_DEBUG", raising=False)
     # Load the real callback_dispatcher (stdlib-only) so the module under
     # test can import it normally.
     dispatcher_spec = importlib.util.spec_from_file_location(
@@ -219,19 +216,45 @@ class TestHotkeyListenerDispatch:
 
 
 class TestDebugGating:
-    """Per-event [DEBUG] prints are opt-in via KUISKAUS_DEBUG (issue #22)."""
+    """Per-event [DEBUG] prints are opt-in via KUISKAUS_DEBUG (issue #22).
+
+    Both tests drive the same event pair and assert the same two strings
+    (presence vs. exact absence), so a regression in the gating
+    expression fails in either direction.
+    """
+
+    PRESS_PRINT = "[DEBUG] Hotkey pressed!"
+    RELEASE_PRINT = "[DEBUG] Hotkey released!"
 
     def test_debug_output_off_by_default(self, listener_module, capsys):
         _feed(_make_listener(listener_module), True, False)
         captured = capsys.readouterr().out
-        assert "[DEBUG]" not in captured
+        assert self.PRESS_PRINT not in captured
+        assert self.RELEASE_PRINT not in captured
 
     def test_debug_output_on_when_enabled(self, listener_module, monkeypatch, capsys):
         monkeypatch.setattr(listener_module, "DEBUG", True)
         _feed(_make_listener(listener_module), True, False)
         captured = capsys.readouterr().out
-        assert "[DEBUG] Hotkey pressed!" in captured
-        assert "[DEBUG] Hotkey released!" in captured
+        assert self.PRESS_PRINT in captured
+        assert self.RELEASE_PRINT in captured
+
+    def test_debug_enabled_via_env_var_at_import(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ):
+        """KUISKAUS_DEBUG=1 at import time enables DEBUG (issue #22 wiring).
+
+        The constant is read once at import, so the env var must be set
+        BEFORE the module loads; the shared autouse fixture clears it
+        afterwards.
+        """
+        monkeypatch.setenv("KUISKAUS_DEBUG", "1")
+        module = _install_stubs(monkeypatch)
+        assert module.DEBUG is True
+        _feed(_make_listener(module), True, False)
+        captured = capsys.readouterr().out
+        assert self.PRESS_PRINT in captured
+        assert self.RELEASE_PRINT in captured
 
 
 class TestRunLoopGuard:

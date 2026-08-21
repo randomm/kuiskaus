@@ -22,11 +22,7 @@ from .whisper_transcriber import WhisperTranscriber
 
 
 def _utcnow() -> datetime:
-    """The one place the app builds a current-time datetime.
-
-    Every comparison against session/recording state assumes aware
-    UTC datetimes; a naive datetime would raise TypeError. Keeping the
-    invariant here (issue #22) instead of at each call site."""
+    """Single source of aware-UTC now(); prevents naive-datetime subtraction errors."""
     return datetime.now(tz=UTC)
 
 
@@ -54,10 +50,14 @@ class KuiskausMenuBarApp(rumps.App):
         self.enabled = True
         self.use_apfel: bool = False
         self._apfel_lock = threading.Lock()
-        # Guards self.transcriber: a worker thread snapshots it at the
-        # start of work, _reload_model swaps it while holding the lock
-        # (issue #22: an unguarded swap races a worker mid-inference).
+        # Guards self.transcriber: held across transcribe() calls; see
+        # _reload_model for the full rationale.
         self._transcriber_lock = threading.Lock()
+        # Serializes reload threads: a superseded reload discards its
+        # constructor result instead of committing or tearing down a
+        # transcriber that a newer reload already swapped in (issue #22).
+        self._reload_lock = threading.Lock()
+        self._reload_generation = 0
 
         # Initialize hotkey listener with CGEventTap
         self.hotkey_listener = HotkeyListenerCGEvent(
@@ -275,12 +275,8 @@ class KuiskausMenuBarApp(rumps.App):
     ) -> None:
         """Transcribe audio and insert text (runs in separate thread)"""
         try:
-            # Hold the transcriber lock for the entire inference call so
-            # _reload_model cannot swap self.transcriber and run
-            # old_transcriber.cleanup() while this worker is still
-            # mid-transcribe() on that same object (issue #22).
-            # Only transcribe() is serialized; apfel and insertion run
-            # outside the lock since they don't touch the transcriber.
+            # Hold the lock across transcribe() so _reload_model cannot
+            # cleanup() the model mid-inference (issue #22).
             with self._transcriber_lock:
                 transcriber = self.transcriber
                 result = transcriber.transcribe(audio_data)
@@ -321,11 +317,6 @@ class KuiskausMenuBarApp(rumps.App):
             if not self.audio_recorder.last_error:
                 self.update_status("🟢 Ready (error)")
 
-    def _current_transcriber(self) -> Transcriber:
-        """Read self.transcriber under the transcriber lock."""
-        with self._transcriber_lock:
-            return self.transcriber
-
     def update_status(self, status: str):
         """Update the status menu item"""
         self.status_item.title = status
@@ -338,8 +329,20 @@ class KuiskausMenuBarApp(rumps.App):
         threading.Thread(target=self._reload_model, args=(model_name,)).start()
 
     def _reload_model(self, model_name: str):
-        """Reload the model in background"""
+        """Reload the model in background.
+
+        Reloads are serialized: each reload claims a generation under
+        _reload_lock and, after loading, re-checks that it is still the
+        latest. A superseded reload (one started while a newer reload is
+        already running) abandons its constructor result without
+        committing it or cleaning up the transcriber it found at start —
+        that transcriber may already be live by then (issue #22).
+        """
         try:
+            with self._reload_lock:
+                self._reload_generation += 1
+                generation = self._reload_generation
+
             new_transcriber: Transcriber
             if model_name == "parakeet":
                 new_transcriber = ParakeetTranscriber()
@@ -354,14 +357,31 @@ class KuiskausMenuBarApp(rumps.App):
                     f"Transcriber implementation {type(new_transcriber)} does not satisfy "
                     "the Transcriber protocol"
                 )
-            # Read, swap AND clean up the old transcriber all while holding
-            # the lock: an in-flight worker holds the lock while it calls
-            # transcribe(), so the worker cannot run inference on a
-            # transcriber that is being torn down (issue #22).
+
+            with self._reload_lock:
+                superseded = generation != self._reload_generation
+            if superseded:
+                # A newer reload is already in flight; don't commit this
+                # (stale) result — it would roll back the newer reload's
+                # swap and tear down a transcriber that may already be
+                # live (issue #22).
+                del new_transcriber
+                print(f"⚠️  Model reload to {model_name} superseded; discarding")
+                return
+
+            # Read, swap, then clean up the old transcriber: the worker
+            # holds _transcriber_lock for its entire transcribe() call, so
+            # the snapshot-and-swap isolates an in-flight worker from the
+            # teardown (it keeps its own reference and finishes on a live
+            # object). Cleanup of the old model can take seconds, so it
+            # runs outside the lock (issue #22).
             with self._transcriber_lock:
                 old_transcriber = self.transcriber
                 self.transcriber = new_transcriber
-                old_transcriber.cleanup()
+            # Drop our last reference so the (now live) transcriber is
+            # reachable only via self.transcriber.
+            del new_transcriber
+            old_transcriber.cleanup()
 
             # A model switch never touches the microphone, so it must not
             # clear a live mic-error banner (#16 DoD: persists until the
@@ -428,7 +448,8 @@ Version 1.0
         try:
             self.hotkey_listener.stop()
             self.audio_recorder.cleanup()
-            self._current_transcriber().cleanup()
+            with self._transcriber_lock:
+                self.transcriber.cleanup()
         except Exception as e:  # noqa: BLE001 - logged; must not raise from quit
             print(f"Cleanup error: {e}")
 

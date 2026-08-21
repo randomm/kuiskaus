@@ -10,6 +10,13 @@ from .callback_dispatcher import CallbackDispatcher
 # KUISKAUS_DEBUG enables it (issue #22). Read once at import.
 DEBUG = bool(os.environ.get("KUISKAUS_DEBUG"))
 
+
+def _debug(*args) -> None:
+    """Emit [DEBUG] output only when KUISKAUS_DEBUG is enabled."""
+    if DEBUG:
+        print(*args)
+
+
 # Define event masks
 NSKeyDownMask = 1 << 10
 NSKeyUpMask = 1 << 11
@@ -60,33 +67,29 @@ class HotkeyListener:
 
     def _handle_event(self, event):
         """Handle keyboard events"""
-        if DEBUG:
-            print(
-                f"[DEBUG] Event handler called! Type: {event.type() if event else 'None'}"
-            )
+        _debug(
+            f"[DEBUG] Event handler called! Type: {event.type() if event else 'None'}"
+        )
         try:
             event_type = event.type()
             flags = event.modifierFlags()
 
-            if DEBUG:
-                print(
-                    f"[DEBUG] Event type: {event_type}, NSFlagsChangedMask: {NSFlagsChangedMask}"
-                )
+            _debug(
+                f"[DEBUG] Event type: {event_type}, NSFlagsChangedMask: {NSFlagsChangedMask}"
+            )
 
             if event_type == NSFlagsChangedMask:
                 # Modifier key changed
                 modifiers_pressed = self._check_modifiers(flags)
 
                 # Debug: print which modifiers are pressed
-                if DEBUG:
-                    print(
-                        f"[DEBUG] Modifier flags: {flags}, Control+Option pressed: {modifiers_pressed}"
-                    )
+                _debug(
+                    f"[DEBUG] Modifier flags: {flags}, Control+Option pressed: {modifiers_pressed}"
+                )
 
                 if modifiers_pressed and not self.is_pressed:
                     # Hotkey pressed
-                    if DEBUG:
-                        print("[DEBUG] Hotkey pressed!")
+                    _debug("[DEBUG] Hotkey pressed!")
                     self.is_pressed = True
                     if self.on_press:
                         # Dispatch to the shared worker so press/release
@@ -95,8 +98,7 @@ class HotkeyListener:
 
                 elif not modifiers_pressed and self.is_pressed:
                     # Hotkey released
-                    if DEBUG:
-                        print("[DEBUG] Hotkey released!")
+                    _debug("[DEBUG] Hotkey released!")
                     self.is_pressed = False
                     if self.on_release:
                         self._dispatcher.dispatch(self.on_release)

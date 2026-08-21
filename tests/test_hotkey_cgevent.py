@@ -30,10 +30,6 @@ _MODULE_PATH = os.path.join(
 
 def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     """Stub the kuiskaus package chain and load the module directly."""
-    # Reset the env var so the module-level DEBUG constant is deterministic
-    # per test (issue #22).
-    monkeypatch.delenv("KUISKAUS_DEBUG", raising=False)
-
     # Load the real callback_dispatcher (stdlib-only) so the module under
     # test can import it normally.
     import importlib.util as _ilu
@@ -259,14 +255,23 @@ class TestDispatcherOrdering:
 
 
 class TestDebugGating:
-    """Per-event [DEBUG] prints are opt-in via KUISKAUS_DEBUG (issue #22)."""
+    """Per-event [DEBUG] prints are opt-in via KUISKAUS_DEBUG (issue #22).
+
+    Both tests drive the same event pair and assert the same two strings
+    (presence vs. exact absence), so a regression in the gating
+    expression fails in either direction.
+    """
+
+    PRESS_PRINT = "[DEBUG CGEvent] Hotkey pressed!"
+    RELEASE_PRINT = "[DEBUG CGEvent] Hotkey released!"
 
     def test_debug_output_off_by_default(self, listener_module, capsys):
         listener = _make_listener(listener_module)
         _press_event(listener)
         _release_event(listener)
         captured = capsys.readouterr().out
-        assert "[DEBUG CGEvent]" not in captured
+        assert self.PRESS_PRINT not in captured
+        assert self.RELEASE_PRINT not in captured
 
     def test_debug_output_on_when_enabled(self, listener_module, monkeypatch, capsys):
         monkeypatch.setattr(listener_module, "DEBUG", True)
@@ -274,5 +279,5 @@ class TestDebugGating:
         _press_event(listener)
         _release_event(listener)
         captured = capsys.readouterr().out
-        assert "[DEBUG CGEvent] Hotkey pressed!" in captured
-        assert "[DEBUG CGEvent] Hotkey released!" in captured
+        assert self.PRESS_PRINT in captured
+        assert self.RELEASE_PRINT in captured

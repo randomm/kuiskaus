@@ -1,8 +1,4 @@
-"""Shared Apple Silicon check for the app entry points.
-
-Extracted from app.py and menubar.py (issue #22): both entry points used
-to carry their own drifted copies of this check.
-"""
+"""Shared Apple Silicon check."""
 
 import subprocess
 

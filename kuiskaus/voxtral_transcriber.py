@@ -46,6 +46,10 @@ class VoxtralTranscriber:
                 # Discard an in-flight load if cleanup() already ran: the
                 # model would otherwise resurrect after being released.
                 if self._cleaned_up:
+                    # Drop the freshly loaded objects explicitly; they
+                    # would otherwise stay referenced (and resident) until
+                    # this load thread's frame unwinds.
+                    del model, processor
                     return
                 self._model = model
                 self._processor = processor
@@ -146,6 +150,9 @@ class VoxtralTranscriber:
 
         Sticks: once cleanup() has run, an in-flight background load
         discards its result instead of repopulating the released model.
+        Note: the discarded load's model/processor references are held by
+        the load thread until it returns, so peak memory is transiently
+        ~2x the model during the load window after a mid-load cleanup.
         """
         with self._model_lock:
             self._cleaned_up = True

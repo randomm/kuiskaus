@@ -141,10 +141,14 @@ class TestVoxtralTranscriber:
         # accidentally see the flag as already-set.
         release = threading.Event()
 
-        def first_from_pretrained(_model_id):
+        # load_model_gate: the first from_pretrained call (the model).
+        # load_processor_gate: the second from_pretrained call (the
+        # processor) — where the load is in flight, so the gate blocks
+        # there to hold the race window open.
+        def load_model_gate(_model_id):
             return MagicMock()
 
-        def second_from_pretrained(_model_id):
+        def load_processor_gate(_model_id):
             # Signal that the load is in flight, then block until released
             gate.set()
             release.wait(timeout=5)
@@ -152,6 +156,8 @@ class TestVoxtralTranscriber:
 
         gate = threading.Event()
 
+        # Suppress the auto-started background load so we can run
+        # _load_model deterministically on our own thread.
         with patch("kuiskaus.voxtral_transcriber.VoxtralTranscriber._load_model"):
             t = VoxtralTranscriber()
 
@@ -165,12 +171,12 @@ class TestVoxtralTranscriber:
                 patch.object(
                     mv.VoxtralForConditionalGeneration,
                     "from_pretrained",
-                    side_effect=first_from_pretrained,
+                    side_effect=load_model_gate,
                 ),
                 patch.object(
                     mv.VoxtralProcessor,
                     "from_pretrained",
-                    side_effect=second_from_pretrained,
+                    side_effect=load_processor_gate,
                 ),
             ):
                 t._load_model()
@@ -220,7 +226,9 @@ class TestVoxtralTranscriber:
 def test_no_sys_modules_pollution_after_import():
     """Importing and running this file must not leak MagicMock stubs into
     sys.modules: a later import of a real dependency must see the real
-    module, not a MagicMock."""
+    module, not a MagicMock. A real module has a __file__ path; a
+    MagicMock injected into sys.modules does not."""
     import mlx_voxtral
 
     assert not isinstance(mlx_voxtral, MagicMock)
+    assert getattr(mlx_voxtral, "__file__", None) is not None
