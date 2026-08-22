@@ -6,13 +6,30 @@ import wave
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import numpy as np
 import pytest
+from huggingface_hub.errors import (
+    GatedRepoError,
+    HfHubHTTPError,
+    RepositoryNotFoundError,
+)
 
 # NOTE: No module-level sys.modules stubbing here. The hardware deps
 # (pyaudio, mlx_voxtral, parakeet_mlx) are real on Apple Silicon and are
 # imported lazily inside methods; tests patch at the method level so
-# nothing leaks into the shared pytest process.
+# nothing leaks into the shared pytest process. huggingface_hub and httpx
+# are plain transitive deps and are imported normally at module level.
+
+# Name -> real hf-hub exception class. Used by TestLoadErrorFormatting._exc
+# to keep the real class in the MRO of its SimpleNamespace stand-ins (the
+# hf-hub stubs don't declare repo_id on the base HfHubHTTPError, so a real
+# typed instance can't carry the attribute without tripping ty).
+_EXC_REAL_BY_NAME: dict[str, type] = {
+    "GatedRepoError": GatedRepoError,
+    "HfHubHTTPError": HfHubHTTPError,
+    "RepositoryNotFoundError": RepositoryNotFoundError,
+}
 
 
 class TestVoxtralTranscriber:
@@ -247,7 +264,11 @@ class TestVoxtralTranscriber:
         # The cause is attached, but the formatted string must not leak the
         # raw third-party message verbatim (only the exception class name).
         assert "404 Client Error: repository not found" not in str(exc_info.value)
-        assert "RuntimeError" in str(exc_info.value)
+        # A plain exception whose message carries an HF availability
+        # signature (e.g. a re-raised 404) surfaces the formatted 404
+        # cause, not the generic bucket (issue #30 DoD).
+        assert "HTTP 404" in str(exc_info.value)
+        assert "not found" in str(exc_info.value)
 
     def test_cleanup_drops_recorded_load_error(self):
         """cleanup() resets _load_error so a stale failure cannot surface
@@ -267,39 +288,50 @@ class TestLoadErrorFormatting:
     failures from generic load failures (issue #30 DoD)."""
 
     @staticmethod
-    def _resp(status_code: int):
-        import httpx
-
+    def _resp(status_code: int) -> httpx.Response:
         return httpx.Response(
             status_code, request=httpx.Request("GET", "https://huggingface.co/api")
         )
 
     @staticmethod
-    def _exc(cls_name: str, message: str, response) -> Exception:
-        """Build an exception by class name. huggingface_hub is a real
-        mlx-voxtral dependency, but importing it (and thus httpx) is
-        slow on a cold CI runner; import lazily so the test module
-        import stays fast."""
-        import importlib
+    def _exc(
+        cls_name: str,
+        message: str,
+        response: httpx.Response,
+    ) -> HfHubHTTPError | GatedRepoError | RepositoryNotFoundError:
+        """Build a real hf-hub exception instance for _format_load_error.
 
-        module = importlib.import_module("huggingface_hub.errors")
-        return getattr(module, cls_name)(message, response=response)
+        The hf-hub stubs don't declare ``repo_id`` on the base HfHubHTTPError
+        (only on the RepositoryNotFoundError subclass), so a direct attribute
+        assignment on the base would trip the project's ty gate. We construct
+        the real instance, set the stubs-invisible attribute via setattr
+        (B010-suppressed), and the return-type union sidesteps the stub
+        gap for downstream ty analysis (issue #30 review).
+        """
+        exc_cls = _EXC_REAL_BY_NAME[cls_name]
+        exc = exc_cls(message, response=response)
+        # B010-suppressed: the hf-hub stubs don't declare repo_id on the
+        # base HfHubHTTPError, so direct assignment trips the ty gate.
+        setattr(exc, "repo_id", "")  # noqa: B010
+        return exc
 
     def test_repository_not_found(self):
         from kuiskaus.voxtral_transcriber import _format_load_error
 
         exc = self._exc("RepositoryNotFoundError", "msg", self._resp(404))
-        exc.repo_id = "mlx-community/does-not-exist"
-        assert "mlx-community/does-not-exist" in _format_load_error(exc)
-        assert "404" in _format_load_error(exc)
+        setattr(exc, "repo_id", "mlx-community/does-not-exist")  # noqa: B010
+        formatted = _format_load_error(exc)  # type: ignore[arg-type]
+        assert "mlx-community/does-not-exist" in formatted
+        assert "404" in formatted
 
     def test_gated_repo(self):
         from kuiskaus.voxtral_transcriber import _format_load_error
 
         exc = self._exc("GatedRepoError", "msg", self._resp(403))
-        exc.repo_id = "org/gated-model"
-        assert "org/gated-model" in _format_load_error(exc)
-        assert "auth" in _format_load_error(exc).lower()
+        setattr(exc, "repo_id", "org/gated-model")  # noqa: B010
+        formatted = _format_load_error(exc)  # type: ignore[arg-type]
+        assert "org/gated-model" in formatted
+        assert "auth" in formatted.lower()
 
     def test_gated_repo_falls_back_to_model_id_when_repo_id_unset(self):
         """HfHubHTTPError declares repo_id as str | None; when hf-hub can't
@@ -308,9 +340,10 @@ class TestLoadErrorFormatting:
         from kuiskaus.voxtral_transcriber import _MODEL_ID, _format_load_error
 
         exc = self._exc("GatedRepoError", "msg", self._resp(403))
-        exc.repo_id = None
-        assert _MODEL_ID in _format_load_error(exc)
-        assert "None" not in _format_load_error(exc)
+        setattr(exc, "repo_id", None)  # noqa: B010
+        formatted = _format_load_error(exc)  # type: ignore[arg-type]
+        assert _MODEL_ID in formatted
+        assert "None" not in formatted
 
     def test_hf_http_error_401(self):
         """A raw 401/403 (unauthenticated private repo) is an
@@ -320,8 +353,9 @@ class TestLoadErrorFormatting:
         exc = self._exc(
             "HfHubHTTPError", "401 Client Error: Unauthorized", self._resp(401)
         )
-        assert "auth" in _format_load_error(exc).lower()
-        assert "401" in _format_load_error(exc)
+        formatted = _format_load_error(exc)  # type: ignore[arg-type]
+        assert "auth" in formatted.lower()
+        assert "401" in formatted
 
     def test_generic_error_is_not_surfaced_verbatim(self):
         """Non-hf-hub exceptions must not leak raw third-party text into
@@ -338,6 +372,24 @@ class TestLoadErrorFormatting:
         )
         assert "no load error recorded" in _format_load_error(None)
 
+    def test_plain_error_with_availability_signature_maps_to_404(self):
+        """A re-raised low-level failure (no hf-hub type on the object) whose
+        message carries HF availability wording must still surface as the
+        formatted 404, not the generic bucket (issue #30 DoD)."""
+        from kuiskaus.voxtral_transcriber import _format_load_error
+
+        exc = RuntimeError("404 Client Error: repository not found")
+        assert "HTTP 404" in _format_load_error(exc)
+        assert "not found" in _format_load_error(exc)
+        assert "404 Client Error" not in _format_load_error(exc)
+
+    def test_plain_error_with_unauthorized_signature_maps_to_auth(self):
+        from kuiskaus.voxtral_transcriber import _format_load_error
+
+        exc = RuntimeError("unauthorized for mzbac/voxtral-mini-3b-4bit-mixed")
+        assert "auth" in _format_load_error(exc).lower()
+        assert "401" in _format_load_error(exc)
+
 
 class TestLoadErrorCaptureInLoadModel:
     """_load_model stores the first from_pretrained failure on
@@ -351,9 +403,7 @@ class TestLoadErrorCaptureInLoadModel:
             return VoxtralTranscriber()
 
     def test_model_load_failure_stored_on_load_error(self):
-        import httpx
         import mlx_voxtral as mv
-        from huggingface_hub.errors import RepositoryNotFoundError
 
         from kuiskaus.voxtral_transcriber import _MODEL_ID
 
@@ -400,9 +450,7 @@ class TestLoadErrorCaptureInLoadModel:
         """After a failed load, a successful reload on the same instance
         must reset _load_error so a stale failure can't surface as the
         current load's cause on a later cleanup() path."""
-        import httpx
         import mlx_voxtral as mv
-        from huggingface_hub.errors import RepositoryNotFoundError
 
         from kuiskaus.voxtral_transcriber import _MODEL_ID
 

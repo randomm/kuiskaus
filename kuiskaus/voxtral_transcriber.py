@@ -16,6 +16,13 @@ from .transcriber import TranscriptionResult
 # stock model, published as MLX-native quantized safetensors (~879 MB vs
 # ~7 GB for mistralai's bf16 repo). The previous "mlx-community/..." id
 # 404s on HF (issue #30).
+#
+# Trust note: mzbac is a community (non-curation) publisher, not the
+# MLX community hub. Weights are NOT revision-pinned yet: once the
+# upstream repo is confirmed stable, pin it via
+# from_pretrained(_MODEL_ID, revision="<commit sha>") so a future
+# push or account compromise cannot silently change the running
+# weights. See README > Privacy & Security (issue #30 review).
 _MODEL_ID = "mzbac/voxtral-mini-3b-4bit-mixed"
 
 if TYPE_CHECKING:
@@ -26,21 +33,20 @@ class VoxtralNotLoadedError(RuntimeError):
     """Raised when transcribe() is called before the model finished loading.
 
     Carries the original load failure in ``cause`` (``None`` if the load
-    was never attempted, e.g. after cleanup() ran) and a pre-formatted,
-    user-facing string in ``detail`` that distinguishes Hugging Face
-    availability problems (repository not found / not authorised) from
-    generic load failures.
+    was never attempted, e.g. after cleanup() ran). ``str()`` appends a
+    formatted, user-facing cause summary (distinguishing Hugging Face
+    availability problems from generic load failures) on demand, so the
+    presentation stays owned by ``_format_load_error`` in one place.
     """
 
     def __init__(self, message: str, cause: Exception | None = None) -> None:
         super().__init__(message)
         self.cause = cause
-        self.detail = f"{message} ({_format_load_error(cause)})"
 
     def __str__(self) -> str:
         # Surface the formatted cause, not just the bare message: this is
         # what the menubar prints at model-switch time (issue #30).
-        return self.detail
+        return f"{self.args[0]} ({_format_load_error(self.cause)})"
 
 
 def _format_load_error(error: Exception | None) -> str:
@@ -78,7 +84,31 @@ def _format_load_error(error: Exception | None) -> str:
             f"Hugging Face authentication or availability error "
             f"({type(error).__name__}" + (f", HTTP {status}" if status else "") + ")"
         )
+    if _hf_availability_signature(str(error)):
+        # mlx-voxtral re-raises low-level HTTP failures as plain
+        # RepositoryNotFoundError/OSError (no hf-hub type on the object),
+        # so the type branches above can miss the 404 the DoD cares
+        # about. The text signatures are HF-specific wording, not the
+        # raw message, so nothing third-party leaks verbatim (issue #30
+        # review).
+        if "not found" in str(error).lower():
+            return f"Hugging Face repository {_MODEL_ID!r} not found (HTTP 404)"
+        if "unauthorized" in str(error).lower():
+            return (
+                "Hugging Face authentication error (HTTP 401 or 403); run "
+                "`hf auth login` with a token that has access"
+            )
     return f"model load failed: {type(error).__name__}"
+
+
+def _hf_availability_signature(text: str) -> bool:
+    """True if the message carries an HF availability signature.
+
+    Gated by HTTP status codes and HF wording so generic errors
+    ("file not found" for local paths) stay in the generic bucket.
+    """
+    lowered = text.lower()
+    return "404" in text or "not found" in lowered or "unauthorized" in lowered
 
 
 class VoxtralTranscriber:
