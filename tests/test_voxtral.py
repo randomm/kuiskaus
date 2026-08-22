@@ -3,6 +3,7 @@
 import os
 import threading
 import wave
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -23,9 +24,13 @@ class TestVoxtralTranscriber:
         mock_model = MagicMock()
         mock_processor = MagicMock()
         mock_processor.decode.return_value = "hello voxtral"
-        mock_processor.apply_transcrition_request.return_value = {
-            "input_ids": MagicMock(shape=(1, 10))
-        }
+        # mlx_voxtral's apply_transcrition_request returns a
+        # TranscriptionInputs object (attributes, not a dict); the mock
+        # mirrors that contract.
+        mock_processor.apply_transcrition_request.return_value = SimpleNamespace(
+            input_ids=MagicMock(shape=(1, 10)),
+            input_features=MagicMock(),
+        )
         mock_model.generate.return_value = [MagicMock()]
         t._model = mock_model
         t._processor = mock_processor
@@ -239,7 +244,10 @@ class TestVoxtralTranscriber:
         with pytest.raises(VoxtralNotLoadedError) as exc_info:
             t.transcribe(np.zeros(16000, dtype=np.float32))
         assert exc_info.value.cause is load_error
-        assert "404 Client Error: repository not found" in str(exc_info.value)
+        # The cause is attached, but the formatted string must not leak the
+        # raw third-party message verbatim (only the exception class name).
+        assert "404 Client Error: repository not found" not in str(exc_info.value)
+        assert "RuntimeError" in str(exc_info.value)
 
     def test_cleanup_drops_recorded_load_error(self):
         """cleanup() resets _load_error so a stale failure cannot surface
@@ -293,6 +301,17 @@ class TestLoadErrorFormatting:
         assert "org/gated-model" in _format_load_error(exc)
         assert "auth" in _format_load_error(exc).lower()
 
+    def test_gated_repo_falls_back_to_model_id_when_repo_id_unset(self):
+        """HfHubHTTPError declares repo_id as str | None; when hf-hub can't
+        parse it from the request URL the formatted cause must fall back
+        to the configured model id, not render 'None'."""
+        from kuiskaus.voxtral_transcriber import _MODEL_ID, _format_load_error
+
+        exc = self._exc("GatedRepoError", "msg", self._resp(403))
+        exc.repo_id = None
+        assert _MODEL_ID in _format_load_error(exc)
+        assert "None" not in _format_load_error(exc)
+
     def test_hf_http_error_401(self):
         """A raw 401/403 (unauthenticated private repo) is an
         HfHubHTTPError without the not-found/gated refinements."""
@@ -304,17 +323,26 @@ class TestLoadErrorFormatting:
         assert "auth" in _format_load_error(exc).lower()
         assert "401" in _format_load_error(exc)
 
-    def test_generic_error_passes_through(self):
+    def test_generic_error_is_not_surfaced_verbatim(self):
+        """Non-hf-hub exceptions must not leak raw third-party text into
+        the user-facing string — only the exception class name."""
         from kuiskaus.voxtral_transcriber import _format_load_error
 
-        assert _format_load_error(RuntimeError("out of memory")) == "out of memory"
+        message = (
+            "Failed to download https://huggingface.co/x/weights.safetensors "
+            "(server said: something opaque)"
+        )
+        assert (
+            _format_load_error(RuntimeError(message))
+            == "model load failed: RuntimeError"
+        )
         assert "no load error recorded" in _format_load_error(None)
 
 
 class TestLoadErrorCaptureInLoadModel:
     """_load_model stores the first from_pretrained failure on
-    _load_error and re-raises it — the stored cause is what
-    _ensure_loaded surfaces."""
+    _load_error and logs it; the stored cause is what _ensure_loaded
+    surfaces."""
 
     def _transcriber_without_background_load(self):
         from kuiskaus.voxtral_transcriber import VoxtralTranscriber
@@ -368,17 +396,31 @@ class TestLoadErrorCaptureInLoadModel:
         assert t._model is None
         assert t._load_error is generic
 
-    def test_successful_load_records_no_error(self):
+    def test_successful_load_clears_stale_load_error(self):
+        """After a failed load, a successful reload on the same instance
+        must reset _load_error so a stale failure can't surface as the
+        current load's cause on a later cleanup() path."""
+        import httpx
         import mlx_voxtral as mv
+        from huggingface_hub.errors import RepositoryNotFoundError
+
+        from kuiskaus.voxtral_transcriber import _MODEL_ID
+
+        resp = httpx.Response(
+            404, request=httpx.Request("GET", "https://huggingface.co/api")
+        )
+        stale = RepositoryNotFoundError("repository not found", response=resp)
+        stale.repo_id = _MODEL_ID
 
         t = self._transcriber_without_background_load()
+        t._load_error = stale
         with (
             patch.object(mv.VoxtralForConditionalGeneration, "from_pretrained"),
             patch.object(mv.VoxtralProcessor, "from_pretrained"),
         ):
             t._load_model()
-        assert t._load_error is None
         assert t._model is not None
+        assert t._load_error is None
 
     def test_audio_clipping(self):
         from kuiskaus.voxtral_transcriber import VoxtralTranscriber

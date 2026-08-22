@@ -5,7 +5,7 @@ import tempfile
 import threading
 import time
 import wave
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -14,7 +14,7 @@ from .transcriber import TranscriptionResult
 # mzbac/voxtral-mini-3b-4bit-mixed: public, unauthenticated, non-gated HF
 # repo with the same VoxtralForConditionalGeneration architecture as the
 # stock model, published as MLX-native quantized safetensors (~879 MB vs
-# ~9.3 GB for mistralai's bf16 repo). The previous "mlx-community/..." id
+# ~7 GB for mistralai's bf16 repo). The previous "mlx-community/..." id
 # 404s on HF (issue #30).
 _MODEL_ID = "mzbac/voxtral-mini-3b-4bit-mixed"
 
@@ -59,19 +59,26 @@ def _format_load_error(error: Exception | None) -> str:
             RepositoryNotFoundError,
         )
     except ImportError:  # pragma: no cover - mlx_voxtral requires hf-hub
-        return str(error)
+        return f"model load failed: {type(error).__name__}"
     if isinstance(error, GatedRepoError):
+        repo_id = getattr(error, "repo_id", None) or _MODEL_ID
         return (
-            f"'Hugging Face repository {error.repo_id} is gated or requires "
+            f"'Hugging Face repository {repo_id} is gated or requires "
             "authentication; run `hf auth login` with a token that has access"
         )
     if isinstance(error, RepositoryNotFoundError):
-        return f"Hugging Face repository '{error.repo_id}' not found (HTTP 404)"
+        repo_id = getattr(error, "repo_id", None) or _MODEL_ID
+        return f"Hugging Face repository '{repo_id}' not found (HTTP 404)"
     if isinstance(error, HfHubHTTPError):
-        # Generic Hub HTTP error, e.g. 401/403 for a private repository.
-        # The status code is embedded in the message hf-hub formats.
-        return f"Hugging Face authentication or availability error: {error}"
-    return str(error)
+        # Keep only the status code / class name: str() of an HfHubHTTPError
+        # embeds the request URL and raw server response text, which must
+        # not be surfaced verbatim to the user (issue #30 review).
+        status = getattr(error.response, "status_code", None)
+        return (
+            f"Hugging Face authentication or availability error "
+            f"({type(error).__name__}" + (f", HTTP {status}" if status else "") + ")"
+        )
+    return f"model load failed: {type(error).__name__}"
 
 
 class VoxtralTranscriber:
@@ -107,6 +114,10 @@ class VoxtralTranscriber:
                     return
                 self._model = model
                 self._processor = processor
+                # A successful load supersedes any failure recorded by an
+                # earlier attempt on this instance (cleanup/reload cycle),
+                # so a later failure surfaces this attempt's cause.
+                self._load_error = None
             print(f"Voxtral model loaded in {time.time() - start:.2f}s")
         # Top-level guard for third-party model loading: must never let a
         # load failure crash the app; the error is logged here and
@@ -115,13 +126,6 @@ class VoxtralTranscriber:
         except Exception as e:  # noqa: BLE001 - logged; model-load guard
             self._load_error = e
             print(f"Failed to load Voxtral model: {e}")
-
-    @staticmethod
-    def _input_ids(inputs: Any) -> Any:
-        """Extract input_ids from processor output (attr or dict access)."""
-        if isinstance(inputs, dict):
-            return inputs["input_ids"]
-        return inputs.input_ids
 
     def _ensure_loaded(
         self,
@@ -184,12 +188,10 @@ class VoxtralTranscriber:
                     language=kwargs.get("language", "en"),
                     audio=wav_path,
                 )
-                input_ids = self._input_ids(inputs)
+                input_ids = inputs.input_ids
                 outputs = model.generate(
                     input_ids=input_ids,
-                    input_features=inputs.get("input_features")
-                    if isinstance(inputs, dict)
-                    else inputs.input_features,
+                    input_features=inputs.input_features,
                     max_new_tokens=kwargs.get("max_new_tokens", 1024),
                     temperature=0.0,
                 )
