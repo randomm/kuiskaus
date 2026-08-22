@@ -217,8 +217,168 @@ class TestVoxtralTranscriber:
         t._processor = None
         t._load_thread.join(timeout=1)
         audio = np.zeros(16000, dtype=np.float32)
-        with pytest.raises(RuntimeError, match="loading failed"):
+        with pytest.raises(RuntimeError, match="not loaded"):
             t.transcribe(audio)
+
+    def test_load_failure_records_cause_on_not_loaded_error(self):
+        """A failed load must surface the original exception, not just a
+        generic 'loading failed' message (issue #30 DoD: a 404 should not
+        look the same as an out-of-memory failure)."""
+        from kuiskaus.voxtral_transcriber import (
+            VoxtralNotLoadedError,
+            VoxtralTranscriber,
+        )
+
+        with patch.object(VoxtralTranscriber, "_load_model"):
+            t = VoxtralTranscriber()
+        t._load_thread.join(timeout=1)
+        load_error = RuntimeError("404 Client Error: repository not found")
+        t._load_error = load_error
+        t._model = None
+        t._processor = None
+        with pytest.raises(VoxtralNotLoadedError) as exc_info:
+            t.transcribe(np.zeros(16000, dtype=np.float32))
+        assert exc_info.value.cause is load_error
+        assert "404 Client Error: repository not found" in str(exc_info.value)
+
+    def test_cleanup_drops_recorded_load_error(self):
+        """cleanup() resets _load_error so a stale failure cannot surface
+        as a later load's error on the reload path."""
+        from kuiskaus.voxtral_transcriber import VoxtralTranscriber
+
+        with patch.object(VoxtralTranscriber, "_load_model"):
+            t = VoxtralTranscriber()
+        t._load_thread.join(timeout=1)
+        t._load_error = RuntimeError("stale 404")
+        t.cleanup()
+        assert t._load_error is None
+
+
+class TestLoadErrorFormatting:
+    """_format_load_error must distinguish Hugging Face availability
+    failures from generic load failures (issue #30 DoD)."""
+
+    @staticmethod
+    def _resp(status_code: int):
+        import httpx
+
+        return httpx.Response(
+            status_code, request=httpx.Request("GET", "https://huggingface.co/api")
+        )
+
+    @staticmethod
+    def _exc(cls_name: str, message: str, response) -> Exception:
+        """Build an exception by class name. huggingface_hub is a real
+        mlx-voxtral dependency, but importing it (and thus httpx) is
+        slow on a cold CI runner; import lazily so the test module
+        import stays fast."""
+        import importlib
+
+        module = importlib.import_module("huggingface_hub.errors")
+        return getattr(module, cls_name)(message, response=response)
+
+    def test_repository_not_found(self):
+        from kuiskaus.voxtral_transcriber import _format_load_error
+
+        exc = self._exc("RepositoryNotFoundError", "msg", self._resp(404))
+        exc.repo_id = "mlx-community/does-not-exist"
+        assert "mlx-community/does-not-exist" in _format_load_error(exc)
+        assert "404" in _format_load_error(exc)
+
+    def test_gated_repo(self):
+        from kuiskaus.voxtral_transcriber import _format_load_error
+
+        exc = self._exc("GatedRepoError", "msg", self._resp(403))
+        exc.repo_id = "org/gated-model"
+        assert "org/gated-model" in _format_load_error(exc)
+        assert "auth" in _format_load_error(exc).lower()
+
+    def test_hf_http_error_401(self):
+        """A raw 401/403 (unauthenticated private repo) is an
+        HfHubHTTPError without the not-found/gated refinements."""
+        from kuiskaus.voxtral_transcriber import _format_load_error
+
+        exc = self._exc(
+            "HfHubHTTPError", "401 Client Error: Unauthorized", self._resp(401)
+        )
+        assert "auth" in _format_load_error(exc).lower()
+        assert "401" in _format_load_error(exc)
+
+    def test_generic_error_passes_through(self):
+        from kuiskaus.voxtral_transcriber import _format_load_error
+
+        assert _format_load_error(RuntimeError("out of memory")) == "out of memory"
+        assert "no load error recorded" in _format_load_error(None)
+
+
+class TestLoadErrorCaptureInLoadModel:
+    """_load_model stores the first from_pretrained failure on
+    _load_error and re-raises it — the stored cause is what
+    _ensure_loaded surfaces."""
+
+    def _transcriber_without_background_load(self):
+        from kuiskaus.voxtral_transcriber import VoxtralTranscriber
+
+        with patch("kuiskaus.voxtral_transcriber.VoxtralTranscriber._load_model"):
+            return VoxtralTranscriber()
+
+    def test_model_load_failure_stored_on_load_error(self):
+        import httpx
+        import mlx_voxtral as mv
+        from huggingface_hub.errors import RepositoryNotFoundError
+
+        from kuiskaus.voxtral_transcriber import _MODEL_ID
+
+        resp = httpx.Response(
+            404, request=httpx.Request("GET", "https://huggingface.co/api")
+        )
+
+        exc = RepositoryNotFoundError("repository not found", response=resp)
+        exc.repo_id = _MODEL_ID
+
+        t = self._transcriber_without_background_load()
+        with (
+            patch.object(
+                mv.VoxtralForConditionalGeneration, "from_pretrained", side_effect=exc
+            ),
+            patch.object(mv.VoxtralProcessor, "from_pretrained") as mock_proc,
+        ):
+            t._load_model()
+        assert t._model is None
+        assert t._load_error is exc
+        mock_proc.assert_not_called()
+
+    def test_processor_load_failure_stored_on_load_error(self):
+        import mlx_voxtral as mv
+
+        from kuiskaus.voxtral_transcriber import _MODEL_ID
+
+        t = self._transcriber_without_background_load()
+        generic = OSError(
+            f"{_MODEL_ID} is not a local folder or a valid repository name"
+        )
+        with (
+            patch.object(
+                mv.VoxtralForConditionalGeneration, "from_pretrained"
+            ) as mock_model,
+            patch.object(mv.VoxtralProcessor, "from_pretrained", side_effect=generic),
+        ):
+            t._load_model()
+        mock_model.assert_called_once()
+        assert t._model is None
+        assert t._load_error is generic
+
+    def test_successful_load_records_no_error(self):
+        import mlx_voxtral as mv
+
+        t = self._transcriber_without_background_load()
+        with (
+            patch.object(mv.VoxtralForConditionalGeneration, "from_pretrained"),
+            patch.object(mv.VoxtralProcessor, "from_pretrained"),
+        ):
+            t._load_model()
+        assert t._load_error is None
+        assert t._model is not None
 
     def test_audio_clipping(self):
         from kuiskaus.voxtral_transcriber import VoxtralTranscriber
