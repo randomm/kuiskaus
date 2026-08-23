@@ -18,6 +18,26 @@ import rumps
 from kuiskaus.transcriber import Transcriber
 
 
+class _FakeCgeventModule(types.ModuleType):
+    HotkeyListenerCGEvent: type
+
+
+class _FakeAudioRecorderModule(types.ModuleType):
+    AudioRecorder: MagicMock
+
+
+class _FakeParakeetModule(types.ModuleType):
+    ParakeetTranscriber: type
+
+
+class _FakeWhisperModule(types.ModuleType):
+    WhisperTranscriber: type
+
+
+class _FakeTextInserterModule(types.ModuleType):
+    TextInserter: MagicMock
+
+
 class _FakeCGEventListener:
     """Stand-in for HotkeyListenerCGEvent used when constructing the app.
 
@@ -100,11 +120,11 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Fresh stub each call: menubar is re-imported per test and re-binds
     # HotkeyListenerCGEvent from this module.
-    fake_cgevent = types.ModuleType("kuiskaus.hotkey_listener_cgevent")
+    fake_cgevent = _FakeCgeventModule("kuiskaus.hotkey_listener_cgevent")
     fake_cgevent.HotkeyListenerCGEvent = _FakeCGEventListener
     monkeypatch.setitem(sys.modules, "kuiskaus.hotkey_listener_cgevent", fake_cgevent)
 
-    fake_audio = types.ModuleType("kuiskaus.audio_recorder")
+    fake_audio = _FakeAudioRecorderModule("kuiskaus.audio_recorder")
     fake_audio.AudioRecorder = MagicMock()
 
     # Real class (see _fake_parakeet_transcriber_class): menubar's
@@ -113,7 +133,7 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     # the isinstance(..., Transcriber) check. The class is also patched
     # directly onto the already-imported menubar module so the reload
     # path and the __init__ path see the same stub identity.
-    fake_parakeet = types.ModuleType("kuiskaus.parakeet_transcriber")
+    fake_parakeet = _FakeParakeetModule("kuiskaus.parakeet_transcriber")
     parakeet_cls = _fake_parakeet_transcriber_class()
     fake_parakeet.ParakeetTranscriber = parakeet_cls
 
@@ -124,7 +144,7 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     except ImportError:
         pass  # menubar not imported yet; the sys.modules stub covers it
 
-    fake_whisper = types.ModuleType("kuiskaus.whisper_transcriber")
+    fake_whisper = _FakeWhisperModule("kuiskaus.whisper_transcriber")
     whisper_cls = _fake_whisper_transcriber_class()
     fake_whisper.WhisperTranscriber = whisper_cls
 
@@ -135,7 +155,7 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     except ImportError:
         pass  # menubar not imported yet; the sys.modules stub covers it
 
-    fake_text = types.ModuleType("kuiskaus.text_inserter")
+    fake_text = _FakeTextInserterModule("kuiskaus.text_inserter")
     fake_text.TextInserter = MagicMock()
 
     monkeypatch.setitem(sys.modules, "kuiskaus.audio_recorder", fake_audio)

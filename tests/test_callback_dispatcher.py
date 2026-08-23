@@ -56,6 +56,7 @@ class TestCallbackDispatcherStop:
         dispatcher.dispatch(slow)
         assert started.wait(timeout=1.0)
         zombie_worker = dispatcher._worker
+        assert zombie_worker is not None
 
         dispatcher.stop(timeout=0.05)
         # Timeout elapsed while the callback was still running: stop()
@@ -80,11 +81,13 @@ class TestCallbackDispatcherStop:
         dispatcher = CallbackDispatcher()
         dispatcher.start()
         first_worker = dispatcher._worker
+        assert first_worker is not None
         dispatcher.stop()
         assert not first_worker.is_alive()
 
         dispatcher.start()
         second_worker = dispatcher._worker
+        assert second_worker is not None
         try:
             assert second_worker is not first_worker
             assert second_worker.is_alive()

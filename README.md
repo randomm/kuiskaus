@@ -258,7 +258,7 @@ uv sync --group dev
 uv run ruff check kuiskaus/ tests/
 
 # Type checking
-uv run ty check kuiskaus/
+uv run ty check kuiskaus/ tests/
 
 # Formatting
 uv run ruff format kuiskaus/ tests/

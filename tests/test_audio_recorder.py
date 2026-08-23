@@ -23,6 +23,7 @@ import importlib
 import sys
 import threading
 import time
+from unittest import mock
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -69,14 +70,17 @@ def audio_recorder_module(monkeypatch: pytest.MonkeyPatch):
     built: list = []
     orig_audio_recorder = module.AudioRecorder
 
-    def tracking_ctor(*args, **kwargs):
+    def tracker(*args, **kwargs):
         recorder = orig_audio_recorder(*args, **kwargs)
         built.append(recorder)
         return recorder
 
-    module.AudioRecorder = tracking_ctor
+    patcher = mock.patch.object(module, "AudioRecorder", side_effect=tracker)
+    patcher.start()
 
     yield module
+
+    patcher.stop()
 
     # Deterministically tear down every worker before the recorder objects
     # are dropped, so the unbounded join in __del__ -> cleanup() can never
@@ -85,7 +89,6 @@ def audio_recorder_module(monkeypatch: pytest.MonkeyPatch):
     for recorder in built:
         _cleanup_recorder(recorder)
     built.clear()
-    module.AudioRecorder = orig_audio_recorder
     monkeypatch.undo()
     importlib.reload(module)
 

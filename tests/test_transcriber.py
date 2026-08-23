@@ -11,6 +11,8 @@ spec_transcriber = importlib.util.spec_from_file_location(
     "kuiskaus.transcriber",
     os.path.join(os.path.dirname(__file__), "..", "kuiskaus", "transcriber.py"),
 )
+assert spec_transcriber is not None
+assert spec_transcriber.loader is not None
 transcriber_module = importlib.util.module_from_spec(spec_transcriber)
 spec_transcriber.loader.exec_module(transcriber_module)
 Transcriber = transcriber_module.Transcriber
