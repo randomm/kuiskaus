@@ -45,5 +45,5 @@ jobs:
       # AGENTS.md "Pre-Push Quality Gates".
       - run: uv run ruff check kuiskaus/ tests/
       - run: uv run ruff format --check kuiskaus/ tests/
-      - run: uv run ty check kuiskaus/
+      - run: uv run ty check kuiskaus/ tests/
       - run: ./run_tests.sh

@@ -29,6 +29,14 @@ _MODULE_PATH = os.path.join(
 )
 
 
+class _FakeAppKit(ModuleType):
+    NSEvent: type
+
+
+class _FakePyObjCTools(ModuleType):
+    AppHelper: MagicMock
+
+
 def _make_package_stub() -> ModuleType:
     """Minimal package stand-in for the `kuiskaus` name.
 
@@ -49,14 +57,16 @@ def _load_real_submodule(monkeypatch: pytest.MonkeyPatch, name: str) -> ModuleTy
         os.path.join(os.path.dirname(__file__), rel + ".py"),
         submodule_search_locations=[os.path.join(os.path.dirname(__file__), rel)],
     )
+    assert spec is not None
+    assert spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, mod)
     spec.loader.exec_module(mod)
     return mod
 
 
-def _make_appkit_stub() -> ModuleType:
-    appkit = ModuleType("AppKit")
+def _make_appkit_stub() -> _FakeAppKit:
+    appkit = _FakeAppKit("AppKit")
 
     class _FakeNSEvent:
         @staticmethod
@@ -97,15 +107,17 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     monkeypatch.setitem(sys.modules, "kuiskaus", _make_package_stub())
 
     monkeypatch.setitem(sys.modules, "AppKit", _make_appkit_stub())
-    pyobjc = ModuleType("PyObjCTools")
+    pyobjc = _FakePyObjCTools("PyObjCTools")
     pyobjc.AppHelper = MagicMock(name="AppHelper")
     monkeypatch.setitem(sys.modules, "PyObjCTools", pyobjc)
 
     spec = importlib.util.spec_from_file_location(
         "kuiskaus.hotkey_listener", _MODULE_PATH
     )
+    assert spec is not None
     mod = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, "kuiskaus.hotkey_listener", mod)
+    assert spec.loader is not None
     spec.loader.exec_module(mod)
     return mod
 

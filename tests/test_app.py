@@ -13,6 +13,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+class _FakeAppKit(types.ModuleType):
+    NSEvent: MagicMock
+    NSPasteboard: MagicMock
+    NSPasteboardTypeString: MagicMock
+
+
+class _FakePyObjCTools(types.ModuleType):
+    AppHelper: MagicMock
+
+
 def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub the pyobjc / mlx / pyaudio / parakeet stack before importing
     kuiskaus.app so the module import never touches hardware.
@@ -30,11 +40,11 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime here: HotkeyListener/AudioRecorder/TextInserter are all
     replaced with mocks in _make_app(), so a placeholder is sufficient.
     """
-    appkit = types.ModuleType("AppKit")
+    appkit = _FakeAppKit("AppKit")
     appkit.NSEvent = MagicMock(name="NSEvent")
     appkit.NSPasteboard = MagicMock(name="NSPasteboard")
     appkit.NSPasteboardTypeString = MagicMock(name="NSPasteboardTypeString")
-    pyobjc_tools = types.ModuleType("PyObjCTools")
+    pyobjc_tools = _FakePyObjCTools("PyObjCTools")
     pyobjc_tools.AppHelper = MagicMock(name="AppHelper")
 
     for name in (

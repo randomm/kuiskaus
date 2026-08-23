@@ -28,6 +28,13 @@ _MODULE_PATH = os.path.join(
 )
 
 
+class _FakeQuartz(ModuleType):
+    def __init__(self) -> None:
+        super().__init__("Quartz")
+        self.kCGEventFlagsChanged = FLAGS_CHANGED_TYPE
+        self.CGEventGetFlags = MagicMock()
+
+
 def _make_package_stub() -> ModuleType:
     """Minimal package stand-in for the `kuiskaus` name (relative imports
     resolve against its __path__)."""
@@ -44,6 +51,8 @@ def _load_real_submodule(monkeypatch: pytest.MonkeyPatch, name: str) -> ModuleTy
         os.path.join(os.path.dirname(__file__), rel + ".py"),
         submodule_search_locations=[os.path.join(os.path.dirname(__file__), rel)],
     )
+    assert spec is not None
+    assert spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, mod)
     spec.loader.exec_module(mod)
@@ -72,16 +81,16 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
         monkeypatch.setitem(sys.modules, name, ModuleType(name))
     monkeypatch.setitem(sys.modules, "kuiskaus", _make_package_stub())
 
-    fake_quartz = ModuleType("Quartz")
-    fake_quartz.kCGEventFlagsChanged = FLAGS_CHANGED_TYPE
-    fake_quartz.CGEventGetFlags = MagicMock()
+    fake_quartz = _FakeQuartz()
     monkeypatch.setitem(sys.modules, "Quartz", fake_quartz)
 
     spec = importlib.util.spec_from_file_location(
         "kuiskaus.hotkey_listener_cgevent", _MODULE_PATH
     )
+    assert spec is not None
     mod = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, "kuiskaus.hotkey_listener_cgevent", mod)
+    assert spec.loader is not None
     spec.loader.exec_module(mod)
     return mod
 
