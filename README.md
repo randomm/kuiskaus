@@ -192,7 +192,9 @@ You may see Info.plist errors when running from a virtual environment. This is a
 - **On-device processing**: All transcription happens locally
 - **Model provenance**: The Voxtral model downloads from a community
   Hugging Face publisher (`mzbac`), not the curated MLX community hub.
-  It is cached locally after first download; no other network access.
+  The weights are revision-pinned to a specific repository commit, so
+  upstream pushes cannot change the weights this app runs. It is
+  cached locally after first download; no other network access.
 - **No internet required**: Works completely offline after setup
 - **No data collection**: Your audio and transcriptions never leave your Mac
 - **Open source**: Full source code available for inspection

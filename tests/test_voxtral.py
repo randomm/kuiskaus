@@ -3,6 +3,7 @@
 import os
 import threading
 import wave
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -165,7 +166,11 @@ class TestVoxtralTranscriber:
         # import cost must sit outside the timed window.
         import mlx_voxtral  # noqa: F401  # warm-up; see note above
 
-        from kuiskaus.voxtral_transcriber import _MODEL_ID, VoxtralTranscriber
+        from kuiskaus.voxtral_transcriber import (
+            _MODEL_ID,
+            _MODEL_REVISION,
+            VoxtralTranscriber,
+        )
 
         # The load thread blocks on `release` until the main thread has
         # called cleanup() and set it — the exact in-flight window of the
@@ -177,15 +182,16 @@ class TestVoxtralTranscriber:
         # load_processor_gate: the second from_pretrained call (the
         # processor) — where the load is in flight, so the gate blocks
         # there to hold the race window open.
-        def load_model_gate(_model_id: str) -> MagicMock:
-            assert _model_id == _MODEL_ID
+        # Both from_pretrained calls receive the pinned snapshot path
+        # (offline-safe; see _load_model), so the gates just accept it.
+        def load_model_gate(model_path: str) -> MagicMock:
             return MagicMock()
 
-        def load_processor_gate(_model_id: str) -> MagicMock:
+        def load_processor_gate(model_path: str) -> MagicMock:
             # Signal that the load is in flight, then block until released
             gate.set()
             release.wait(timeout=5)
-            assert _model_id == _MODEL_ID
+            assert model_path == str(Path("/tmp/pinned-snapshot"))
             return MagicMock()
 
         gate = threading.Event()
@@ -215,8 +221,18 @@ class TestVoxtralTranscriber:
                     "from_pretrained",
                     side_effect=load_processor_gate,
                 ),
+                patch(
+                    "huggingface_hub.snapshot_download",
+                    return_value=Path("/tmp/pinned-snapshot"),
+                ) as mock_snapshot,
             ):
                 t._load_model()
+                # The pin must be enforced: snapshot_download resolves the
+                # pinned revision, and the model/processor load from that
+                # snapshot path.
+                mock_snapshot.assert_called_once_with(
+                    _MODEL_ID, revision=_MODEL_REVISION
+                )
 
         thread = threading.Thread(target=load_with_gate, daemon=True)
         thread.start()
@@ -357,6 +373,18 @@ class TestLoadErrorFormatting:
         assert "auth" in formatted.lower()
         assert "401" in formatted
 
+    def test_offline_mode_error_is_surfaced_distinctly(self):
+        """snapshot_download under HF_HUB_OFFLINE=1 raises
+        OfflineModeIsEnabled; the formatted cause must name offline mode,
+        not fall into the generic bucket (issue #30 review)."""
+        from huggingface_hub.errors import OfflineModeIsEnabled
+
+        from kuiskaus.voxtral_transcriber import _format_load_error
+
+        formatted = _format_load_error(OfflineModeIsEnabled("offline mode is enabled"))
+        assert "offline mode" in formatted.lower()
+        assert "HF_HUB_OFFLINE" in formatted
+
     def test_generic_error_is_not_surfaced_verbatim(self):
         """Non-hf-hub exceptions must not leak raw third-party text into
         the user-facing string — only the exception class name."""
@@ -416,6 +444,7 @@ class TestLoadErrorCaptureInLoadModel:
 
         t = self._transcriber_without_background_load()
         with (
+            patch("huggingface_hub.snapshot_download"),
             patch.object(
                 mv.VoxtralForConditionalGeneration, "from_pretrained", side_effect=exc
             ),
@@ -436,6 +465,7 @@ class TestLoadErrorCaptureInLoadModel:
             f"{_MODEL_ID} is not a local folder or a valid repository name"
         )
         with (
+            patch("huggingface_hub.snapshot_download"),
             patch.object(
                 mv.VoxtralForConditionalGeneration, "from_pretrained"
             ) as mock_model,
@@ -463,6 +493,7 @@ class TestLoadErrorCaptureInLoadModel:
         t = self._transcriber_without_background_load()
         t._load_error = stale
         with (
+            patch("huggingface_hub.snapshot_download"),
             patch.object(mv.VoxtralForConditionalGeneration, "from_pretrained"),
             patch.object(mv.VoxtralProcessor, "from_pretrained"),
         ):
