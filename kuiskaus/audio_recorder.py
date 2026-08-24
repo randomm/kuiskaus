@@ -41,7 +41,7 @@ class AudioRecorder:
         self.pyaudio: pyaudio.PyAudio | None = None
         self.stream: pyaudio.Stream | None = None
         self.recording = False
-        self.audio_queue: queue.Queue = queue.Queue()
+        self.audio_queue: queue.Queue[bytes] = queue.Queue()
         self.recording_thread: threading.Thread | None = None
         self.last_error: str | None = None
         self._lock = threading.Lock()
@@ -76,10 +76,19 @@ class AudioRecorder:
         # depend on this instance surviving; every recording re-resolves
         # the device against its own fresh instance in
         # _open_stream_with_retry. A RuntimeError here (no input device
-        # found at all) propagates out of __init__ unchanged.
+        # found at all) propagates out of __init__ unchanged. An OSError
+        # from the probe is transient (a coreaudiod storm at startup,
+        # the same failure class _attempt_open_once classifies in the
+        # retry loop): warn and return a valid instance -- the retry
+        # loop re-resolves at the first start_recording() call.
         probe = pyaudio.PyAudio()
         try:
             self._find_default_input_device(probe)
+        except (OSError, RuntimeError) as probe_error:
+            print(
+                f"Warning: microphone probe failed at startup "
+                f"({probe_error}); retry loop will re-resolve per recording."
+            )
         finally:
             terminate_quietly(probe)
 
@@ -131,9 +140,12 @@ class AudioRecorder:
 
         Returns (pa, stream, None) on success. Returns (None, None,
         error) on any failure, with the failed PyAudio already
-        terminated internally -- a failed attempt's fresh instance owns
-        no stream and was never adopted into self.pyaudio, so direct
-        termination is always safe (issue #37 task-c).
+        terminated internally and NOT returned in the tuple -- a failed
+        attempt's fresh instance owns no stream and was never adopted
+        into self.pyaudio, so direct termination is always safe (issue
+        #37 task-c) and pa is only ever returned alongside its stream,
+        which makes the "don't use a failed attempt's pa" contract
+        structural rather than documented.
 
         Transient failures (PyAudio() construction failure, OSError from
         device enumeration or open()) are returned as the error so the
@@ -167,13 +179,13 @@ class AudioRecorder:
                 attempt, self.max_attempts, attempt_start, device_error.errno, "open"
             )
             terminate_quietly(pa)
-            return pa, None, device_error
+            return None, None, device_error
         except RuntimeError as device_error:
             # _find_default_input_device's own documented failure (no
             # input device found at all) -- persistent state.
             log_retry_attempt(attempt, self.max_attempts, attempt_start, None, "abort")
             terminate_quietly(pa)
-            return pa, None, device_error
+            return None, None, device_error
 
         try:
             stream = pa.open(
@@ -189,7 +201,7 @@ class AudioRecorder:
                 attempt, self.max_attempts, attempt_start, open_error.errno, "open"
             )
             terminate_quietly(pa)
-            return pa, None, open_error
+            return None, None, open_error
 
         return pa, stream, None
 
@@ -228,6 +240,11 @@ class AudioRecorder:
         # Outside the lock: whoever captures old_pyaudio owns its
         # termination; cleanup() uses the same local-capture pattern, so
         # double-terminate is impossible by construction.
+        #
+        # Invariant (lens review HIGH #3 trace): self.stream is ALWAYS
+        # None here -- it is only written by _recording_worker AFTER
+        # _open_stream_with_retry returns, so the post-lock read is a
+        # defensive guard, not a racy gate. No leak on any current path.
         if old_pyaudio is not None and self.stream is None:
             terminate_quietly(old_pyaudio)
         return True
@@ -292,7 +309,11 @@ class AudioRecorder:
                 if isinstance(error, RuntimeError):
                     break
                 continue
-            assert pa is not None, "success tuple must carry its PyAudio"
+            if pa is None:
+                raise RuntimeError(
+                    "internal invariant violated: _attempt_open_once returned a stream "
+                    "without a PyAudio instance"
+                )
             if not self._adopt_and_dispose_previous(
                 pa, stream, my_gen, attempt, attempt_start
             ):

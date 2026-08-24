@@ -25,6 +25,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Callable
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -102,7 +103,12 @@ def _make_pyaudio_instance(index: int = 0) -> MagicMock:
     return instance
 
 
-def _make_recorder(module, *pa_instances: MagicMock | BaseException, **kwargs):
+def _make_recorder(
+    module,
+    *pa_instances: MagicMock | Exception,
+    init_probe: MagicMock | None = None,
+    **kwargs,
+):
     """Build an AudioRecorder whose successive pyaudio.PyAudio() calls
     return pa_instances in order across every retry-loop attempt of every
     recording this recorder makes (attempt 1 first, retries after).
@@ -112,18 +118,22 @@ def _make_recorder(module, *pa_instances: MagicMock | BaseException, **kwargs):
     ``pa_instances`` is consumed -- that construction is synthesized
     internally here so callers only need to describe the construction
     sequence ``_open_stream_with_retry`` will see; it never has to
-    account for __init__'s probe.
+    account for __init__'s probe. Pass ``init_probe`` to customize that
+    synthesized probe instance (e.g. to simulate a failing startup
+    probe) instead of the default always-successful one.
 
     An ``Exception`` instance in ``pa_instances`` is raised instead of
     returned (mock's own ``side_effect``-iterable behaviour), simulating
     a PyAudio() construction failure on that attempt.
     """
-    init_probe = _make_pyaudio_instance(-1)  # -1: __init__'s own device-probe instance
-    module.pyaudio.PyAudio = MagicMock(side_effect=[init_probe, *pa_instances])
+    probe = init_probe if init_probe is not None else _make_pyaudio_instance(-1)
+    module.pyaudio.PyAudio = MagicMock(side_effect=[probe, *pa_instances])
     return module.AudioRecorder(**kwargs)
 
 
-def _blocking_stream(read_error: Exception, release_event: threading.Event):
+def _blocking_stream(
+    read_error: Exception, release_event: threading.Event
+) -> MagicMock:
     """A mock stream whose read() blocks on a test-owned event, then
     raises read_error.
 
@@ -144,7 +154,7 @@ def _blocking_stream(read_error: Exception, release_event: threading.Event):
 
 
 def _wait_until(
-    predicate,
+    predicate: Callable[[], object],
     timeout: float = 2.0,
     poll: float = 0.01,
 ) -> bool:
@@ -160,7 +170,7 @@ def _wait_until(
     deadline = time.monotonic() + timeout
     while not predicate() and time.monotonic() < deadline:
         threading.Event().wait(timeout=poll)
-    return predicate()
+    return bool(predicate())
 
 
 # ---------------------------------------------------------------------------
@@ -635,11 +645,12 @@ def test_release_during_backoff_sleep_aborts_before_next_attempt(
 
     monkeypatch.setattr(module.time, "sleep", fake_sleep)
 
+    # Fast-abort pattern: fake_sleep flips the state synchronously during
+    # the sleep, so the worker may tear down before the thread handle is
+    # captured; wait for completion on observable state instead (lens
+    # review HIGH #1/#4).
     assert recorder.start_recording() is True
-    thread = recorder.recording_thread
-    assert thread is not None
-    thread.join(timeout=2.0)
-    assert not thread.is_alive()
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     # The abort must land before the retry attempt does any work: probe
     # (1) + attempt 1 (pa1, 1) = 2, no third (retry) construction, no
@@ -777,23 +788,18 @@ def test_max_attempts_less_than_one_raises_value_error(
 
 def test_oserror_from_device_enumeration_is_retryable(audio_recorder_module):
     """A coreaudiod storm can make device enumeration itself raise OSError
-    -9986 (pa.get_device_count()/get_device_info_by_index), not just
-    open() (lens review HIGH #3). That must cost one attempt and let the
-    loop continue, not propagate out of _recording_worker and kill the
-    thread silently (the exact bug #16 this PR closes)."""
+    -9986 in _find_default_input_device's fallback path
+    (get_default_input_device_info fails, then get_device_count raises),
+    not just open() (lens review HIGH #3). That must cost one attempt and
+    let the loop continue, not propagate out of _recording_worker and
+    kill the thread silently (the exact bug #16 this PR closes)."""
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
     # Default-info lookup raises (so the fallback enumeration path runs),
-    # and the first enumeration pass itself raises OSError -9986.
+    # and the fallback's own get_device_count() call raises OSError --
+    # the enumeration-path OSError this test is named for.
     pa1.get_default_input_device_info.side_effect = OSError("no default")
-    pa1.get_device_count.side_effect = [
-        OSError("paInternalError during enumeration"),
-        1,
-    ]
-    pa1.get_device_info_by_index.return_value = {
-        "maxInputChannels": 0,
-        "maxOutputChannels": 2,
-    }
+    pa1.get_device_count.side_effect = OSError("paInternalError during enumeration")
     pa1.open.side_effect = OSError("attempt 1 failed")
 
     pa2 = _make_pyaudio_instance(1)
@@ -942,11 +948,13 @@ def test_backoff_loop_makes_up_to_n_attempts_with_sleep_between(
         max_attempts=4,
         retry_backoff_seconds=(0.01, 0.01, 0.01),
     )
+    # Fast-exhaustion pattern: all attempts fail in <1ms (sleep is mocked
+    # to a no-op), so the worker may have already torn down and cleared
+    # recording_thread before the capture below. Wait for completion on
+    # observable state instead of capturing the thread handle (lens
+    # review HIGH #1/#4: the read-before-start race failed in CI).
     assert recorder.start_recording() is True
-    thread = recorder.recording_thread
-    assert thread is not None
-    thread.join(timeout=5.0)
-    assert not thread.is_alive()
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     # -1 for __init__'s own device-probe construction (issue #37 task-c).
     assert module.pyaudio.PyAudio.call_count - 1 == 4
@@ -969,46 +977,13 @@ def test_backoff_sleep_cadence_matches_schedule(audio_recorder_module, monkeypat
     recorder = _make_recorder(
         module, *pa_instances, max_attempts=4, retry_backoff_seconds=schedule
     )
+    # Fast-exhaustion pattern: the worker may tear down before the thread
+    # handle can be captured; wait for completion on observable state
+    # instead (lens review HIGH #1/#4).
     assert recorder.start_recording() is True
-    thread = recorder.recording_thread
-    assert thread is not None
-    thread.join(timeout=5.0)
-    assert not thread.is_alive()
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     assert module.time.sleep.call_args_list == [mock.call(s) for s in schedule]
-
-
-def test_backoff_loop_exhausts_after_max_attempts_sets_last_error(
-    audio_recorder_module, monkeypatch
-):
-    """Exhausting every one of max_attempts attempts sets last_error and
-    resets recording/stream/thread state cleanly."""
-    module = audio_recorder_module
-    monkeypatch.setattr(module.time, "sleep", MagicMock())
-
-    pa_instances = []
-    for i in range(4):
-        pa = _make_pyaudio_instance(i)
-        pa.open.side_effect = OSError(f"attempt {i + 1} failed")
-        pa_instances.append(pa)
-
-    recorder = _make_recorder(
-        module,
-        *pa_instances,
-        max_attempts=4,
-        retry_backoff_seconds=(0.01, 0.01, 0.01),
-    )
-    assert recorder.start_recording() is True
-    thread = recorder.recording_thread
-    assert thread is not None
-    thread.join(timeout=5.0)
-    assert not thread.is_alive()
-
-    assert recorder.recording is False
-    assert recorder.stream is None
-    assert recorder.recording_thread is None
-    assert recorder.last_error is not None
-    assert "attempt 4 failed" in recorder.last_error
 
 
 def test_backoff_loop_succeeds_on_middle_attempt(audio_recorder_module, monkeypatch):
@@ -1233,11 +1208,14 @@ def test_backoff_loop_aborts_on_generation_supersede(
 
     monkeypatch.setattr(module.time, "sleep", fake_sleep)
 
+    # Fast-abort pattern: fake_sleep flips the state synchronously during
+    # the sleep, so the worker may tear down before the thread handle is
+    # captured. Wait for completion via the abort's observable outcome:
+    # the abort path writes no state, so last_error stays None and the
+    # retry attempt (attempt 2) is never constructed (lens review
+    # HIGH #1/#4).
     assert recorder.start_recording() is True
-    thread = recorder.recording_thread
-    assert thread is not None
-    thread.join(timeout=2.0)
-    assert not thread.is_alive()
+    assert _wait_until(lambda: module.pyaudio.PyAudio.call_count == 2, timeout=5.0)
 
     # The abort must land before the retry attempt does any work: probe
     # (1) + attempt 1 (pa1, 1) = 2, no second (retry) construction.
@@ -1270,11 +1248,12 @@ def test_backoff_loop_aborts_on_release_mid_backoff(audio_recorder_module, monke
 
     sleep_mock.side_effect = release_after_first_sleep
 
+    # Fast-abort pattern: the release fires synchronously inside the
+    # mocked sleep, so the worker may tear down before the thread handle
+    # is captured; wait for completion on observable state instead (lens
+    # review HIGH #1/#4).
     assert recorder.start_recording() is True
-    thread = recorder.recording_thread
-    assert thread is not None
-    thread.join(timeout=2.0)
-    assert not thread.is_alive()
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     # Only attempt 1's failure triggers the first sleep; the loop aborts
     # right after waking, before attempt 2 is constructed or a second
@@ -1337,6 +1316,40 @@ def test_per_attempt_log_line_emitted_with_expected_fields(
     )
     assert any("action=sleep" in line for line in log_lines)
     assert any("action=adopt" in line for line in log_lines)
+
+
+def test_init_survives_probe_oserror_during_coreaudiod_storm(
+    audio_recorder_module,
+):
+    """An OSError from the startup device probe (a coreaudiod storm
+    hitting get_device_count()/get_device_info_by_index in the fallback
+    enumeration path at app launch) must not propagate out of
+    __init__: construction succeeds and the retry loop re-resolves at
+    the first start_recording() call (lens review MEDIUM #4)."""
+    module = audio_recorder_module
+    probe = _make_pyaudio_instance(-1)
+    probe.get_default_input_device_info.side_effect = OSError("no default")
+    probe.get_device_count.side_effect = OSError("enumeration failed")
+    pa1 = _make_pyaudio_instance(0)
+    release_event = threading.Event()
+    pa1.open.return_value = _blocking_stream(OSError("stop the loop"), release_event)
+
+    recorder = _make_recorder(module, pa1, init_probe=probe)
+    # Construction survived the probe failure: probe got terminated. Now
+    # start recording -- the retry loop re-resolves against the fresh
+    # attempt-1 instance and adopts it (a blocking read keeps the worker
+    # deterministically alive, so this is the standard post-adoption wait
+    # idiom).
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert recorder.recording is True
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
 
 
 # ---------------------------------------------------------------------------

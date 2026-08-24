@@ -1,12 +1,14 @@
-"""Retry policy and logging helpers for microphone stream opening (issue #37).
+"""Retry policy (attempt budget, backoff schedule, errno classification),
+structured per-attempt logging, and a best-effort PyAudio terminate
+helper (issue #37).
 
-Extracted from audio_recorder.py so the retry policy (attempt budget,
-backoff schedule, errno classification, structured per-attempt logging,
-and PyAudio teardown) lives in one place, separate from the recorder's
-stream-lifecycle state management.
+Extracted from audio_recorder.py. The recorder's stream-lifecycle state
+management and the call sites that invoke terminate_quietly remain in
+audio_recorder.py.
 """
 
 import time
+from typing import Literal
 
 import pyaudio
 
@@ -64,7 +66,7 @@ def log_retry_attempt(
     max_attempts: int,
     attempt_start: float,
     errno: int | None,
-    action: str,
+    action: Literal["sleep", "open", "adopt", "abort"],
 ) -> None:
     """Emit one structured per-attempt retry log line to stdout.
 
