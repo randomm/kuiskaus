@@ -167,6 +167,116 @@ class TestHotkeyPressAdmission:
         assert app.recording_start_time is not None
 
 
+class TestHotkeyPressStartingState:
+    """Press-acknowledged state: the 🟠 line fires only on an admitted
+    start, and the old 🎤 Recording... line is gone (issue #43)."""
+
+    def test_press_admitted_prints_starting_state(self, app, capsys):
+        """Admitted press: 🟠 Starting... fires; 🎤 Recording... is gone."""
+        app.audio_recorder.start_recording = MagicMock(return_value=True)
+        app.show_notification = MagicMock()
+
+        app.on_hotkey_press()
+        out = capsys.readouterr().out
+
+        assert "🟠 Starting..." in out
+        assert "🎤 Recording..." not in out
+        assert app.is_recording is True
+
+    def test_press_refused_does_not_print_starting_state(self, app, capsys):
+        """Refused press (worker still alive, #16): no 🟠 line."""
+        app.audio_recorder.start_recording = MagicMock(return_value=False)
+        app.show_notification = MagicMock()
+
+        app.on_hotkey_press()
+        out = capsys.readouterr().out
+
+        assert "🟠 Starting..." not in out
+        assert app.is_recording is False
+
+
+class TestOnCaptureStarted:
+    """CLI parallel of the menubar trampoline (issue #43): the worker
+    thread's first non-empty stream.read() fires on_capture_started,
+    which prints 🔴 Recording when the CLI is still recording."""
+
+    def test_capture_started_prints_recording_when_active(self, app, capsys):
+        """is_recording True: 🔴 Recording fires."""
+        app.is_recording = True
+
+        app._on_capture_started()
+        out = capsys.readouterr().out
+
+        assert "🔴 Recording" in out
+
+    def test_capture_started_not_printed_when_not_recording(self, app, capsys):
+        """is_recording False (release already fired): 🔴 Recording
+        must NOT fire — stale callback is dropped with a warning line."""
+        app.is_recording = False
+
+        app._on_capture_started()
+        out = capsys.readouterr().out
+
+        assert "🔴 Recording" not in out
+        assert "after release" in out
+
+
+class TestDebugGating:
+    """KUISKAUS_DEBUG env var gates the structured [hotkey.*] /
+    [capture.started] log lines (issue #40). The DEBUG constant is
+    read at import time; the tests patch the module's binding directly
+    so the env-var wiring is exercised at import, not at call time."""
+
+    def test_debug_lines_present_when_debug_enabled(self, app, monkeypatch, capsys):
+        """DEBUG True: both [hotkey.press] and [capture.started] lines
+        fire on an admitted press + capture started."""
+        import kuiskaus.app as app_module
+
+        monkeypatch.setattr(app_module, "DEBUG", True)
+        app.audio_recorder.start_recording = MagicMock(return_value=True)
+        app.show_notification = MagicMock()
+
+        app.on_hotkey_press()
+        app._on_capture_started()
+        out = capsys.readouterr().out
+
+        assert "[hotkey.press]" in out
+        assert "[capture.started]" in out
+
+    def test_debug_lines_absent_when_debug_disabled(self, app, monkeypatch, capsys):
+        """DEBUG False (the default): neither [hotkey.press] nor
+        [capture.started] fires; the user-visible 🟠/🔴 lines still do."""
+        import kuiskaus.app as app_module
+
+        monkeypatch.setattr(app_module, "DEBUG", False)
+        app.audio_recorder.start_recording = MagicMock(return_value=True)
+        app.show_notification = MagicMock()
+
+        app.on_hotkey_press()
+        app._on_capture_started()
+        out = capsys.readouterr().out
+
+        assert "[hotkey.press]" not in out
+        assert "[capture.started]" not in out
+        # The user-visible state lines must still fire regardless of DEBUG.
+        assert "🟠 Starting..." in out
+        assert "🔴 Recording" in out
+
+    def test_debug_lines_absent_on_refused_press(self, app, monkeypatch, capsys):
+        """Refused press: [hotkey.press] fires with the refused tag so
+        the operator can correlate the warning line with a log line."""
+        import kuiskaus.app as app_module
+
+        monkeypatch.setattr(app_module, "DEBUG", True)
+        app.audio_recorder.start_recording = MagicMock(return_value=False)
+        app.show_notification = MagicMock()
+
+        app.on_hotkey_press()
+        out = capsys.readouterr().out
+
+        assert "[hotkey.press] refused" in out
+
+
 class TestHotkeyReleaseLastError:
     """A failed/stuck microphone open must surface via last_error (#16)."""
 
@@ -200,3 +310,29 @@ class TestHotkeyReleaseLastError:
         with patch("threading.Thread") as mock_thread_cls:
             app.on_hotkey_release()
             mock_thread_cls.assert_called_once()
+
+
+class TestHotkeyReleaseRaceLost:
+    """Race-lost empty audio (no last_error) must surface a notification (#40)."""
+
+    def test_cli_notifies_on_race_lost_empty_audio(self, app):
+        """Empty audio + no last_error: notification fires with race-lost message."""
+        import numpy as np
+
+        app.audio_recorder.stop_recording = MagicMock(
+            return_value=np.array([], dtype=np.float32)
+        )
+        app.audio_recorder.last_error = None
+        app.show_notification = MagicMock()
+
+        app.on_hotkey_press()
+        app.show_notification.reset_mock()
+        with patch("threading.Thread") as mock_thread_cls:
+            app.on_hotkey_release()
+            mock_thread_cls.assert_not_called()
+
+        app.show_notification.assert_called_once()
+        args = app.show_notification.call_args.args
+        assert args[0] == "No audio captured"
+        assert "hold longer" in args[1]
+        assert "microphone permission" in args[1]

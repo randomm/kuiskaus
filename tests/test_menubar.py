@@ -5,6 +5,7 @@ the menubar module import never touches Quartz, pyaudio, or model
 loading.
 """
 
+import queue
 import sys
 import threading
 import types
@@ -191,7 +192,65 @@ def app(monkeypatch: pytest.MonkeyPatch):
     instance._transcriber_lock = threading.Lock()
     instance._reload_lock = threading.Lock()
     instance._reload_generation = 0
+    instance._pending_capture_started_events = queue.Queue()
+    # Stubbed timer: the real rumps.Timer requires the NSRunLoop that
+    # only exists under app.run(); tests invoke _drain_ui_events directly.
+    instance._ui_tick_timer = MagicMock()
+    instance.audio_recorder.recording = False
+    instance.audio_recorder._generation = 0
     return instance
+
+
+def test_press_sets_starting_state(app):
+    """Press only acknowledges the request: the menu bar shows 🟠
+    Starting... until the capture-started event arrives (issue #43).
+    A capture-started event enqueued before press must NOT be rendered
+    either -- the UI must not claim a live recording before the press."""
+    app.audio_recorder.start_recording = MagicMock(return_value=True)
+    app._pending_capture_started_events.put(1)
+
+    app.on_hotkey_press()
+    app._drain_ui_events(None)
+
+    assert app.is_recording is True
+    assert app.title == "🟠"
+    assert app.status_item.title == "🟠 Starting..."
+
+
+def test_capture_started_event_drained_transitions_to_recording(app):
+    """A capture-started event for the current generation transitions the
+    menu bar to 🔴 Recording on the main-thread trampoline (issue #43)."""
+    app.audio_recorder.start_recording = MagicMock(return_value=True)
+    app.on_hotkey_press()
+    assert app.title == "🟠"
+
+    app.audio_recorder.recording = True
+    app.audio_recorder._generation = 5
+    app._enqueue_capture_started()
+
+    app._drain_ui_events(None)
+
+    assert app.title == "🔴"
+    assert app.status_item.title == "🔴 Recording"
+
+
+def test_stale_capture_started_dropped_by_generation_gate(app):
+    """A capture-started event whose generation is no longer current
+    (superseded recording, or release already fired) must be dropped --
+    a late event can never flicker 🔴 over Processing/Ready (#43)."""
+    app.audio_recorder.start_recording = MagicMock(return_value=True)
+    app.on_hotkey_press()
+
+    app.audio_recorder.recording = True
+    app.audio_recorder._generation = 5
+    app._enqueue_capture_started()
+    # A newer generation superseded the event's recording.
+    app.audio_recorder._generation = 6
+
+    app._drain_ui_events(None)
+
+    assert app.title == "🟠"
+    assert app.status_item.title == "🟠 Starting..."
 
 
 def test_release_without_press_is_noop(app):
@@ -260,6 +319,52 @@ def test_release_with_last_error_surfaces_and_persists(app):
     assert app.status_item.title != "🟢 Ready"
 
 
+def test_no_audio_captured_state_set_on_race_lost(app):
+    """A release that yields zero audio without a mic error (race-lost,
+    #40) surfaces ⚪ No audio captured -- not a silent flip to Ready,
+    and no transcription thread is spawned."""
+    app.audio_recorder.start_recording = MagicMock(return_value=True)
+    app.audio_recorder.stop_recording = MagicMock(
+        return_value=np.array([], dtype=np.float32)
+    )
+    app.audio_recorder.last_error = None
+
+    app.on_hotkey_press()
+    with patch("threading.Thread") as mock_thread_cls:
+        app.on_hotkey_release()
+        mock_thread_cls.assert_not_called()
+
+    assert app.status_item.title == "⚪ No audio captured"
+    assert app.is_recording is False
+
+
+def test_no_audio_state_clears_on_next_successful_recording(app):
+    """⚪ set on a race-lost release must be cleared by the next release
+    that yields audio: the transcribe branch resets the status to
+    🟡 Processing before spawning the worker (#40 DoD)."""
+    app.audio_recorder.start_recording = MagicMock(return_value=True)
+
+    # Cycle 1: race-lost -- empty audio, no error -> ⚪ status.
+    app.audio_recorder.stop_recording = MagicMock(
+        return_value=np.array([], dtype=np.float32)
+    )
+    app.on_hotkey_press()
+    app.on_hotkey_release()
+    assert app.status_item.title == "⚪ No audio captured"
+
+    # Cycle 2: a genuine capture -- the ⚪ state must not survive the
+    # release that hands audio to the transcription worker.
+    app.audio_recorder.stop_recording = MagicMock(
+        return_value=np.array([0.1, 0.2], dtype=np.float32)
+    )
+    app.on_hotkey_press()
+    with patch("threading.Thread") as mock_thread_cls:
+        app.on_hotkey_release()
+        mock_thread_cls.assert_called_once()
+
+    assert app.status_item.title == "🟡 Processing..."
+
+
 def test_release_without_last_error_still_transcribes(app):
     """No last_error: the normal transcription path still fires."""
     app.audio_recorder.start_recording = MagicMock(return_value=True)
@@ -294,19 +399,21 @@ def test_press_refused_paired_release_preserves_banner(app):
 
 
 def test_banner_clears_after_successful_recording(app):
-    """A genuinely successful recording (no last_error, empty audio) is
+    """A genuinely successful recording (no last_error, captured audio) is
     the one case that DOES clear a previously persisted banner."""
     app.status_item.title = "🔴 microphone busy — recording did not start"
     app.audio_recorder.start_recording = MagicMock(return_value=True)
     app.audio_recorder.stop_recording = MagicMock(
-        return_value=np.array([], dtype=np.float32)
+        return_value=np.array([0.1, 0.2], dtype=np.float32)
     )
     app.audio_recorder.last_error = None
 
     app.on_hotkey_press()
-    app.on_hotkey_release()
+    with patch("threading.Thread") as mock_thread_cls:
+        app.on_hotkey_release()
+        mock_thread_cls.assert_called_once()
 
-    assert app.status_item.title == "🟢 Ready"
+    assert app.status_item.title == "🟡 Processing..."
 
 
 def test_toggle_enabled_preserves_banner_on_reenable(app):
@@ -732,9 +839,19 @@ def test_init_installs_locks_and_transcriber_before_hotkey_listener(
 
     # rumps.App.__init__ needs a display; run it headless-safe via
     # NSApplication is already stubbed-free here (rumps works in tests
-    # because it defers the run loop to app.run()).
-    with patch.object(menubar_module, "HotkeyListenerCGEvent", _TrackingListener):
+    # because it defers the run loop to app.run()). The AudioRecorder
+    # stub swallows the on_capture_started kwarg (issue #43); a MagicMock
+    # would leak a partially-constructed recorder from __del__ ->
+    # cleanup() otherwise.
+    with (
+        patch.object(menubar_module, "HotkeyListenerCGEvent", _TrackingListener),
+        patch.object(menubar_module, "AudioRecorder") as mock_recorder_cls,
+    ):
         app = menubar_module.KuiskausMenuBarApp()
+
+    mock_recorder_cls.assert_called_once_with(
+        on_capture_started=app._enqueue_capture_started
+    )
 
     # The listener has been started (synchronously in __init__), so the
     # ordering invariant is fully exercised: the lock, the reload

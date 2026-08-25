@@ -253,6 +253,159 @@ def test_stop_recording_after_failed_open_returns_empty_array(audio_recorder_mod
     assert result.size == 0
 
 
+def test_stop_recording_logs_reason_retry_exhausted(audio_recorder_module, capsys):
+    """A stop after the retry loop exhausted (worker already set
+    last_error and cleared recording) must log the early-return reason
+    retry-exhausted -- the existing #16 red state is unchanged, the log
+    line is pure observability (issue #40)."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)
+    pa1.open.side_effect = OSError("first attempt failed")
+    pa_retry = _make_pyaudio_instance(1)
+    pa_retry.open.side_effect = OSError("retry failed")
+
+    recorder = _make_recorder(module, pa1, pa_retry, max_attempts=2)
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.last_error is not None, timeout=5.0)
+
+    recorder.stop_recording()
+
+    captured = capsys.readouterr()
+    log_lines = [
+        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
+    ]
+    pattern = re.compile(
+        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
+    )
+    assert len(log_lines) == 1
+    assert pattern.match(log_lines[0]), log_lines[0]
+    assert "reason=retry-exhausted" in log_lines[0]
+
+
+def test_stop_recording_logs_reason_no_worker(audio_recorder_module, capsys):
+    """A stop before any start (or a double-stop) must log reason=
+    no-worker with chunks=0 and duration_ms=0 (issue #40)."""
+    module = audio_recorder_module
+    recorder = _make_recorder(module, _make_pyaudio_instance(0))
+
+    result = recorder.stop_recording()
+
+    assert result.size == 0
+    captured = capsys.readouterr()
+    log_lines = [
+        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
+    ]
+    pattern = re.compile(
+        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
+    )
+    assert len(log_lines) == 1
+    assert pattern.match(log_lines[0]), log_lines[0]
+    assert "chunks=0" in log_lines[0]
+    assert "duration_ms=0" in log_lines[0]
+    assert "reason=no-worker" in log_lines[0]
+
+
+def test_stop_recording_logs_reason_race_lost(
+    audio_recorder_module, capsys, monkeypatch
+):
+    """The race the user hit (#40): the worker adopted the stream but the
+    user released before the first stream.read() landed, so the queue
+    drains empty with no last_error. Must log reason=race-lost and a
+    non-negative duration_ms (issue #40)."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)
+
+    # Synchronisation: the worker blocks in read() until unblocked.
+    # stop_recording() sets recording=False and then join(timeout);
+    # a helper thread unblocks the read shortly after, so the worker's
+    # read raises OSError, the worker breaks on the next loop check
+    # (recording is already False), and exits cleanly well before the
+    # join timeout. Queue is empty (no frame was ever put), last_error
+    # is None -> stop_recording() classifies this as race-lost (#40).
+    read_gate = threading.Event()
+
+    def fake_read(*_args, **_kwargs):
+        read_gate.wait(timeout=10.0)
+        raise OSError("loop ended before first frame")
+
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = fake_read
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    # Wait until the worker is provably inside read().
+    assert _wait_until(lambda: stream.read.called, timeout=5.0)
+
+    # Unblock the read from a helper thread so the worker can exit
+    # cleanly while stop_recording() is blocked in its join.
+    def _unblock():
+        threading.Event().wait(timeout=0.05)
+        read_gate.set()
+
+    unblock_thread = threading.Thread(target=_unblock, daemon=True)
+    unblock_thread.start()
+
+    result = recorder.stop_recording()
+    unblock_thread.join(timeout=5.0)
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+    assert result.size == 0
+    assert recorder.last_error is None
+    captured = capsys.readouterr()
+    log_lines = [
+        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
+    ]
+    pattern = re.compile(
+        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
+    )
+    assert len(log_lines) == 1
+    assert pattern.match(log_lines[0]), log_lines[0]
+    assert "chunks=0" in log_lines[0]
+    assert "reason=race-lost" in log_lines[0]
+
+
+def test_stop_recording_omits_log_line_on_non_empty_return(
+    audio_recorder_module, capsys
+):
+    """The [audio.stop] line is only for empty-array returns: a normal
+    capture must NOT log it (issue #40)."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)
+    release_event = threading.Event()
+    frame = b"\x00\x00" * 1024  # one full 1024-sample int16 frame
+
+    def fake_read(*_args, **_kwargs):
+        release_event.wait(timeout=10.0)
+        return frame
+
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = fake_read
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+
+    release_event.set()
+    thread.join(timeout=10.0)
+
+    result = recorder.stop_recording()
+    assert result.size > 0
+
+    captured = capsys.readouterr()
+    log_lines = [
+        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
+    ]
+    assert log_lines == []
+
+
 def test_failed_open_teardown_only_touches_worker_owned_objects(audio_recorder_module):
     """Every attempt -- including attempt 1 -- constructs its own fresh,
     disposable PyAudio() instance (issue #37 task-c); a failed attempt
@@ -281,7 +434,9 @@ def test_failed_open_teardown_only_touches_worker_owned_objects(audio_recorder_m
     assert recorder.pyaudio is None
 
 
-def test_all_attempts_exhausted_surfaces_error_and_recovers(audio_recorder_module):
+def test_all_attempts_exhausted_surfaces_error_and_recovers(
+    audio_recorder_module, capsys
+):
     """Every one of self.max_attempts instances failing must exhaust the
     loop cleanly (last_error set, recording/stream/thread reset), not
     crash the worker thread. Regression guard for the under-provisioning
@@ -316,6 +471,21 @@ def test_all_attempts_exhausted_surfaces_error_and_recovers(audio_recorder_modul
     assert recorder.recording_thread is None
     assert recorder.last_error is not None
     assert "attempt 4 failed" in recorder.last_error
+
+    # Issue #40: a stop after exhaustion must log reason=retry-exhausted
+    # from the early-return path (the worker already cleared recording).
+    recorder.stop_recording()
+    captured = capsys.readouterr()
+    log_lines = [
+        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
+    ]
+    pattern = re.compile(
+        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
+    )
+    assert len(log_lines) == 1
+    assert pattern.match(log_lines[0]), log_lines[0]
+    assert "chunks=0" in log_lines[0]
+    assert "reason=retry-exhausted" in log_lines[0]
 
 
 def test_pyaudio_construction_failure_on_retry_is_not_fatal(audio_recorder_module):
@@ -827,7 +997,7 @@ def test_oserror_from_device_enumeration_is_retryable(audio_recorder_module):
 # ---------------------------------------------------------------------------
 
 
-def test_stuck_open_sets_last_error_on_join_timeout(audio_recorder_module):
+def test_stuck_open_sets_last_error_on_join_timeout(audio_recorder_module, capsys):
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
     never_release = threading.Event()
@@ -856,6 +1026,21 @@ def test_stuck_open_sets_last_error_on_join_timeout(audio_recorder_module):
     assert result.size == 0
     assert recorder.last_error is not None
     assert "busy" in recorder.last_error.lower()
+
+    # Issue #40: the stuck-open outcome must also surface as the
+    # structured [audio.stop] log line (the existing print above it is
+    # unchanged; this is the observability add).
+    captured = capsys.readouterr()
+    log_lines = [
+        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
+    ]
+    pattern = re.compile(
+        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
+    )
+    assert len(log_lines) == 1
+    assert pattern.match(log_lines[0]), log_lines[0]
+    assert "chunks=0" in log_lines[0]
+    assert "reason=stuck-open" in log_lines[0]
 
     never_release.set()
     thread.join(timeout=10.0)
@@ -1369,3 +1554,323 @@ def test_constructor_kwargs_override_module_defaults(audio_recorder_module):
     assert recorder._stuck_open_timeout_seconds == pytest.approx(0.55)
     assert recorder.max_attempts != module.MAX_ATTEMPTS
     assert recorder.retry_backoff_seconds != module.RETRY_BACKOFF_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# on_capture_started callback (issue #43 task-c)
+# ---------------------------------------------------------------------------
+
+
+def _capture_callback_recorder(module, callback, read_data: bytes) -> tuple:
+    """Build a recorder wired with `callback` whose worker adopts a stream
+    whose read() returns read_data once (firing the capture-started hook)
+    and then blocks on a test-owned release event before raising OSError
+    to end the loop. Returns (recorder, thread, release_event)."""
+    pa1 = _make_pyaudio_instance(0)
+    release_event = threading.Event()
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = _blocking_read_then_block(read_data, release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, pa1, on_capture_started=callback)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    return recorder, thread, release_event
+
+
+def _blocking_read_then_block(read_data: bytes, release_event: threading.Event):
+    """side_effect callable: first call returns read_data, every later call
+    blocks on release_event then raises OSError("stop the loop"). The
+    "already returned once" state lives in a local list (a function
+    attribute would not be ty-resolvable, so a one-element list keeps the
+    type checker clean)."""
+    done = [False]
+
+    def fake_read(*_args, **_kwargs):
+        if not done[0]:
+            done[0] = True
+            return read_data
+        release_event.wait(timeout=10.0)
+        raise OSError("stop the loop")
+
+    return fake_read
+
+
+def test_on_capture_started_fires_after_first_nonempty_read(
+    audio_recorder_module,
+):
+    """The callback fires after the worker's first stream.read() that
+    returns a non-empty buffer. Zero-filled CoreAudio warmup bytes ARE
+    non-empty and DO fire it (issue #43: the trigger's purpose is
+    'audio bytes flowing from coreaudiod', not 'non-silent audio')."""
+    module = audio_recorder_module
+    callback = MagicMock()
+    _, thread, release = _capture_callback_recorder(module, callback, b"\x00" * 2048)
+
+    assert _wait_until(lambda: callback.call_count == 1, timeout=5.0)
+
+    release.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+    assert callback.call_count == 1
+
+
+def test_on_capture_started_fires_only_once_per_session(audio_recorder_module):
+    """A sustained recording (many successful reads) fires the callback
+    exactly once; the flag gates the second-and-later reads."""
+    module = audio_recorder_module
+    callback = MagicMock()
+    recorder, thread, release = _capture_callback_recorder(
+        module, callback, b"\x01\x02" * 1024
+    )
+
+    assert _wait_until(lambda: callback.call_count == 1, timeout=5.0)
+    # Let the worker take a few more read() iterations while the callback
+    # flag must stay set -- the next read blocks, but the flag state is
+    # already pinned.
+    assert _wait_until(lambda: recorder._capture_announced is True, timeout=5.0)
+
+    release.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+    assert callback.call_count == 1
+
+
+def test_on_capture_started_flag_resets_per_start_recording_cycle(
+    audio_recorder_module,
+):
+    """The once-flag is per start_recording() cycle: a second cycle on the
+    same recorder fires the callback again."""
+    module = audio_recorder_module
+    callback = MagicMock()
+    first = _capture_callback_recorder(module, callback, b"\x00" * 2048)
+    recorder = first[0]
+    release = first[2]
+    assert _wait_until(lambda: callback.call_count == 1, timeout=5.0)
+    release.set()
+    first[1].join(timeout=10.0)
+    assert not first[1].is_alive()
+    assert callback.call_count == 1
+
+    # Second cycle on the same recorder with a fresh pa instance and
+    # stream. The fixture's _make_recorder consumed pa1 for cycle 1 and
+    # the probe for __init__, so this cycle needs its own PyAudio()
+    # construction (pa2). Use a fresh PyAudio mock returning pa2 only.
+    pa2 = _make_pyaudio_instance(1)
+    release2 = threading.Event()
+    stream2 = MagicMock(name="stream-2")
+    stream2.read.side_effect = _blocking_read_then_block(b"\x03" * 2048, release2)
+    pa2.open.return_value = stream2
+    module.pyaudio.PyAudio = MagicMock(return_value=pa2)
+
+    assert recorder.start_recording() is True
+    thread2 = recorder.recording_thread
+    assert thread2 is not None
+
+    # The flag was reset by start_recording, so the callback fires again.
+    assert _wait_until(lambda: callback.call_count == 2, timeout=5.0)
+
+    release2.set()
+    thread2.join(timeout=10.0)
+    assert not thread2.is_alive()
+    assert callback.call_count == 2
+
+
+def test_on_capture_started_not_called_on_empty_capture(audio_recorder_module):
+    """Release-before-first-read (the race-lost case, issue #40's
+    newly-surfaced outcome): the worker breaks out of the loop before any
+    stream.read() succeeds, so the callback must never fire."""
+    module = audio_recorder_module
+    callback = MagicMock()
+    pa1 = _make_pyaudio_instance(0)
+    stream = MagicMock(name="never-read-stream")
+
+    # The while loop rechecks self.recording under lock before each read;
+    # if the test clears it before the first read, the worker breaks
+    # without ever calling stream.read().
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, pa1, on_capture_started=callback)
+    assert recorder.start_recording() is True
+    # stop_recording() clears self.recording under lock and joins.
+    recorder.stop_recording()
+
+    assert not recorder.recording
+    stream.read.assert_not_called()
+    assert callback.call_count == 0
+
+
+def test_on_capture_started_skipped_when_generation_superseded(
+    audio_recorder_module,
+):
+    """A newer recording superseding this worker between read() and the
+    callback firing (generation bump under lock) must suppress the
+    callback -- the generation gate is rechecked after read() returns."""
+    module = audio_recorder_module
+    callback = MagicMock()
+    pa1 = _make_pyaudio_instance(0)
+
+    def fake_read(*_args, **_kwargs):
+        # Simulate a newer generation taking over while the worker is in
+        # flight between read() and the callback. This is the exact race
+        # the issue's "generation gate" requirement exists to close.
+        with recorder._lock:
+            recorder._generation += 1
+            recorder.recording = True  # the newer generation is recording
+        return b"\x00" * 2048
+
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = fake_read
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, pa1, on_capture_started=callback)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    # The worker's read loop breaks immediately after the first read
+    # because the generation no longer matches my_gen.
+    assert _wait_until(lambda: thread.is_alive() is False, timeout=5.0)
+    thread.join(timeout=10.0)
+
+    assert callback.call_count == 0
+    # The stale worker must still have closed the stream it owned.
+    stream.stop_stream.assert_called_once()
+    stream.close.assert_called_once()
+
+    # Reset sentinel state so GC-time cleanup() doesn't join a string.
+    with recorder._lock:
+        recorder.recording = False
+        recorder.recording_thread = None
+        recorder.stream = None
+
+
+def test_on_capture_started_skipped_when_recording_false(audio_recorder_module):
+    """stop_recording() landing between the worker's read() returning and
+    the callback firing (recording False under lock) must suppress the
+    callback -- the recording-True gate is rechecked after read()."""
+    module = audio_recorder_module
+    callback = MagicMock()
+    pa1 = _make_pyaudio_instance(0)
+
+    def fake_read(*_args, **_kwargs):
+        # Simulate a release landing between read() and the callback.
+        with recorder._lock:
+            recorder.recording = False
+        return b"\x00" * 2048
+
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = fake_read
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, pa1, on_capture_started=callback)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    # The worker's read loop breaks on the next iteration; the callback
+    # is suppressed this time and the loop exits.
+    assert _wait_until(lambda: thread.is_alive() is False, timeout=5.0)
+    thread.join(timeout=10.0)
+
+    assert callback.call_count == 0
+    # The worker still tears down the stream it owned.
+    stream.stop_stream.assert_called_once()
+    stream.close.assert_called_once()
+
+
+def test_on_capture_started_callback_exception_does_not_stop_worker(
+    audio_recorder_module, capsys
+):
+    """A raising callback must not kill the read loop: the broad guard
+    (callback boundary, # noqa: BLE001) logs and continues. The next
+    read() still succeeds and the callback is NOT retried (the flag was
+    set before the raise)."""
+    module = audio_recorder_module
+
+    def boom():
+        raise RuntimeError("callback failure")
+
+    recorder, thread, release = _capture_callback_recorder(module, boom, b"\x00" * 2048)
+
+    # The flag is set before the callback runs, so the worker continues
+    # the loop after the raise without retrying; the second read blocks
+    # on release.
+    assert _wait_until(lambda: recorder._capture_announced is True, timeout=5.0)
+
+    release.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+    captured = capsys.readouterr()
+    assert "on_capture_started callback raised" in captured.out
+
+
+def test_on_capture_started_default_none_is_backwards_compatible(
+    audio_recorder_module,
+):
+    """AudioRecorder() without on_capture_started never calls anything;
+    recording behaves exactly as before the callback existed. The
+    flag is set (as a bookkeeping no-op) but no callback runs."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)
+    release_event = threading.Event()
+    pa1.open.return_value = _blocking_stream(OSError("stop the loop"), release_event)
+    recorder = _make_recorder(module, pa1)
+    assert recorder.on_capture_started is None
+    assert recorder._capture_announced is False
+
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    # The worker is deterministically alive (blocked in read()). Wait for
+    # adoption so the post-loop assertion on the flag is race-free.
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    assert thread.is_alive()
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+def test_on_capture_started_fires_after_retry_adoption(audio_recorder_module):
+    """The callback fires on the FIRST successful non-empty read ACROSS
+    ALL attempts, i.e. after retry adoption lands and the adopted stream
+    delivers its first bytes -- not once per retry attempt. Attempt 1
+    never reaches a read() (open() fails), so no callback fires from it.
+    A non-empty read on the adopted (attempt-2) stream fires it exactly
+    once."""
+    module = audio_recorder_module
+    callback = MagicMock()
+    pa1 = _make_pyaudio_instance(0)
+    pa1.open.side_effect = OSError("attempt 1 failed")
+    pa_retry = _make_pyaudio_instance(1)
+    release_event = threading.Event()
+    pa_retry.open.return_value = _blocking_read_stream(b"\x00" * 2048, release_event)
+
+    recorder = _make_recorder(
+        module, pa1, pa_retry, max_attempts=2, on_capture_started=callback
+    )
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    # Wait for the retry adoption, then for the callback to fire on the
+    # adopted stream's first non-empty read.
+    assert _wait_until(lambda: recorder.pyaudio is pa_retry, timeout=5.0)
+    assert _wait_until(lambda: callback.call_count == 1, timeout=5.0)
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+    assert callback.call_count == 1  # once total, not once per attempt
+
+
+def _blocking_read_stream(
+    read_data: bytes, release_event: threading.Event
+) -> MagicMock:
+    """A mock stream whose first read() returns read_data and whose
+    subsequent reads block on release_event before raising OSError.
+    Distinct from _blocking_stream (which raises on the first call): used
+    for tests where the worker must reach the read loop at least once."""
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = _blocking_read_then_block(read_data, release_event)
+    return stream

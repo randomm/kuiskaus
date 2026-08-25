@@ -4,6 +4,7 @@ Kuiskaus Menu Bar App - Whisper V3 Turbo Speech-to-Text for macOS
 A menu bar application for easy access to speech-to-text functionality.
 """
 
+import queue
 import threading
 import time
 from datetime import UTC, datetime
@@ -35,7 +36,9 @@ class KuiskausMenuBarApp(rumps.App):
         )
 
         # Initialize components
-        self.audio_recorder = AudioRecorder()
+        self.audio_recorder = AudioRecorder(
+            on_capture_started=self._enqueue_capture_started
+        )
         self.transcriber: Transcriber = ParakeetTranscriber()
         if not isinstance(self.transcriber, Transcriber):
             raise TypeError(
@@ -58,6 +61,15 @@ class KuiskausMenuBarApp(rumps.App):
         # transcriber that a newer reload already swapped in (issue #22).
         self._reload_lock = threading.Lock()
         self._reload_generation = 0
+        # Worker-thread -> main-thread trampoline for the capture-started
+        # event (issue #43): the recorder's worker calls
+        # _enqueue_capture_started off the main thread; the rumps.Timer
+        # below drains the queue on the main thread, where UI mutation is
+        # safe. rumps is main-thread-affine, so direct writes from the
+        # worker would race the NSRunLoop.
+        self._pending_capture_started_events: queue.Queue[int] = queue.Queue()
+        self._ui_tick_timer = rumps.Timer(self._drain_ui_events, 0.05)
+        self._ui_tick_timer.start()
 
         # Initialize hotkey listener with CGEventTap
         self.hotkey_listener = HotkeyListenerCGEvent(
@@ -207,9 +219,40 @@ class KuiskausMenuBarApp(rumps.App):
             self.is_recording = True
             self.recording_start_time = time.time()
 
-            # Update UI
+            # Update UI. Press only acknowledges the request: the mic
+            # is not necessarily capturing yet (PyAudio init), so the
+            # live-recording state waits for the capture-started event
+            # (issue #43).
+            self.title = "🟠"
+            self.update_status("🟠 Starting...")
+
+    def _enqueue_capture_started(self) -> None:
+        """Capture-started callback from the recorder's worker thread.
+
+        Queues the event's generation only; the rumps.Timer trampoline
+        (_drain_ui_events) performs the actual UI transition on the main
+        thread (issue #43). No UI mutation here.
+        """
+        self._pending_capture_started_events.put(self.audio_recorder._generation)
+
+    def _drain_ui_events(self, _sender) -> None:
+        """Main-thread trampoline: transition to live recording once the
+        capture-started event for the current recording generation has
+        arrived. Stale events (a newer generation superseded, or the
+        recording already released) are dropped so a late worker event
+        can never flicker 🔴 over Processing/Ready (issue #43)."""
+        while True:
+            try:
+                event_gen = self._pending_capture_started_events.get_nowait()
+            except queue.Empty:
+                return
+            if (
+                not self.audio_recorder.recording
+                or self.audio_recorder._generation != event_gen
+            ):
+                continue
             self.title = "🔴"
-            self.update_status("🔴 Recording...")
+            self.update_status("🔴 Recording")
 
     def on_hotkey_release(self):
         """Called when hotkey is released"""
@@ -250,6 +293,20 @@ class KuiskausMenuBarApp(rumps.App):
             self.update_status(f"🔴 {error_msg}")
             return
 
+        if len(audio_data) == 0:
+            # Race-lost: the recording ended before any audio bytes were
+            # captured and no mic error was set (#40). Surface it as its
+            # own state -- distinct from Ready -- instead of flipping
+            # straight back to Ready with no explanation. There is no
+            # auto-clear: any subsequent release that yields audio
+            # (below) restores the normal flow, and a no-op release
+            # (is_recording False) intentionally resets to Ready too,
+            # since any later release clears the transient state.
+            print("⚠️  No audio captured")
+            self.title = "🎤"
+            self.update_status("⚪ No audio captured")
+            return
+
         if start_time is None:
             print("⚠️  No start time recorded — ignoring release")
             self.title = "🎤"
@@ -257,18 +314,16 @@ class KuiskausMenuBarApp(rumps.App):
             return
         recording_duration = time.time() - start_time
 
-        # Update UI
+        # Update UI. A previous race-lost release may have left the ⚪
+        # status live; a release that yields audio supersedes it.
         self.title = "🎤"
         self.update_status("🟡 Processing...")
 
-        if len(audio_data) > 0:
-            # Transcribe in a separate thread
-            threading.Thread(
-                target=self._transcribe_and_insert,
-                args=(audio_data, recording_duration),
-            ).start()
-        else:
-            self.update_status("🟢 Ready")
+        # Transcribe in a separate thread
+        threading.Thread(
+            target=self._transcribe_and_insert,
+            args=(audio_data, recording_duration),
+        ).start()
 
     def _transcribe_and_insert(
         self, audio_data: np.ndarray, recording_duration: float
@@ -483,6 +538,10 @@ Version 1.0
                 return
 
         # Cleanup
+        try:
+            self._ui_tick_timer.stop()
+        except Exception as e:  # noqa: BLE001 - logged; must not raise from quit
+            print(f"Timer stop error: {e}")
         self.cleanup()
         rumps.quit_application()
 

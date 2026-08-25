@@ -2,7 +2,7 @@ import math
 import queue
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import pyaudio
@@ -34,6 +34,7 @@ class AudioRecorder:
         channels: int = 1,
         max_attempts: int = MAX_ATTEMPTS,
         retry_backoff_seconds: Sequence[float] = RETRY_BACKOFF_SECONDS,
+        on_capture_started: Callable[[], None] | None = None,
     ):
         # Defensive state first, before validation can raise: __del__ ->
         # cleanup() can then run on a partially-constructed instance
@@ -46,6 +47,16 @@ class AudioRecorder:
         self.last_error: str | None = None
         self._lock = threading.Lock()
         self._generation = 0
+        # Monotonic start timestamp of the current/last recording (issue
+        # #40), used for the [audio.stop] duration_ms field. Monotonic,
+        # not wall-clock: NTP adjustments must not produce negative
+        # durations. Set under _lock in start_recording(), read + reset
+        # in stop_recording().
+        self._start_monotonic: float | None = None
+        self.on_capture_started = on_capture_started
+        # Fires the on_capture_started callback at most once per
+        # start_recording() cycle; reset under the lock in start_recording().
+        self._capture_announced = False
 
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
@@ -364,13 +375,37 @@ class AudioRecorder:
             with self._lock:
                 if self._generation != my_gen or not self.recording:
                     break
+                # Announce capture-start at most once per start_recording()
+                # cycle (issue #43 task-c). The predicate is deliberately
+                # not re-checked here: the generation/recording gate below
+                # (re-acquired before the callback fires) is the actual
+                # staleness defence, and the flag is reset once per cycle.
+                capture_announced = self._capture_announced
             try:
                 data = stream.read(self.chunk_size, exception_on_overflow=False)
-                self.audio_queue.put(data)
             except OSError as e:
                 # CoreAudio/pyaudio I/O failure: log and stop the recording loop
                 print(f"Error recording audio: {e}")
                 break
+            self.audio_queue.put(data)
+            if not capture_announced and len(data) > 0:
+                with self._lock:
+                    if (
+                        self._capture_announced
+                        or self._generation != my_gen
+                        or not self.recording
+                    ):
+                        continue
+                    self._capture_announced = True
+                callback = self.on_capture_started
+                if callback is not None:
+                    try:
+                        callback()
+                    except Exception:  # noqa: BLE001 - callback boundary
+                        # A raising callback must not stop the read loop;
+                        # the recording continues.
+                        print("on_capture_started callback raised")
+                        continue
 
         self._close_stream_quietly(stream)
 
@@ -411,7 +446,9 @@ class AudioRecorder:
 
             self._generation += 1
             my_gen = self._generation
+            self._start_monotonic = time.monotonic()
             self.recording = True
+            self._capture_announced = False
             # Clear before spawning: clearing after thread.start() could
             # wipe an error the new worker has already set.
             self.last_error = None
@@ -425,17 +462,31 @@ class AudioRecorder:
         return True
 
     def stop_recording(self) -> np.ndarray:
-        """Stop recording and return the audio data as numpy array."""
+        """Stop recording and return the audio data as numpy array.
+
+        Every empty-array return logs exactly one structured line
+        ``[audio.stop] chunks=<n> duration_ms=<m> reason=<value>``
+        (issue #40). The reason is classified from observable state:
+        no-worker (stop without a live session, no error),
+        retry-exhausted (stop without a live session, last_error set),
+        stuck-open (worker still alive after the join timeout), or
+        race-lost (clean join, empty queue, no error).
+        """
         with self._lock:
             was_recording = self.recording
             thread = self.recording_thread
             my_gen = self._generation
+            start_monotonic = self._start_monotonic
             if was_recording:
                 self.recording = False
+                self._start_monotonic = None
 
         if not was_recording:
+            reason = "no-worker" if self.last_error is None else "retry-exhausted"
+            print(f"[audio.stop] chunks=0 duration_ms=0 reason={reason}")
             return np.array([], dtype=np.float32)
 
+        stuck_open = False
         if thread is not None:
             thread.join(timeout=self._stuck_open_timeout_seconds)
             if thread.is_alive():
@@ -448,6 +499,7 @@ class AudioRecorder:
                 print(
                     "Recording worker still alive after stop; microphone may be stuck"
                 )
+                stuck_open = True
 
         # Collect all audio data
         audio_chunks = []
@@ -462,6 +514,15 @@ class AudioRecorder:
             audio_float = audio_array.astype(np.float32) / 32768.0
             return audio_float
 
+        if start_monotonic is not None:
+            duration_ms = int((time.monotonic() - start_monotonic) * 1000)
+        else:
+            duration_ms = 0
+        reason = "stuck-open" if stuck_open else "race-lost"
+        print(
+            f"[audio.stop] chunks={len(audio_chunks)} "
+            f"duration_ms={duration_ms} reason={reason}"
+        )
         return np.array([], dtype=np.float32)
 
     def cleanup(self) -> None:
