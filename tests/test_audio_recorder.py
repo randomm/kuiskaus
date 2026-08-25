@@ -219,19 +219,12 @@ def test_failed_open_leaves_recording_false_and_next_start_succeeds(
     # so the loop doesn't try a 3rd/4th construction the mock has no
     # instance left to return.
     recorder = _make_recorder(module, pa1, pa_retry, max_attempts=2)
-    first_thread = None
+    # Fast-failure path: both attempts fail immediately, so the worker
+    # can complete and clear recording/recording_thread before any
+    # capture; wait for completion on observable state instead (lens
+    # review HIGH #1/#4 read-before-start race).
     assert recorder.start_recording() is True
-    _wait_until(lambda: recorder.recording_thread is not None)
-    first_thread = recorder.recording_thread
-    # Fast-failure path: the worker sets recording_thread inside
-    # start_recording() and clears it in teardown; both are under the
-    # same lock, so either the worker is still running (we captured a
-    # live thread) or it already finished and cleared the state (which
-    # is the subject of the assertions below). Polling can miss the
-    # thread entirely -- that is the expected fast-failure outcome, not
-    # a failure of the test.
-    if first_thread is not None:
-        first_thread.join(timeout=2.0)
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     # The wedge: open()'s OSError must not leave recording stuck True.
     assert recorder.recording is False
@@ -248,7 +241,6 @@ def test_failed_open_leaves_recording_false_and_next_start_succeeds(
     assert recorder.start_recording() is True
     second_thread = recorder.recording_thread
     assert second_thread is not None
-    assert second_thread is not first_thread
     assert second_thread.is_alive()
 
     second_release.set()
@@ -267,12 +259,12 @@ def test_stop_recording_after_failed_open_returns_empty_array(audio_recorder_mod
     # so the loop doesn't try a 3rd/4th construction the mock has no
     # instance left to return.
     recorder = _make_recorder(module, pa1, pa_retry, max_attempts=2)
-    thread = None
+    # Fast-failure path: both attempts fail immediately, so the worker
+    # can complete and clear recording before any capture; wait for
+    # completion on observable state instead (lens review HIGH #1/#4
+    # read-before-start race).
     assert recorder.start_recording() is True
-    _wait_until(lambda: recorder.recording_thread is not None)
-    thread = recorder.recording_thread
-    if thread is not None:
-        thread.join(timeout=2.0)
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     result = recorder.stop_recording()
 
@@ -342,9 +334,12 @@ def test_stop_recording_logs_reason_race_lost(
 
     recorder = _make_recorder(module, pa1)
     assert recorder.start_recording() is True
+    # Post-adoption capture idiom: wait for adoption first (the worker
+    # only clears recording_thread in post-loop teardown, so it cannot
+    # have exited before adoption lands).
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
     thread = recorder.recording_thread
     assert thread is not None
-    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
     # Wait until the worker is provably inside read().
     assert _wait_until(lambda: stream.read.called, timeout=5.0)
 
@@ -387,9 +382,11 @@ def test_stop_recording_omits_log_line_on_non_empty_return(
 
     recorder = _make_recorder(module, pa1)
     assert recorder.start_recording() is True
+    # Post-adoption capture idiom: the worker is blocked in read() after
+    # adoption, so it cannot have torn down recording_thread.
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
     thread = recorder.recording_thread
     assert thread is not None
-    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
 
     release_event.set()
     thread.join(timeout=10.0)
@@ -459,12 +456,12 @@ def test_failed_open_teardown_only_touches_worker_owned_objects(audio_recorder_m
     # so the loop doesn't try a 3rd/4th construction the mock has no
     # instance left to return.
     recorder = _make_recorder(module, pa1, pa_retry, max_attempts=2)
-    thread = None
+    # Fast-failure path: both attempts fail immediately, so the worker
+    # can complete and clear recording before any capture; wait for
+    # completion on observable state instead (lens review HIGH #1/#4
+    # read-before-start race).
     assert recorder.start_recording() is True
-    _wait_until(lambda: recorder.recording_thread is not None)
-    thread = recorder.recording_thread
-    if thread is not None:
-        thread.join(timeout=2.0)
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     pa1.terminate.assert_called_once()
     pa_retry.terminate.assert_called_once()
@@ -492,13 +489,12 @@ def test_all_attempts_exhausted_surfaces_error_and_recovers(
         max_attempts=4,
         retry_backoff_seconds=(0.01, 0.01, 0.01),
     )
-    thread = None
+    # Fast-exhaustion path: all four attempts fail immediately, so the
+    # worker can complete and clear recording before any capture; wait
+    # for completion on observable state instead (lens review HIGH
+    # #1/#4 read-before-start race).
     assert recorder.start_recording() is True
-    _wait_until(lambda: recorder.recording_thread is not None, timeout=5.0)
-    thread = recorder.recording_thread
-    if thread is not None:
-        thread.join(timeout=5.0)
-        assert not thread.is_alive()
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     # +1 for __init__'s own device-probe construction (issue #37 task-c),
     # synthesized by _make_recorder ahead of pa_instances.
@@ -625,12 +621,13 @@ def test_retry_runtime_error_from_device_lookup_sets_last_error(
     pa_retry.get_device_count.return_value = 0  # fallback loop finds nothing
 
     recorder = _make_recorder(module, pa1, pa_retry)
-    thread = None
+    # Fast-failure path: both attempts fail immediately (the retry's
+    # device lookup raises RuntimeError), so the worker can complete and
+    # clear recording before any capture; wait for completion on
+    # observable state instead (lens review HIGH #1/#4 read-before-start
+    # race).
     assert recorder.start_recording() is True
-    _wait_until(lambda: recorder.recording_thread is not None)
-    thread = recorder.recording_thread
-    if thread is not None:
-        thread.join(timeout=2.0)
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     assert recorder.recording is False
     assert recorder.stream is None
@@ -779,6 +776,10 @@ def test_admission_refuses_while_worker_alive(audio_recorder_module):
     # instance left to return.
     recorder = _make_recorder(module, pa1, pa_retry, max_attempts=2)
     assert recorder.start_recording() is True
+    # The worker is deterministically alive (blocked in open() on the
+    # test-owned event), so no adoption wait is needed before the
+    # capture.
+    assert _wait_until(lambda: recorder.recording_thread is not None)
     first_thread = recorder.recording_thread
 
     assert recorder.start_recording() is False
@@ -1215,10 +1216,13 @@ def test_backoff_loop_succeeds_on_middle_attempt(audio_recorder_module, monkeypa
         retry_backoff_seconds=(0.01, 0.01, 0.01),
     )
     assert recorder.start_recording() is True
+    # Post-adoption capture idiom: adoption (blocked in read()) provably
+    # precedes any teardown, so the capture is race-free.
+    assert _wait_until(lambda: recorder.pyaudio is pa3, timeout=5.0)
     thread = recorder.recording_thread
     assert thread is not None
 
-    assert _wait_until(lambda: recorder.pyaudio is pa3)
+    assert module.time.sleep.call_count == 2
     assert module.time.sleep.call_count == 2
     assert recorder.last_error is None
 
@@ -1292,9 +1296,11 @@ def test_fresh_pyaudio_constructed_every_start_recording_call(audio_recorder_mod
     recorder = _make_recorder(module, pa_first, pa_second)
 
     assert recorder.start_recording() is True
+    # Post-adoption capture idiom: the worker is blocked in read() after
+    # adoption, so it cannot have torn down recording_thread.
+    assert _wait_until(lambda: recorder.pyaudio is pa_first, timeout=5.0)
     first_thread = recorder.recording_thread
     assert first_thread is not None
-    assert _wait_until(lambda: recorder.pyaudio is pa_first)
 
     first_release.set()
     first_thread.join(timeout=10.0)
@@ -1305,10 +1311,12 @@ def test_fresh_pyaudio_constructed_every_start_recording_call(audio_recorder_mod
         OSError("stop second recording"), second_release
     )
     assert recorder.start_recording() is True
+    # Post-adoption capture idiom: the worker is blocked in read() after
+    # adoption, so it cannot have torn down recording_thread.
+    assert _wait_until(lambda: recorder.pyaudio is pa_second, timeout=5.0)
     second_thread = recorder.recording_thread
     assert second_thread is not None
     assert second_thread is not first_thread
-    assert _wait_until(lambda: recorder.pyaudio is pa_second)
     assert recorder.pyaudio is not pa_first
 
     # 1 probe (init) + 1 (first recording's attempt 1) + 1 (second
@@ -1497,10 +1505,11 @@ def test_per_attempt_log_line_emitted_with_expected_fields(
         module, pa1, pa_retry, max_attempts=2, retry_backoff_seconds=(0.01,)
     )
     assert recorder.start_recording() is True
+    # Post-adoption capture idiom: the worker is blocked in read() after
+    # adoption, so it cannot have torn down recording_thread.
+    assert _wait_until(lambda: recorder.pyaudio is pa_retry, timeout=5.0)
     thread = recorder.recording_thread
     assert thread is not None
-
-    assert _wait_until(lambda: recorder.pyaudio is pa_retry)
 
     release_event.set()
     thread.join(timeout=10.0)
@@ -1596,6 +1605,12 @@ def _capture_callback_recorder(module, callback, read_data: bytes) -> tuple:
 
     recorder = _make_recorder(module, pa1, on_capture_started=callback)
     assert recorder.start_recording() is True
+    # Post-adoption capture idiom: after the first read() returns
+    # (observable as stream.read having been called once), the worker
+    # is blocked on release_event inside read(), so it cannot have torn
+    # down recording_thread. A read-call (not callback) predicate, so
+    # the helper also works for raising callbacks (issue #43 task-c).
+    assert _wait_until(lambda: stream.read.call_count >= 1, timeout=5.0)
     thread = recorder.recording_thread
     assert thread is not None
     return recorder, thread, release_event
@@ -1687,11 +1702,12 @@ def test_on_capture_started_flag_resets_per_start_recording_cycle(
     module.pyaudio.PyAudio = MagicMock(return_value=pa2)
 
     assert recorder.start_recording() is True
+    # The flag was reset by start_recording, so the callback fires again;
+    # wait for it before capturing (post-adoption idiom -- the worker is
+    # then blocked on release2 inside read()).
+    assert _wait_until(lambda: callback.call_count == 2, timeout=5.0)
     thread2 = recorder.recording_thread
     assert thread2 is not None
-
-    # The flag was reset by start_recording, so the callback fires again.
-    assert _wait_until(lambda: callback.call_count == 2, timeout=5.0)
 
     release2.set()
     thread2.join(timeout=10.0)
@@ -1748,23 +1764,18 @@ def test_on_capture_started_skipped_when_generation_superseded(
 
     recorder = _make_recorder(module, pa1, on_capture_started=callback)
     assert recorder.start_recording() is True
-    thread = recorder.recording_thread
-    assert thread is not None
     # The worker's read loop breaks immediately after the first read
-    # because the generation no longer matches my_gen.
-    assert _wait_until(lambda: thread.is_alive() is False, timeout=5.0)
-    thread.join(timeout=10.0)
+    # (the generation no longer matches my_gen) and its post-loop
+    # teardown is generation-gated, so it never clears recording for
+    # this generation; the only deterministic observable is the stream
+    # closure below. Wait on that instead of the transient thread handle
+    # (lens review HIGH #1/#4 read-before-start race).
+    assert _wait_until(lambda: stream.close.called, timeout=5.0)
 
     assert callback.call_count == 0
     # The stale worker must still have closed the stream it owned.
     stream.stop_stream.assert_called_once()
     stream.close.assert_called_once()
-
-    # Reset sentinel state so GC-time cleanup() doesn't join a string.
-    with recorder._lock:
-        recorder.recording = False
-        recorder.recording_thread = None
-        recorder.stream = None
 
 
 def test_on_capture_started_skipped_when_recording_false(audio_recorder_module):
@@ -1787,12 +1798,15 @@ def test_on_capture_started_skipped_when_recording_false(audio_recorder_module):
 
     recorder = _make_recorder(module, pa1, on_capture_started=callback)
     assert recorder.start_recording() is True
+    # The worker's read loop breaks on the next iteration (recording is
+    # False); the callback is suppressed this time and the loop exits.
+    # The worker can clear recording_thread before a capture, so assert
+    # on observable state instead (lens review HIGH #1/#4 read-before-
+    # start race).
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
     thread = recorder.recording_thread
-    assert thread is not None
-    # The worker's read loop breaks on the next iteration; the callback
-    # is suppressed this time and the loop exits.
-    assert _wait_until(lambda: thread.is_alive() is False, timeout=5.0)
-    thread.join(timeout=10.0)
+    if thread is not None:
+        thread.join(timeout=10.0)
 
     assert callback.call_count == 0
     # The worker still tears down the stream it owned.
@@ -1873,12 +1887,14 @@ def test_on_capture_started_fires_after_retry_adoption(audio_recorder_module):
         module, pa1, pa_retry, max_attempts=2, on_capture_started=callback
     )
     assert recorder.start_recording() is True
-    thread = recorder.recording_thread
-    assert thread is not None
     # Wait for the retry adoption, then for the callback to fire on the
-    # adopted stream's first non-empty read.
+    # adopted stream's first non-empty read; by then the worker is
+    # blocked on release_event inside read(), so the capture is
+    # race-free (post-adoption idiom).
     assert _wait_until(lambda: recorder.pyaudio is pa_retry, timeout=5.0)
     assert _wait_until(lambda: callback.call_count == 1, timeout=5.0)
+    thread = recorder.recording_thread
+    assert thread is not None
 
     release_event.set()
     thread.join(timeout=10.0)
