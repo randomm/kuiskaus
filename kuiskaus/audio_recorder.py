@@ -14,6 +14,7 @@ from kuiskaus.audio_retry import (
     attempt_open_once,
     format_microphone_error,
     log_retry_attempt,
+    refresh_pyaudio_session,
     terminate_quietly,
 )
 
@@ -50,12 +51,8 @@ class AudioRecorder:
         self._generation = 0
         # Monotonic start timestamp of the current/last recording
         # (issue #40), used for the [audio.stop] duration_ms field.
-        # Monotonic, not wall-clock: NTP adjustments must not produce
-        # negative durations. Set under _lock in start_recording().
         self._start_monotonic: float | None = None
         self.on_capture_started = on_capture_started
-        # Fires on_capture_started at most once per start_recording()
-        # cycle; reset under the lock there.
         self._capture_announced = False
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
@@ -74,13 +71,30 @@ class AudioRecorder:
             )
         self.max_attempts = max_attempts
         self.retry_backoff_seconds = retry_backoff_seconds
-        # Backoff budget plus slack for open() latency; a worst-case run
-        # of max_attempts slow opens can exceed this by ~0.5s and is
-        # surfaced late via the release path -- accepted (issue #37 TC).
         self._stuck_open_timeout_seconds: float = sum(retry_backoff_seconds) + 0.5
-        # Startup sanity check: a transient probe OSError here just
-        # warns; the retry loop re-resolves (see _initialize_probe).
-        _initialize_probe(self)
+        # Persistent cached PyAudio session (issue #42).
+        try:
+            self.pyaudio = pyaudio.PyAudio()
+        except Exception as construct_error:  # noqa: BLE001 - PyAudio()
+            # construction wraps PortAudio's Pa_Initialize(), whose
+            # failure modes aren't documented as a narrow exception set.
+            self.pyaudio = None
+            print(
+                "Warning: PyAudio construction failed at startup "
+                f"({construct_error}); will retry at first recording."
+            )
+        self.input_device_index: int | None = None
+        if self.pyaudio is not None:
+            try:
+                self.input_device_index = self._find_default_input_device(self.pyaudio)
+            except (OSError, RuntimeError):
+                # Transient (coreaudiod storm at startup) or no device at
+                # all -- the worker's poll + the retry loop re-resolve.
+                self.input_device_index = None
+                print(
+                    "Warning: microphone probe failed at startup; "
+                    "will re-resolve at first recording."
+                )
 
     @property
     def current_generation(self) -> int:
@@ -137,19 +151,19 @@ class AudioRecorder:
         attempt: int,
         attempt_start: float,
     ) -> bool:
-        """Lock-scoped local-capture ownership transfer: adopt new_pa
-        and its stream into self.pyaudio, terminating the previous
-        session's instance (captured under the same lock acquisition)
-        outside the lock, gated on self.stream is None -- the
-        invariant every teardown path maintains (issue #37 task-c).
-
-        Returns False (stream + new_pa torn down) if superseded while
-        retrying -- the stream belongs to no one in that case.
-        """
+        """Lock-scoped local-capture ownership transfer: adopt new_pa and
+        its stream into self.pyaudio, terminating the previous session's
+        instance. A retry (attempt >= 2) adopts a fresh instance and
+        disposes the previous; attempt 1 (issue #42) adopts the cached
+        instance. Returns False if superseded while retrying."""
         with self._lock:
             if self._generation != my_gen or not self.recording:
                 self._close_stream_quietly(stream)
-                terminate_quietly(new_pa)
+                if attempt > 1:
+                    # A fresh (unadopted) retry instance: this worker
+                    # owns its termination -- cleanup() will never see
+                    # it (self.pyaudio was never reassigned).
+                    terminate_quietly(new_pa)
                 log_retry_attempt(
                     attempt, self.max_attempts, attempt_start, None, "abort"
                 )
@@ -159,6 +173,10 @@ class AudioRecorder:
             # concurrent cleanup() can never observe a torn state.
             old_pyaudio = self.pyaudio
             self.pyaudio = new_pa
+            # Attempt 1 reused the cached instance: it remains current
+            # and its device index is still valid.
+            if attempt == 1:
+                return True
 
         # Outside the lock: whoever captures old_pyaudio owns its
         # termination; cleanup() uses the same pattern, so
@@ -174,34 +192,11 @@ class AudioRecorder:
 
     def _open_stream_with_retry(self, my_gen: int) -> "pyaudio.Stream | None":
         """Open the input stream, retrying with backoff up to
-        ``self.max_attempts``.
-
-        Every attempt -- including attempt 1 -- constructs a fresh
-        ``pyaudio.PyAudio()`` and re-resolves the default input device
-        against it (issue #37 task-c); a device change between
-        recordings (e.g. AirPods disconnecting) is picked up on attempt
-        1. Deliberately no time budget on open() itself --
-        pyaudio.open() is an uninterruptible blocking C call (issue
-        #16). Before each attempt after the first, the
-        generation/recording state is rechecked under ``_lock`` both
-        before the backoff sleep and after waking, so a hotkey release
-        mid-backoff does not burn the remaining sleep budget or an
-        abandoned attempt. A ``RuntimeError`` from device re-resolution
-        (no input device at all) aborts the loop immediately; an
-        ``OSError`` from device enumeration or ``open()``, or a
-        ``pyaudio.PyAudio()`` construction failure, is transient and
-        costs one attempt.
-
-        Returns the opened stream, or None if all attempts failed
-        (``last_error`` is set, gated on ``my_gen`` still current) or
-        the generation/recording state was superseded mid-retry.
-
-        Per-attempt structured logging (issue #37): every attempt emits
-        one line -- action ``"sleep"`` (backoff, attempts 2..N),
-        ``"open"`` (failed construction/enumeration/open()), ``"adopt"``
-        (successful open), or ``"abort"`` (superseded state, or
-        persistent device-lookup RuntimeError).
-        """
+        ``self.max_attempts``. Attempt 1 reuses the cached ``self.pyaudio``
+        and ``self.input_device_index`` (issue #42); retries 2..N construct
+        a fresh PyAudio() and re-resolve the device (issue #37, unchanged).
+        Returns the opened stream, or None if all attempts failed or the
+        generation was superseded mid-retry."""
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_attempts + 1):
@@ -232,6 +227,12 @@ class AudioRecorder:
                 self.max_attempts,
                 attempt,
                 attempt_start,
+                # Issue #42: attempt 1 reuses the cached session; its
+                # device was already resolved against the cache at
+                # construction/poll time (issue #38's per-attempt
+                # re-resolution stays on retries 2..N).
+                existing_pa=self.pyaudio if attempt == 1 else None,
+                existing_device_index=self.input_device_index if attempt == 1 else None,
             )
             if stream is None:
                 last_error = error
@@ -263,14 +264,31 @@ class AudioRecorder:
                 self.recording_thread = None
         return None
 
+    def _refresh_pyaudio_session(self) -> None:
+        """Device-change poll + on-demand construction (issue #42),
+        called at the top of _recording_worker before the retry loop.
+        Delegates to audio_retry.refresh_pyaudio_session (extracted to
+        keep this module under the 500-line limit).
+        """
+        with self._lock:
+            self.pyaudio, self.input_device_index = refresh_pyaudio_session(
+                pyaudio,
+                self.pyaudio,
+                self.input_device_index,
+                self._find_default_input_device,
+            )
+
     def _recording_worker(self, my_gen: int) -> None:
         """Worker thread for continuous audio recording.
 
         Every shared-state write here (failure path, adoption,
         post-loop teardown) is gated on ``self._generation == my_gen``
         so a late/stale worker can never clobber a newer recording's
-        state.
+        state. The device-change poll (issue #42) runs first: it
+        rebuilds the cached PyAudio session when the default input
+        device moved, and constructs on-demand if __init__ failed.
         """
+        self._refresh_pyaudio_session()
         stream = self._open_stream_with_retry(my_gen)
         if stream is None:
             return  # last_error already set (or generation superseded)
@@ -475,25 +493,3 @@ class AudioRecorder:
     def __del__(self):
         """Ensure cleanup on deletion"""
         self.cleanup()
-
-
-def _initialize_probe(recorder: "AudioRecorder") -> None:
-    """Validate a default input device exists using a temporary PyAudio()
-    instance, terminated immediately after (issue #37 task-c). Sanity
-    check only -- every recording re-resolves the device against its own
-    fresh instance in _open_stream_with_retry. A RuntimeError (no input
-    device at all) propagates out of __init__ unchanged; an OSError from
-    the probe is transient (a coreaudiod storm at startup, the same
-    failure class attempt_open_once classifies in the retry loop): warn
-    -- the retry loop re-resolves at the first start_recording() call.
-    """
-    probe = pyaudio.PyAudio()
-    try:
-        recorder._find_default_input_device(probe)
-    except (OSError, RuntimeError) as probe_error:
-        print(
-            f"Warning: microphone probe failed at startup "
-            f"({probe_error}); retry loop will re-resolve per recording."
-        )
-    finally:
-        terminate_quietly(probe)

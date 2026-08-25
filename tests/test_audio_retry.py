@@ -74,6 +74,108 @@ def test_attempt_open_once_construction_failure_returns_oserror_and_terminates_n
     assert not pa_module.PyAudio.return_value.terminate.called
 
 
+def test_attempt_open_once_with_existing_pa_reuses_it_and_skips_resolution():
+    """Issue #42: attempt 1 passes the cached PyAudio instance plus its
+    cached device index. The cached instance must be reused verbatim --
+    no PyAudio() construction, no re-resolution (find_default_input
+    device never called) -- and the stream opened against the cached
+    index."""
+    from kuiskaus.audio_retry import attempt_open_once
+
+    pa_module = MagicMock(name="pyaudio")
+    cached_pa = MagicMock(name="cached-pa")
+    stream = MagicMock(name="stream")
+    cached_pa.open.return_value = stream
+
+    pa, got_stream, error = attempt_open_once(
+        pa_module,
+        8,
+        1,
+        16000,
+        1024,
+        _find_device,
+        4,
+        1,
+        0.0,
+        existing_pa=cached_pa,
+        existing_device_index=42,
+    )
+
+    assert error is None
+    assert pa is cached_pa
+    assert got_stream is stream
+    pa_module.PyAudio.assert_not_called()
+    cached_pa.open.assert_called_once_with(
+        format=8,
+        channels=1,
+        rate=16000,
+        input=True,
+        input_device_index=42,
+        frames_per_buffer=1024,
+    )
+
+
+def test_attempt_open_once_existing_pa_open_failure_does_not_terminate_cached():
+    """Issue #42: a failed attempt-1 open on the CACHED instance must not
+    terminate it -- the call site owns it and the retry loop (or the
+    next recording) may still use it. The error is returned so the loop
+    retries with a fresh instance."""
+    from kuiskaus.audio_retry import attempt_open_once
+
+    pa_module = MagicMock(name="pyaudio")
+    cached_pa = MagicMock(name="cached-pa")
+    open_error = OSError("stale session")
+    cached_pa.open.side_effect = open_error
+
+    pa, got_stream, error = attempt_open_once(
+        pa_module,
+        8,
+        1,
+        16000,
+        1024,
+        _find_device,
+        4,
+        1,
+        0.0,
+        existing_pa=cached_pa,
+        existing_device_index=42,
+    )
+
+    assert pa is None
+    assert got_stream is None
+    assert error is open_error
+    cached_pa.terminate.assert_not_called()
+
+
+def test_attempt_open_once_existing_pa_runtime_error_does_not_terminate_cached():
+    """Issue #42: a device-lookup RuntimeError against the cached instance
+    (no input device found -- persistent state) is returned for the
+    call site's abort decision, and the cached instance is NOT
+    terminated (the call site owns it)."""
+    from kuiskaus.audio_retry import attempt_open_once
+
+    pa_module = MagicMock(name="pyaudio")
+    cached_pa = MagicMock(name="cached-pa")
+
+    pa, got_stream, error = attempt_open_once(
+        pa_module,
+        8,
+        1,
+        16000,
+        1024,
+        lambda _pa: (_ for _ in ()).throw(RuntimeError("No input device found")),
+        4,
+        1,
+        0.0,
+        existing_pa=cached_pa,
+    )
+
+    assert pa is None
+    assert got_stream is None
+    assert isinstance(error, RuntimeError)
+    cached_pa.terminate.assert_not_called()
+
+
 def test_attempt_open_once_open_failure_terminates_the_failed_pa():
     """An open() OSError terminates the failed attempt's PyAudio (the
     attempt owns no stream) and returns the error so the loop retries."""
