@@ -1243,10 +1243,11 @@ def test_last_error_mentions_killall_coreaudiod_for_paInternalError(
 
     recorder = _make_recorder(module, pa1, max_attempts=1)
     assert recorder.start_recording() is True
-    thread = recorder.recording_thread
-    assert thread is not None
-    thread.join(timeout=2.0)
-    assert not thread.is_alive()
+    # Fast-exhaustion path: the worker can complete and clear
+    # recording_thread before a plain read of the attribute; assert on
+    # observable state instead of the transient thread handle (same
+    # race fixed in PR #38 round 2 for the sibling tests).
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     assert recorder.last_error is not None
     assert "sudo killall coreaudiod" in recorder.last_error
@@ -1261,10 +1262,11 @@ def test_last_error_generic_for_non_paInternalError(audio_recorder_module):
 
     recorder = _make_recorder(module, pa1, max_attempts=1)
     assert recorder.start_recording() is True
-    thread = recorder.recording_thread
-    assert thread is not None
-    thread.join(timeout=2.0)
-    assert not thread.is_alive()
+    # Fast-exhaustion path: the worker can complete and clear
+    # recording_thread before a plain read of the attribute; assert on
+    # observable state instead of the transient thread handle (same
+    # race fixed in PR #38 round 2 for the sibling tests).
+    assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     assert recorder.last_error is not None
     assert "killall" not in recorder.last_error
@@ -1336,16 +1338,10 @@ def test_previous_pyaudio_terminated_when_stream_none_before_next_recording(
     recorder = _make_recorder(module, pa_first, pa_second)
 
     assert recorder.start_recording() is True
-    first_thread = recorder.recording_thread
-    assert first_thread is not None
-    deadline = time.monotonic() + 2.0
-    while recorder.pyaudio is not pa_first and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert recorder.pyaudio is pa_first
+    assert _wait_until(lambda: recorder.pyaudio is pa_first, timeout=5.0)
 
     first_release.set()
-    first_thread.join(timeout=10.0)
-    assert not first_thread.is_alive()
+    assert _wait_until(lambda: recorder.recording is False, timeout=10.0)
     assert recorder.stream is None  # teardown invariant
 
     second_release = threading.Event()
@@ -1353,15 +1349,16 @@ def test_previous_pyaudio_terminated_when_stream_none_before_next_recording(
         OSError("stop second recording"), second_release
     )
     assert recorder.start_recording() is True
-    second_thread = recorder.recording_thread
-    assert second_thread is not None
     assert _wait_until(lambda: recorder.pyaudio is pa_second)
 
-    pa_first.terminate.assert_called_once()
-
+    # The second worker is blocked in read(), so the stop below needs
+    # no thread handle.
     second_release.set()
-    second_thread.join(timeout=10.0)
-    assert not second_thread.is_alive()
+    assert _wait_until(lambda: recorder.recording is False, timeout=10.0)
+
+    # Termination of the first instance happens at the second
+    # recording's adoption, so it is already observable by now.
+    pa_first.terminate.assert_called_once()
 
 
 def test_previous_pyaudio_not_terminated_when_stream_not_none(audio_recorder_module):
