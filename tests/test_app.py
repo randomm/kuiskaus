@@ -97,6 +97,49 @@ def app(monkeypatch: pytest.MonkeyPatch):
     return instance
 
 
+class TestCLICgeventListenerSwap:
+    """CLI must use the CGEventTap-based listener with the correct
+    lifecycle order (issue #39): start() → run_loop() → stop()."""
+
+    def test_cli_uses_cgevent_listener_and_lifecycle_order(self, monkeypatch, capsys):
+        import kuiskaus.app as app_module
+        from kuiskaus.app import KuiskausApp
+        from kuiskaus.hotkey_listener_cgevent import HotkeyListenerCGEvent
+
+        # The import-time alias in app.py must bind the CGEvent class,
+        # so instantiating app_module.HotkeyListener yields it.
+        assert app_module.HotkeyListener is HotkeyListenerCGEvent
+
+        class MockTranscriber:
+            def transcribe(self, audio, **kwargs) -> dict:
+                return {"text": ""}
+
+            def cleanup(self) -> None:
+                pass
+
+        call_order = []
+        fake_listener = MagicMock(spec=HotkeyListenerCGEvent)
+        fake_listener.start.side_effect = lambda: (call_order.append("start"), True)[1]
+        fake_listener.run_loop.side_effect = lambda: call_order.append("run_loop")
+        fake_listener.stop.side_effect = lambda: call_order.append("stop")
+
+        with (
+            patch.object(app_module, "AudioRecorder"),
+            patch.object(
+                app_module, "ParakeetTranscriber", return_value=MockTranscriber()
+            ),
+            patch.object(app_module, "TextInserter"),
+            patch.object(app_module, "HotkeyListener", return_value=fake_listener),
+        ):
+            app = KuiskausApp()
+        app.run()
+
+        assert call_order == ["start", "run_loop", "stop"]
+        # Cleanup ran after the loop: recorder + transcriber tore down too.
+        out = capsys.readouterr().out
+        assert "Goodbye" in out
+
+
 class TestHotkeyReleaseNoOp:
     """A release with no active recording must be a clean no-op (#17)."""
 

@@ -4,6 +4,7 @@ Kuiskaus - Whisper V3 Turbo Speech-to-Text for macOS
 Hold Control+Option to record, release to transcribe and insert text.
 """
 
+import signal
 import sys
 import threading
 import time
@@ -12,7 +13,7 @@ import numpy as np
 
 from .audio_recorder import AudioRecorder
 from .debug import DEBUG, _debug
-from .hotkey_listener import HotkeyListener
+from .hotkey_listener_cgevent import HotkeyListenerCGEvent as HotkeyListener
 from .parakeet_transcriber import ParakeetTranscriber
 from .postprocessor import clean_with_apfel
 from .silicon_check import check_apple_silicon
@@ -267,6 +268,17 @@ class KuiskausApp:
             print("\n❌ Failed to start hotkey listener")
             print("Please grant accessibility permissions and restart")
             return
+
+        # Belt-and-braces SIGINT handling (#39): it is unverified whether
+        # Python's SIGINT reaches the thread blocked in
+        # Quartz.CFRunLoopRun() on macOS 26. CFRunLoopStop is
+        # cross-thread-safe per Apple docs, so the handler stops the run
+        # loop from any thread; cleanup then runs in run()'s finally.
+        def _sigint_handler(_signum: int, _frame: object) -> None:
+            print("\n\nShutting down...")
+            self.hotkey_listener.stop_loop()
+
+        signal.signal(signal.SIGINT, _sigint_handler)
 
         try:
             # Run event loop (blocks)

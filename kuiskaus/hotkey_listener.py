@@ -1,3 +1,14 @@
+"""DEPRECATED: superseded by HotkeyListenerCGEvent (issue #39).
+
+Retained for one release cycle for rollback safety. This NSEvent-based
+global monitor requires a fully-initialized NSApplication (not just
+AppHelper.runEventLoop) to receive events, which bare-Python CLI
+processes don't provide on macOS 26 Tahoe.
+
+Use HotkeyListenerCGEvent instead — same API surface, works in both
+the menu bar app AND bare-Python CLI.
+"""
+
 from collections.abc import Callable
 
 from AppKit import NSEvent
