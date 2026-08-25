@@ -7,7 +7,6 @@ Hold Control+Option to record, release to transcribe and insert text.
 import sys
 import threading
 import time
-from collections.abc import Callable
 
 import numpy as np
 
