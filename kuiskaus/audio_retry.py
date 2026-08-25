@@ -1,6 +1,6 @@
 """Retry policy (attempt budget, backoff schedule, errno classification),
-structured per-attempt logging, and a best-effort PyAudio terminate
-helper (issue #37).
+structured per-attempt logging, one-shot open attempt, and a best-effort
+PyAudio terminate helper (issue #37).
 
 Extracted from audio_recorder.py. The recorder's stream-lifecycle state
 management and the call sites that invoke terminate_quietly remain in
@@ -8,6 +8,8 @@ audio_recorder.py.
 """
 
 import time
+from collections.abc import Callable
+from types import ModuleType
 from typing import Literal
 
 import pyaudio
@@ -50,6 +52,88 @@ def format_microphone_error(error: BaseException) -> str:
             "state; try 'sudo killall coreaudiod' in Terminal."
         )
     return f"Microphone unavailable: {error}"
+
+
+def attempt_open_once(
+    pa_module: ModuleType,
+    format: int,
+    channels: int,
+    sample_rate: int,
+    chunk_size: int,
+    find_default_input_device: Callable[["pyaudio.PyAudio"], int],
+    max_attempts: int,
+    attempt: int,
+    attempt_start: float,
+) -> tuple["pyaudio.PyAudio | None", "pyaudio.Stream | None", "Exception | None"]:
+    """One attempt: construct a fresh PyAudio(), re-resolve the
+    default input device against it, and open the stream.
+
+    Returns (pa, stream, None) on success. Returns (None, None,
+    error) on any failure, with the failed PyAudio already
+    terminated internally and NOT returned in the tuple -- a failed
+    attempt's fresh instance owns no stream and was never adopted
+    into self.pyaudio, so direct termination is always safe (issue
+    #37 task-c) and pa is only ever returned alongside its stream,
+    which makes the "don't use a failed attempt's pa" contract
+    structural rather than documented.
+
+    Transient failures (PyAudio() construction failure, OSError from
+    device enumeration or open()) are returned as the error so the
+    loop continues; a RuntimeError from device lookup (no input
+    device found at all -- persistent state) is distinguished by
+    type at the call site, which aborts the loop.
+
+    The contract for the call site is: ``stream is not None``
+    (success) implies ``pa is not None``; ``stream is None``
+    implies the attempt failed and ``error`` is set.
+    """
+    pa: pyaudio.PyAudio
+    try:
+        pa = pa_module.PyAudio()
+    except Exception as construct_error:  # noqa: BLE001 - PyAudio()
+        # construction wraps PortAudio's Pa_Initialize(), whose
+        # failure modes aren't documented as a narrow exception
+        # set. Transient, like an open() OSError: wrap in OSError
+        # (errno None) so the loop's RuntimeError check -- reserved
+        # for persistent device-lookup failures -- stays unambiguous.
+        log_retry_attempt(attempt, max_attempts, attempt_start, None, "open")
+        return None, None, OSError(construct_error)
+
+    try:
+        device_index = find_default_input_device(pa)
+    except OSError as device_error:
+        # A coreaudiod storm can make device enumeration itself
+        # raise OSError -9986 (issue #37 lens review HIGH #3):
+        # transient, same treatment as an open() OSError.
+        log_retry_attempt(
+            attempt, max_attempts, attempt_start, device_error.errno, "open"
+        )
+        terminate_quietly(pa)
+        return None, None, device_error
+    except RuntimeError as device_error:
+        # find_default_input_device's own documented failure (no
+        # input device found at all) -- persistent state.
+        log_retry_attempt(attempt, max_attempts, attempt_start, None, "abort")
+        terminate_quietly(pa)
+        return None, None, device_error
+
+    try:
+        stream = pa.open(
+            format=format,
+            channels=channels,
+            rate=sample_rate,
+            input=True,
+            input_device_index=device_index,
+            frames_per_buffer=chunk_size,
+        )
+    except OSError as open_error:
+        log_retry_attempt(
+            attempt, max_attempts, attempt_start, open_error.errno, "open"
+        )
+        terminate_quietly(pa)
+        return None, None, open_error
+
+    return pa, stream, None
 
 
 def terminate_quietly(pa: "pyaudio.PyAudio") -> None:

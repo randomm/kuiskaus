@@ -197,7 +197,7 @@ def app(monkeypatch: pytest.MonkeyPatch):
     # only exists under app.run(); tests invoke _drain_ui_events directly.
     instance._ui_tick_timer = MagicMock()
     instance.audio_recorder.recording = False
-    instance.audio_recorder._generation = 0
+    instance.audio_recorder.current_generation = 0
     return instance
 
 
@@ -225,7 +225,7 @@ def test_capture_started_event_drained_transitions_to_recording(app):
     assert app.title == "🟠"
 
     app.audio_recorder.recording = True
-    app.audio_recorder._generation = 5
+    app.audio_recorder.current_generation = 5
     app._enqueue_capture_started()
 
     app._drain_ui_events(None)
@@ -242,10 +242,10 @@ def test_stale_capture_started_dropped_by_generation_gate(app):
     app.on_hotkey_press()
 
     app.audio_recorder.recording = True
-    app.audio_recorder._generation = 5
+    app.audio_recorder.current_generation = 5
     app._enqueue_capture_started()
     # A newer generation superseded the event's recording.
-    app.audio_recorder._generation = 6
+    app.audio_recorder.current_generation = 6
 
     app._drain_ui_events(None)
 

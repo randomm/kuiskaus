@@ -52,6 +52,34 @@ def _cleanup_recorder(recorder):
         print("Error closing stream: recorder teardown in test")
 
 
+def _assert_stop_log_line(
+    captured,
+    reason: str,
+    chunks: int | None = None,
+    duration_ms_min: int | None = None,
+) -> None:
+    """Assert exactly one well-formed ``[audio.stop] chunks=<n>
+    duration_ms=<m> reason=<value>`` line in captured stdout, with the
+    given reason (issue #40). Optionally pin the chunks count and a
+    duration_ms floor. Shared by the four empty-return reason tests so
+    the line shape is asserted in one place."""
+    log_lines = [
+        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
+    ]
+    pattern = re.compile(
+        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
+    )
+    assert len(log_lines) == 1
+    assert pattern.match(log_lines[0]), log_lines[0]
+    if chunks is not None:
+        assert f"chunks={chunks}" in log_lines[0]
+    if duration_ms_min is not None:
+        match = pattern.match(log_lines[0])
+        assert match is not None
+        assert int(match.group(2)) >= duration_ms_min
+    assert f"reason={reason}" in log_lines[0]
+
+
 @pytest.fixture
 def audio_recorder_module(monkeypatch: pytest.MonkeyPatch):
     """Reload kuiskaus.audio_recorder bound to a stubbed pyaudio module.
@@ -270,16 +298,7 @@ def test_stop_recording_logs_reason_retry_exhausted(audio_recorder_module, capsy
 
     recorder.stop_recording()
 
-    captured = capsys.readouterr()
-    log_lines = [
-        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
-    ]
-    pattern = re.compile(
-        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
-    )
-    assert len(log_lines) == 1
-    assert pattern.match(log_lines[0]), log_lines[0]
-    assert "reason=retry-exhausted" in log_lines[0]
+    _assert_stop_log_line(capsys.readouterr(), "retry-exhausted")
 
 
 def test_stop_recording_logs_reason_no_worker(audio_recorder_module, capsys):
@@ -291,18 +310,7 @@ def test_stop_recording_logs_reason_no_worker(audio_recorder_module, capsys):
     result = recorder.stop_recording()
 
     assert result.size == 0
-    captured = capsys.readouterr()
-    log_lines = [
-        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
-    ]
-    pattern = re.compile(
-        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
-    )
-    assert len(log_lines) == 1
-    assert pattern.match(log_lines[0]), log_lines[0]
-    assert "chunks=0" in log_lines[0]
-    assert "duration_ms=0" in log_lines[0]
-    assert "reason=no-worker" in log_lines[0]
+    _assert_stop_log_line(capsys.readouterr(), "no-worker", chunks=0, duration_ms_min=0)
 
 
 def test_stop_recording_logs_reason_race_lost(
@@ -356,17 +364,7 @@ def test_stop_recording_logs_reason_race_lost(
 
     assert result.size == 0
     assert recorder.last_error is None
-    captured = capsys.readouterr()
-    log_lines = [
-        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
-    ]
-    pattern = re.compile(
-        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
-    )
-    assert len(log_lines) == 1
-    assert pattern.match(log_lines[0]), log_lines[0]
-    assert "chunks=0" in log_lines[0]
-    assert "reason=race-lost" in log_lines[0]
+    _assert_stop_log_line(capsys.readouterr(), "race-lost", chunks=0, duration_ms_min=0)
 
 
 def test_stop_recording_omits_log_line_on_non_empty_return(
@@ -404,6 +402,45 @@ def test_stop_recording_omits_log_line_on_non_empty_return(
         line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
     ]
     assert log_lines == []
+
+
+def test_current_generation_reflects_recording_cycles(audio_recorder_module):
+    """The public current_generation property mirrors the internal
+    generation counter: 0 before any recording, 1 after the first
+    start_recording(), 2 after the second (issue #40/43 lens review
+    MEDIUM #2: UI drain code reads the current generation through this
+    accessor instead of the private _generation attribute)."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)
+    release1 = threading.Event()
+    pa1.open.return_value = _blocking_stream(OSError("stop"), release1)
+    pa2 = _make_pyaudio_instance(1)
+    release2 = threading.Event()
+    pa2.open.return_value = _blocking_stream(OSError("stop"), release2)
+
+    recorder = _make_recorder(module, pa1, pa2)
+    assert recorder.current_generation == 0
+
+    assert recorder.start_recording() is True
+    assert recorder.current_generation == 1
+    release1.set()
+    assert recorder.recording_thread is not None
+    recorder.recording_thread.join(timeout=10.0)
+
+    assert recorder.start_recording() is True
+    assert recorder.current_generation == 2
+    release2.set()
+    assert recorder.recording_thread is not None
+    recorder.recording_thread.join(timeout=10.0)
+
+
+def test_current_generation_not_writable(audio_recorder_module):
+    """current_generation is a read-only accessor: assignment must fail
+    with AttributeError, not silently create an instance attribute."""
+    module = audio_recorder_module
+    recorder = _make_recorder(module, _make_pyaudio_instance(0))
+    with pytest.raises(AttributeError):
+        recorder.current_generation = 5
 
 
 def test_failed_open_teardown_only_touches_worker_owned_objects(audio_recorder_module):
@@ -475,17 +512,9 @@ def test_all_attempts_exhausted_surfaces_error_and_recovers(
     # Issue #40: a stop after exhaustion must log reason=retry-exhausted
     # from the early-return path (the worker already cleared recording).
     recorder.stop_recording()
-    captured = capsys.readouterr()
-    log_lines = [
-        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
-    ]
-    pattern = re.compile(
-        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
+    _assert_stop_log_line(
+        capsys.readouterr(), "retry-exhausted", chunks=0, duration_ms_min=0
     )
-    assert len(log_lines) == 1
-    assert pattern.match(log_lines[0]), log_lines[0]
-    assert "chunks=0" in log_lines[0]
-    assert "reason=retry-exhausted" in log_lines[0]
 
 
 def test_pyaudio_construction_failure_on_retry_is_not_fatal(audio_recorder_module):
@@ -1030,17 +1059,9 @@ def test_stuck_open_sets_last_error_on_join_timeout(audio_recorder_module, capsy
     # Issue #40: the stuck-open outcome must also surface as the
     # structured [audio.stop] log line (the existing print above it is
     # unchanged; this is the observability add).
-    captured = capsys.readouterr()
-    log_lines = [
-        line for line in captured.out.splitlines() if line.startswith("[audio.stop]")
-    ]
-    pattern = re.compile(
-        r"^\[audio\.stop\] chunks=(\d+) duration_ms=(\d+) reason=[\w-]+$"
+    _assert_stop_log_line(
+        capsys.readouterr(), "stuck-open", chunks=0, duration_ms_min=0
     )
-    assert len(log_lines) == 1
-    assert pattern.match(log_lines[0]), log_lines[0]
-    assert "chunks=0" in log_lines[0]
-    assert "reason=stuck-open" in log_lines[0]
 
     never_release.set()
     thread.join(timeout=10.0)
@@ -1351,16 +1372,20 @@ def test_previous_pyaudio_not_terminated_when_stream_not_none(audio_recorder_mod
     module = audio_recorder_module
     old_pa = _make_pyaudio_instance(0)
     new_pa = _make_pyaudio_instance(1)
-    new_pa.open.return_value = MagicMock(name="new-stream")
 
     recorder = _make_recorder(module, new_pa)
     recorder.pyaudio = old_pa
     recorder.stream = MagicMock(name="still-live-stream-sentinel")
     recorder.recording = True
 
-    result = recorder._open_stream_with_retry(recorder._generation)
-
-    assert result is not None
+    stream = MagicMock(name="new-stream")
+    # Drive the adoption directly: the guard under test is the
+    # post-lock stream check, which the retry loop cannot reach without
+    # a full open() (the loop only adopts after open() succeeds, at
+    # which point the worker owns self.stream == None).
+    assert recorder._adopt_and_dispose_previous(
+        new_pa, stream, recorder.current_generation, 1, 0.0
+    )
     assert recorder.pyaudio is new_pa
     old_pa.terminate.assert_not_called()
 

@@ -233,7 +233,7 @@ class KuiskausMenuBarApp(rumps.App):
         (_drain_ui_events) performs the actual UI transition on the main
         thread (issue #43). No UI mutation here.
         """
-        self._pending_capture_started_events.put(self.audio_recorder._generation)
+        self._pending_capture_started_events.put(self.audio_recorder.current_generation)
 
     def _drain_ui_events(self, _sender) -> None:
         """Main-thread trampoline: transition to live recording once the
@@ -248,7 +248,7 @@ class KuiskausMenuBarApp(rumps.App):
                 return
             if (
                 not self.audio_recorder.recording
-                or self.audio_recorder._generation != event_gen
+                or self.audio_recorder.current_generation != event_gen
             ):
                 continue
             self.title = "🔴"
