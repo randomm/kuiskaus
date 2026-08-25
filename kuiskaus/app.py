@@ -11,6 +11,7 @@ import time
 import numpy as np
 
 from .audio_recorder import AudioRecorder
+from .debug import DEBUG, _debug
 from .hotkey_listener import HotkeyListener
 from .parakeet_transcriber import ParakeetTranscriber
 from .postprocessor import clean_with_apfel
@@ -64,14 +65,20 @@ class KuiskausApp:
         self.recording_start_time = None
         self.use_apfel = use_apfel
 
+        # Stats
+        self.total_transcriptions = 0
+        self.total_recording_time = 0.0
+
+        # Re-open the recorder so capture-start announcements (#43) land
+        # after all components are initialised, then replace the probe
+        # instance with a callback-connected one.
+        self.audio_recorder.cleanup()
+        self.audio_recorder = AudioRecorder(on_capture_started=self._on_capture_started)
+
         # Initialize hotkey listener with callbacks
         self.hotkey_listener = HotkeyListener(
             on_press=self.on_hotkey_press, on_release=self.on_hotkey_release
         )
-
-        # Stats
-        self.total_transcriptions = 0
-        self.total_recording_time = 0.0
 
     def on_hotkey_press(self):
         """Called when hotkey is pressed"""
@@ -84,10 +91,12 @@ class KuiskausApp:
                 print(
                     "⚠️  Recording could not start — previous recording still stopping"
                 )
+                _debug(DEBUG, "[hotkey.press] refused")
                 return
             self.is_recording = True
             self.recording_start_time = time.time()
-            print("🎤 Recording...")
+            print("🟠 Starting...")
+            _debug(DEBUG, "[hotkey.press] admitted")
             self.show_notification("Recording", "Speak now...")
 
     def on_hotkey_release(self):
@@ -125,13 +134,45 @@ class KuiskausApp:
         print(f"⏹️  Stopped recording ({recording_duration:.1f}s)")
 
         if len(audio_data) > 0:
+            _debug(DEBUG, "[hotkey.release] transcribing")
             # Transcribe in a separate thread to avoid blocking
             threading.Thread(
                 target=self._transcribe_and_insert,
                 args=(audio_data, recording_duration),
             ).start()
         else:
+            # Race-lost: recording was admitted but the worker captured zero
+            # frames (release before first stream.read()). Distinct from the
+            # last_error paths above — no mic error, just no audio (#40).
             print("No audio recorded")
+            _debug(DEBUG, "[hotkey.release] no-audio")
+            self.show_notification(
+                "No audio captured",
+                "Recording ended without capturing any audio "
+                "(hold longer, or check microphone permission).",
+            )
+
+    def _on_capture_started(self):
+        """Called from the audio-recorder worker thread when the first
+        non-empty stream.read() has returned (issue #43).
+
+        CLI has no main-thread trampoline requirement: plain print()
+        is thread-safe enough for this one line. The is_recording gate
+        here is the CLI-side complement to the generation gate that
+        AudioRecorder applies before invoking the callback (issue #43);
+        if release has already fired by the time the callback lands on
+        this thread, we drop the transition and print a warning so the
+        operator can see the stale event rather than silently ignore it.
+        """
+        try:
+            if self.is_recording:
+                print("🔴 Recording")
+                _debug(DEBUG, "[capture.started]")
+            else:
+                print("⚠️  Capture started after release — ignoring")
+                _debug(DEBUG, "[capture.started] stale-dropped")
+        except Exception as e:  # noqa: BLE001 - logged; callback boundary
+            print(f"Error in on_capture_started callback: {e}")
 
     def _transcribe_and_insert(
         self, audio_data: np.ndarray, recording_duration: float
