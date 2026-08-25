@@ -162,11 +162,18 @@ class KuiskausApp:
                         f"   Performance: {result['transcribe_time']:.2f}s ({rtf:.2f}x realtime)"
                     )
 
-                # Insert text
-                self.text_inserter.insert_text(text)
-                self.show_notification(
-                    "Transcribed", text[:50] + "..." if len(text) > 50 else text
-                )
+                # Insert text. On failure, surface the inserter's
+                # last_error and suppress the success notification — a
+                # failed insert must not be announced as a success (#41).
+                if self.text_inserter.insert_text(text):
+                    self.show_notification(
+                        "Transcribed",
+                        text[:50] + "..." if len(text) > 50 else text,
+                    )
+                else:
+                    self.show_notification(
+                        "Insert failed", self.text_inserter.last_error
+                    )
             else:
                 print("No speech detected")
                 self.show_notification(

@@ -293,20 +293,40 @@ class KuiskausMenuBarApp(rumps.App):
                 self.total_transcriptions += 1
                 self.total_recording_time += recording_duration
 
-                # Insert text
-                self.text_inserter.insert_text(text)
+                # Insert text (issue #41): the return value is now
+                # meaningful -- False means the keystrokes or the
+                # pasteboard write failed and TextInserter.last_error
+                # carries a specific reason. An insert failure must
+                # surface as its own banner and must NOT be clobbered
+                # by the terminal Ready update below (no-clobber guard,
+                # same principle as the #16 last_error clobber-guard).
+                insert_ok = self.text_inserter.insert_text(text)
 
                 # Log instead of notification (avoids Info.plist issues)
                 print(f"📝 Transcribed: {text}")
 
-                # This thread was spawned for a recording that completed
-                # without a mic error. But transcription runs async and can
-                # outlive a *later* press/release cycle; if that later
-                # cycle has since set last_error, this stale completion
-                # must not clobber it (#16, same principle as the no-op
-                # release branch above).
-                if not self.audio_recorder.last_error:
-                    self.update_status("🟢 Ready")
+                if insert_ok:
+                    # This thread was spawned for a recording that
+                    # completed without a mic error. But transcription
+                    # runs async and can outlive a *later*
+                    # press/release cycle; if that later cycle has
+                    # since set last_error, this stale completion must
+                    # not clobber it (#16, same principle as the no-op
+                    # release branch above).
+                    if not self.audio_recorder.last_error:
+                        self.update_status("🟢 Ready")
+                else:
+                    # An insert failure is a live error state: persist
+                    # it like a mic error (#16 pattern) -- no auto-
+                    # clear, and the no-clobber guard forbids the
+                    # terminal Ready write even when no mic error is
+                    # live. The banner clears on the next successful
+                    # transcription completion, mirroring how audio
+                    # errors clear on the next successful recording.
+                    self.title = "🎤"
+                    error_msg = self.text_inserter.last_error or "unknown error"
+                    print(f"⚠️  {error_msg}")
+                    self.update_status(f"🔴 Insert failed: {error_msg}")
             elif not self.audio_recorder.last_error:
                 self.update_status("🟢 Ready (no speech)")
 
