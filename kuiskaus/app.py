@@ -73,9 +73,7 @@ class KuiskausApp:
         # after all components are initialised, then replace the probe
         # instance with a callback-connected one.
         self.audio_recorder.cleanup()
-        self.audio_recorder = AudioRecorder(
-            on_capture_started=self._on_capture_started
-        )
+        self.audio_recorder = AudioRecorder(on_capture_started=self._on_capture_started)
 
         # Initialize hotkey listener with callbacks
         self.hotkey_listener = HotkeyListener(
