@@ -809,6 +809,72 @@ def test_show_stats_uses_aware_utc_session_start(app, monkeypatch):
     assert "0h 30m" in mock_alert.call_args.args[1]
 
 
+def test_insert_failure_surfaces_via_update_status(app):
+    """A transcription whose INSERTION failed must surface the distinct
+    🔴 Insert failed banner carrying TextInserter.last_error (#41), not
+    a silent success."""
+    app.transcriber = MagicMock()
+    app.transcriber.transcribe.return_value = {"text": "hello world"}
+    app.text_inserter = MagicMock()
+    app.text_inserter.insert_text.return_value = False
+    app.text_inserter.last_error = "keystroke injection failed"
+    app.audio_recorder.last_error = None
+
+    app._transcribe_and_insert(np.array([0.1], dtype=np.float32), 1.0)
+
+    app.text_inserter.insert_text.assert_called_once_with("hello world")
+    assert "Insert failed" in app.status_item.title
+    assert "keystroke injection failed" in app.status_item.title
+
+
+def test_insert_failure_status_not_clobbered_by_completion_path(app):
+    """The completion path's terminal 🟢 Ready update must be skipped when
+    insert_text returns False (#41 no-clobber guard): without it, the
+    🔴 Insert failed banner is immediately overwritten and the failure is
+    as invisible as the pre-#41 silent no-op."""
+    app.transcriber = MagicMock()
+    app.transcriber.transcribe.return_value = {"text": "hello world"}
+    app.text_inserter = MagicMock()
+    app.text_inserter.insert_text.return_value = False
+    app.text_inserter.last_error = "keystroke injection failed"
+    app.audio_recorder.last_error = None
+
+    app._transcribe_and_insert(np.array([0.1], dtype=np.float32), 1.0)
+
+    assert app.status_item.title == ("🔴 Insert failed: keystroke injection failed")
+
+
+def test_insert_failure_wins_when_mic_error_also_live(app):
+    """A failed insert surfaces its own 🔴 Insert failed banner even when a
+    mic error is also live (#41) -- the insert-failure branch is not gated
+    on audio_recorder.last_error, so the keystroke/pasteboard failure
+    reason is what the user sees."""
+    app.transcriber = MagicMock()
+    app.transcriber.transcribe.return_value = {"text": "hello world"}
+    app.text_inserter = MagicMock()
+    app.text_inserter.insert_text.return_value = False
+    app.text_inserter.last_error = "keystroke injection failed"
+    app.audio_recorder.last_error = "some mic error"
+
+    app._transcribe_and_insert(np.array([0.1], dtype=np.float32), 1.0)
+
+    assert app.status_item.title == ("🔴 Insert failed: keystroke injection failed")
+
+
+def test_insert_success_still_restores_ready(app):
+    """An insert that succeeded still restores the normal Ready state
+    (#41) -- the no-clobber guard must not swallow the success path."""
+    app.transcriber = MagicMock()
+    app.transcriber.transcribe.return_value = {"text": "hello world"}
+    app.text_inserter = MagicMock()
+    app.text_inserter.insert_text.return_value = True
+    app.audio_recorder.last_error = None
+
+    app._transcribe_and_insert(np.array([0.1], dtype=np.float32), 1.0)
+
+    assert app.status_item.title == "🟢 Ready"
+
+
 def test_app_module_exposes_shared_silicon_check():
     """app.py must use the shared implementation (issue #22 dedup) rather
     than its own private copy."""

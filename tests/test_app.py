@@ -167,6 +167,50 @@ class TestHotkeyPressAdmission:
         assert app.recording_start_time is not None
 
 
+class TestTranscribeAndInsertNotification:
+    """Insert-failure notification + success-notification suppression (#41)."""
+
+    def _drive_transcribe(self, app, text: str):
+        """Run the transcription worker synchronously with a known transcript."""
+        import numpy as np
+
+        class FixedTranscriber:
+            def transcribe(self, audio, **kwargs) -> dict:
+                return {"text": text}
+
+            def cleanup(self) -> None:
+                pass
+
+        app.transcriber = FixedTranscriber()
+        app.show_notification = MagicMock()
+        app._transcribe_and_insert(np.array([0.1]), 1.0)
+
+    def test_cli_notifies_on_insert_failure(self, app):
+        """insert_text False + last_error set: 'Insert failed' notification,
+        and the 'Transcribed' success notification must NOT fire."""
+        app.text_inserter.insert_text = MagicMock(return_value=False)
+        app.text_inserter.last_error = "CGEventPost key down failed"
+
+        self._drive_transcribe(app, "hello world")
+
+        titles = [c.args[0] for c in app.show_notification.call_args_list]
+        assert titles == ["Transcribing", "Insert failed"], (
+            f"unexpected notifications: {titles}"
+        )
+        assert "CGEventPost key down failed" in app.show_notification.call_args.args[1]
+
+    def test_cli_success_notification_only_on_insert_success(self, app):
+        """insert_text True: the 'Transcribed' notification fires as before."""
+        app.text_inserter.insert_text = MagicMock(return_value=True)
+
+        self._drive_transcribe(app, "hello world")
+
+        titles = [c.args[0] for c in app.show_notification.call_args_list]
+        assert titles == ["Transcribing", "Transcribed"], (
+            f"unexpected notifications: {titles}"
+        )
+
+
 class TestHotkeyPressStartingState:
     """Press-acknowledged state: the 🟠 line fires only on an admitted
     start, and the old 🎤 Recording... line is gone (issue #43)."""
