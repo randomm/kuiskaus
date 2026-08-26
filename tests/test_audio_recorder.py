@@ -135,56 +135,36 @@ def _make_recorder(
     module,
     *pa_instances: MagicMock | Exception,
     init_probe: MagicMock | None = None,
+    extra_pa: MagicMock | None = None,
     **kwargs,
 ):
     """Build an AudioRecorder wired for the cached-instance shape (issue
     #42: PR #38's per-recording construction is retired).
 
-    ``module.pyaudio.PyAudio`` is set up to yield, in order, the
-    __init__'s persistent cached instance first (synthesized from
-    ``init_probe`` when given -- e.g. to simulate a failing startup
-    device probe -- else an always-resolvable default), then
-    ``pa_instances`` as successive fresh constructions for the
-    retry-loop attempts 2..N of every recording this recorder makes.
-    Attempt 1 of every recording reuses the cached instance, so a
-    test describing a successful attempt-1 open only needs the cached
-    instance (``init_probe`` / the first synthesized default) to be
-    the instance it expects; its open() is what the attempt drives.
+    ``module.pyaudio.PyAudio`` yields, in order: ``init_probe`` (the
+    __init__'s persistent cached instance -- synthesized when not given),
+    then ``pa_instances`` as successive fresh constructions (retry-loop
+    attempts 2..N and device-change poll rebuilds), then ``extra_pa``
+    (synthesized when not given) on every further construction (a later
+    recording cycle's poll, etc.).
 
     An ``Exception`` instance in ``pa_instances`` is raised instead of
-    returned (mock's own ``side_effect``-iterable behaviour),
-    simulating a PyAudio() construction failure on that attempt.
+    returned, simulating a PyAudio() construction failure on that slot.
     """
-    if init_probe is not None:
-        init_pa = init_probe
-    else:
-        init_pa = _make_pyaudio_instance(-1)
-    # The device-change poll (issue #42) constructs a fresh PyAudio()
-    # whenever the cached index is None or the poll sees a device move.
-    # Use a factory callable: __init__ gets init_pa, retry attempts
-    # consume pa_instances in order, and any further constructions
-    # (2nd recording cycle's poll, etc.) get the last instance.
-    queue: list = [*pa_instances]
-    fallback: MagicMock = (
-        pa_instances[-1]
-        if pa_instances and not isinstance(pa_instances[-1], Exception)
-        else init_pa
-    )
+    if init_probe is None:
+        init_probe = _make_pyaudio_instance(-1)
+    if extra_pa is None:
+        extra_pa = _make_pyaudio_instance(999)
 
-    def _pa_factory() -> MagicMock:
-        nonlocal init_pa
-        if init_pa is not None:
-            result: MagicMock = init_pa
-            init_pa = None  # consumed
-            return result
-        if queue:
-            item = queue.pop(0)
-            if isinstance(item, Exception):
-                raise item
-            return item  # type: ignore[return-value]  # queue holds MagicMocks
-        return fallback
+    queue: list = [init_probe, *pa_instances]
 
-    module.pyaudio.PyAudio = MagicMock(side_effect=_pa_factory)
+    def _next_pa(*_args, **_kwargs) -> MagicMock:
+        item = queue.pop(0) if queue else extra_pa
+        if isinstance(item, BaseException):
+            raise item
+        return item  # type: ignore[return-value]  # queue holds MagicMocks
+
+    module.pyaudio.PyAudio = MagicMock(side_effect=_next_pa)
     return module.AudioRecorder(**kwargs)
 
 
@@ -333,9 +313,6 @@ def test_stop_recording_logs_reason_no_worker(audio_recorder_module, capsys):
     _assert_stop_log_line(capsys.readouterr(), "no-worker", chunks=0, duration_ms_min=0)
 
 
-@pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
-)
 def test_stop_recording_logs_reason_race_lost(
     audio_recorder_module, capsys, monkeypatch
 ):
@@ -363,7 +340,8 @@ def test_stop_recording_logs_reason_race_lost(
     stream.read.side_effect = fake_read
     pa1.open.return_value = stream
 
-    recorder = _make_recorder(module, pa1)
+    # pa1 is the __init__'s cached instance; attempt 1 reuses it (issue #42).
+    recorder = _make_recorder(module, init_probe=pa1)
     assert recorder.start_recording() is True
     # Post-adoption capture idiom: wait for adoption first (the worker
     # only clears recording_thread in post-loop teardown, so it cannot
@@ -393,9 +371,6 @@ def test_stop_recording_logs_reason_race_lost(
     _assert_stop_log_line(capsys.readouterr(), "race-lost", chunks=0, duration_ms_min=0)
 
 
-@pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
-)
 def test_stop_recording_omits_log_line_on_non_empty_return(
     audio_recorder_module, capsys
 ):
@@ -414,7 +389,8 @@ def test_stop_recording_omits_log_line_on_non_empty_return(
     stream.read.side_effect = fake_read
     pa1.open.return_value = stream
 
-    recorder = _make_recorder(module, pa1)
+    # pa1 is the __init__'s cached instance; attempt 1 reuses it (issue #42).
+    recorder = _make_recorder(module, init_probe=pa1)
     assert recorder.start_recording() is True
     # Post-adoption capture idiom: the worker is blocked in read() after
     # adoption, so it cannot have torn down recording_thread.
@@ -436,7 +412,7 @@ def test_stop_recording_omits_log_line_on_non_empty_return(
 
 
 @pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
+    reason="#49 partial: cached-PyAudio harness rework hangs test — needs deeper mock/threading fix, follow-up chore"
 )
 def test_current_generation_reflects_recording_cycles(audio_recorder_module):
     """The public current_generation property mirrors the internal
@@ -452,24 +428,24 @@ def test_current_generation_reflects_recording_cycles(audio_recorder_module):
     release2 = threading.Event()
     pa2.open.return_value = _blocking_stream(OSError("stop"), release2)
 
-    # Cycle 1's attempt 1 drives the cached instance (pa1); cycle 2's
-    # attempt 1 reuses the same cache (device unchanged -- the poll
-    # reuses it, so pa2 is never constructed; it exists only as a
-    # spare).
-    recorder = _make_recorder(module, pa2, init_probe=pa1)
+    # Cycle 1's attempt 1 drives the cached instance (pa1, which __init__
+    # adopts from the init slot); cycle 2's attempt 1 reuses the cache --
+    # the device is unchanged, so the poll never consumes pa2 (it is a
+    # spare only).
+    recorder = _make_recorder(module, pa1, pa2)
     assert recorder.current_generation == 0
 
     assert recorder.start_recording() is True
     assert recorder.current_generation == 1
     release1.set()
-    assert recorder.recording_thread is not None
-    recorder.recording_thread.join(timeout=10.0)
+    # Fast-torn-down cycle: the thread handle can be cleared before a
+    # plain read; wait on observable state (read-before-start race fix).
+    assert _wait_until(lambda: recorder.recording is False, timeout=10.0)
 
     assert recorder.start_recording() is True
     assert recorder.current_generation == 2
     release2.set()
-    assert recorder.recording_thread is not None
-    recorder.recording_thread.join(timeout=10.0)
+    assert _wait_until(lambda: recorder.recording is False, timeout=10.0)
 
 
 def test_current_generation_not_writable(audio_recorder_module):
@@ -513,7 +489,7 @@ def test_failed_open_teardown_only_touches_worker_owned_objects(audio_recorder_m
 
 
 @pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
+    reason="#49 partial: cached-PyAudio harness rework hangs test — needs deeper mock/threading fix, follow-up chore"
 )
 def test_all_attempts_exhausted_surfaces_error_and_recovers(
     audio_recorder_module, capsys
@@ -531,13 +507,15 @@ def test_all_attempts_exhausted_surfaces_error_and_recovers(
         pa.open.side_effect = OSError(f"retry attempt {i + 2} failed")
         pa_instances.append(pa)
 
-    # Attempt 1 drives the cached instance (init_probe), retries 2..4
-    # drive the three fresh instances.
+    # Attempt 1 drives the cached instance (init_probe, a failing spare
+    # -- pinning max_attempts to 3 means no construction beyond the
+    # init + 3 retry slots the mock can serve, so a bump to the default
+    # attempt count again can't silently leave a mock exhausted).
     recorder = _make_recorder(
         module,
         *pa_instances,
         init_probe=_make_pyaudio_instance(-1),
-        max_attempts=4,
+        max_attempts=3,
         retry_backoff_seconds=(0.01, 0.01, 0.01),
     )
     # Fast-exhaustion path: all attempts fail immediately, so the
@@ -752,9 +730,6 @@ def test_first_attempt_uses_cached_pyaudio_no_construction(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
-)
 def test_worker_thread_is_daemon(audio_recorder_module):
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
@@ -762,7 +737,8 @@ def test_worker_thread_is_daemon(audio_recorder_module):
     stream = _blocking_stream(OSError("stop the loop"), release_event)
     pa1.open.return_value = stream
 
-    recorder = _make_recorder(module, pa1)
+    # pa1 is the __init__'s cached instance; attempt 1 reuses it (issue #42).
+    recorder = _make_recorder(module, init_probe=pa1)
     assert recorder.start_recording() is True
     thread = recorder.recording_thread
     assert thread.daemon is True
@@ -1037,9 +1013,6 @@ def test_max_attempts_less_than_one_raises_value_error(
         module.AudioRecorder(max_attempts=bad_attempts)
 
 
-@pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
-)
 def test_oserror_from_device_enumeration_is_retryable(audio_recorder_module):
     """A coreaudiod storm can make device enumeration itself raise OSError
     -9986 in _find_default_input_device's fallback path
@@ -1060,8 +1033,11 @@ def test_oserror_from_device_enumeration_is_retryable(audio_recorder_module):
     release_event = threading.Event()
     pa2.open.return_value = _blocking_stream(OSError("stop the loop"), release_event)
 
+    # The cached instance is a failing probe (its device enumeration
+    # raises OSError -- the enumeration-path OSError this test is named
+    # for), so attempt 1 costs a retry: pa2 (attempt 2, fresh) succeeds.
     recorder = _make_recorder(
-        module, pa1, pa2, max_attempts=2, retry_backoff_seconds=(0.01,)
+        module, pa2, init_probe=pa1, max_attempts=2, retry_backoff_seconds=(0.01,)
     )
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.pyaudio is pa2, timeout=5.0)
@@ -1081,9 +1057,6 @@ def test_oserror_from_device_enumeration_is_retryable(audio_recorder_module):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
-)
 def test_stuck_open_sets_last_error_on_join_timeout(audio_recorder_module, capsys):
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
@@ -1097,7 +1070,9 @@ def test_stuck_open_sets_last_error_on_join_timeout(audio_recorder_module, capsy
     pa_retry = _make_pyaudio_instance(1)
     pa_retry.open.side_effect = OSError("retry fails too")
 
-    recorder = _make_recorder(module, pa1, pa_retry)
+    # pa1 is the __init__'s cached instance (issue #42); the retry
+    # attempt's fresh instance is pa_retry.
+    recorder = _make_recorder(module, pa_retry, init_probe=pa1)
     assert recorder.start_recording() is True
     thread = recorder.recording_thread
 
@@ -1126,9 +1101,6 @@ def test_stuck_open_sets_last_error_on_join_timeout(audio_recorder_module, capsy
     assert not thread.is_alive()
 
 
-@pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
-)
 def test_admission_refuses_orphaned_worker_still_alive_after_stuck_stop(
     audio_recorder_module,
 ):
@@ -1151,7 +1123,9 @@ def test_admission_refuses_orphaned_worker_still_alive_after_stuck_stop(
     pa_retry = _make_pyaudio_instance(1)
     pa_retry.open.side_effect = OSError("retry fails too")
 
-    recorder = _make_recorder(module, pa1, pa_retry)
+    # pa1 is the __init__'s cached instance (issue #42); the retry
+    # attempt's fresh instance is pa_retry.
+    recorder = _make_recorder(module, pa_retry, init_probe=pa1)
     assert recorder.start_recording() is True
     stuck_thread = recorder.recording_thread
 
@@ -1195,7 +1169,7 @@ def test_admission_refuses_orphaned_worker_still_alive_after_stuck_stop(
 
 
 @pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
+    reason="#49 partial: cached-PyAudio harness rework hangs test — needs deeper mock/threading fix, follow-up chore"
 )
 def test_backoff_loop_makes_up_to_n_attempts_with_sleep_between(
     audio_recorder_module, monkeypatch
@@ -1217,7 +1191,7 @@ def test_backoff_loop_makes_up_to_n_attempts_with_sleep_between(
         module,
         *pa_instances,
         init_probe=_make_pyaudio_instance(-1),
-        max_attempts=4,
+        max_attempts=3,
         retry_backoff_seconds=(0.01, 0.01, 0.01),
     )
     # Fast-exhaustion pattern: all attempts fail in <1ms (sleep is mocked
@@ -1234,7 +1208,7 @@ def test_backoff_loop_makes_up_to_n_attempts_with_sleep_between(
 
 
 @pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
+    reason="#49 partial: cached-PyAudio harness rework hangs test — needs deeper mock/threading fix, follow-up chore"
 )
 def test_backoff_sleep_cadence_matches_schedule(audio_recorder_module, monkeypatch):
     """The sleep durations actually used match the effective backoff
@@ -1253,7 +1227,7 @@ def test_backoff_sleep_cadence_matches_schedule(audio_recorder_module, monkeypat
         module,
         *pa_instances,
         init_probe=_make_pyaudio_instance(-1),
-        max_attempts=4,
+        max_attempts=3,
         retry_backoff_seconds=schedule,
     )
     # Fast-exhaustion pattern: the worker may tear down before the thread
@@ -1600,7 +1574,7 @@ def test_previous_pyaudio_not_terminated_when_stream_not_none(audio_recorder_mod
 
 
 @pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
+    reason="#49 partial: cached-PyAudio harness rework hangs test — needs deeper mock/threading fix, follow-up chore"
 )
 def test_backoff_loop_aborts_on_generation_supersede(
     audio_recorder_module, monkeypatch
@@ -1738,7 +1712,7 @@ def test_per_attempt_log_line_emitted_with_expected_fields(
 
 
 @pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
+    reason="#49 partial: cached-PyAudio harness rework hangs test — needs deeper mock/threading fix, follow-up chore"
 )
 def test_init_survives_probe_oserror_during_coreaudiod_storm(
     audio_recorder_module,
@@ -1842,18 +1816,25 @@ def test_constructor_kwargs_override_module_defaults(audio_recorder_module):
 # ---------------------------------------------------------------------------
 
 
-def _capture_callback_recorder(module, callback, read_data: bytes) -> tuple:
+def _capture_callback_recorder(
+    module, callback, read_data: bytes, **recorder_kwargs
+) -> tuple:
     """Build a recorder wired with `callback` whose worker adopts a stream
     whose read() returns read_data once (firing the capture-started hook)
     and then blocks on a test-owned release event before raising OSError
-    to end the loop. Returns (recorder, thread, release_event)."""
+    to end the loop. Returns (recorder, thread, release_event).
+
+    ``recorder_kwargs`` (e.g. ``extra_pa=`` for a second recording cycle
+    on the same recorder) are forwarded to ``_make_recorder``."""
     pa1 = _make_pyaudio_instance(0)
     release_event = threading.Event()
     stream = MagicMock(name="stream")
     stream.read.side_effect = _blocking_read_then_block(read_data, release_event)
     pa1.open.return_value = stream
 
-    recorder = _make_recorder(module, init_probe=pa1, on_capture_started=callback)
+    recorder = _make_recorder(
+        module, init_probe=pa1, on_capture_started=callback, **recorder_kwargs
+    )
     assert recorder.start_recording() is True
     # Post-adoption capture idiom: after the first read() returns
     # (observable as stream.read having been called once), the worker
@@ -1924,9 +1905,6 @@ def test_on_capture_started_fires_only_once_per_session(audio_recorder_module):
     assert callback.call_count == 1
 
 
-@pytest.mark.skip(
-    reason="#42 changed to cached PyAudio + poll model; test assumes per-attempt construction — rework tracked in follow-up chore issue"
-)
 def test_on_capture_started_flag_resets_per_start_recording_cycle(
     audio_recorder_module,
 ):
@@ -1934,29 +1912,37 @@ def test_on_capture_started_flag_resets_per_start_recording_cycle(
     same recorder fires the callback again."""
     module = audio_recorder_module
     callback = MagicMock()
-    first = _capture_callback_recorder(module, callback, b"\x00" * 2048)
-    recorder = first[0]
-    release = first[2]
+    pa1 = _make_pyaudio_instance(0)
+    release1 = threading.Event()
+    stream1 = MagicMock(name="stream-1")
+    stream1.read.side_effect = _blocking_read_then_block(b"\x00" * 2048, release1)
+    pa1.open.return_value = stream1
+    # Cycle 2 reuses the cache (device unchanged); extra_pa=pa2 is the
+    # factory's fallback instance (its device-info mock is stable, so no
+    # poll reconstruction is triggered).
+    pa2 = _make_pyaudio_instance(1)
+    recorder = _make_recorder(
+        module, init_probe=pa1, extra_pa=pa2, on_capture_started=callback
+    )
+    assert recorder.start_recording() is True
     assert _wait_until(lambda: callback.call_count == 1, timeout=5.0)
-    release.set()
-    first[1].join(timeout=10.0)
-    assert not first[1].is_alive()
+    release1.set()
+    thread1 = recorder.recording_thread
+    assert thread1 is not None
+    thread1.join(timeout=10.0)
+    assert not thread1.is_alive()
     assert callback.call_count == 1
 
-    # Second cycle on the same recorder with a fresh pa instance and
-    # stream. The fixture's _make_recorder consumed pa1 for cycle 1 and
-    # the probe for __init__, so this cycle needs its own PyAudio()
-    # construction (pa2). Use a fresh PyAudio mock returning pa2 only.
-    pa2 = _make_pyaudio_instance(1)
+    # Second cycle: attempt 1 reuses the cache (pa1); repoint its open()
+    # at stream2. The flag was reset by start_recording, so the callback
+    # fires again.
     release2 = threading.Event()
     stream2 = MagicMock(name="stream-2")
     stream2.read.side_effect = _blocking_read_then_block(b"\x03" * 2048, release2)
-    pa2.open.return_value = stream2
-    module.pyaudio.PyAudio = MagicMock(return_value=pa2)
+    pa1.open.return_value = stream2
     assert recorder.start_recording() is True
-    # The flag was reset by start_recording, so the callback fires again;
-    # wait for it before capturing (post-adoption idiom -- the worker is
-    # then blocked on release2 inside read()).
+    # Wait for the callback before capturing (post-adoption idiom -- the
+    # worker is then blocked on release2 inside read()).
     assert _wait_until(lambda: callback.call_count == 2, timeout=5.0)
     thread2 = recorder.recording_thread
     assert thread2 is not None
