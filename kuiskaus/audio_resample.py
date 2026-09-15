@@ -33,11 +33,16 @@ def resample_to_target(audio: np.ndarray, capture_rate: int | None) -> np.ndarra
     target_len = max(1, int(audio.size * TARGET_RATE / capture_rate))
     if target_len == audio.size:
         return audio
-    x_old = np.linspace(0.0, 1.0, num=audio.size, endpoint=False)
-    x_new = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
-    # np.interp allocates three float64 temporaries (the two linspace
-    # arrays and its output); at a 1024-frame chunk this is negligible
-    # versus the int16->float32 conversion, and no cheaper path exists
-    # without a second dependency, so this is accepted as-is (issue #55
-    # performance note).
-    return np.interp(x_new, x_old, audio).astype(np.float32)
+    # Index-based linear interpolation: this runs ONCE on the fully
+    # assembled buffer in stop_recording() (not per-chunk), so the
+    # allocation cost scales with the whole recording (a 60 s capture at
+    # 48 kHz native is ~2.88M samples). Interpolating via integer indices
+    # into the source allocates O(target_len) working space instead of
+    # np.interp's O(audio.size) linspace + O(target_len) float64
+    # temporaries (issue #55 lens review MEDIUM, performance).
+    idx = np.arange(target_len, dtype=np.float64) * (audio.size / target_len)
+    lo = np.clip(idx.astype(np.intp), 0, audio.size - 1)
+    hi = np.clip(lo + 1, 0, audio.size - 1)
+    frac = (idx - lo).astype(np.float32)
+    result = audio[lo] * (1.0 - frac) + audio[hi] * frac
+    return result.astype(np.float32)

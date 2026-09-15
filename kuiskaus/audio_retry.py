@@ -74,10 +74,14 @@ def attempt_open_once(
     and its cached device index, skipping re-resolution) and open the
     stream at the device's native sample rate (issue #55).
 
-    The native rate is queried from ``pa.get_default_input_device_info()[
-    "defaultSampleRate"]`` after device resolution. If the query fails
-    or the value is missing/invalid, the provided ``sample_rate``
-    (16000) is used as the fallback.
+    The native rate is queried from ``pa.get_device_info_by_index(
+    device_index)["defaultSampleRate"]`` -- the EXACT device the stream
+    opens against, never the default-device info, so a device change
+    between the device-index resolution and the rate query cannot make
+    the open() and the rate refer to different devices (TOCTOU, issue
+    #55 lens review MEDIUM, security). If the query fails or the value
+    is missing, non-positive, or outside the sanity bounds 4000..192000
+    Hz, the provided ``sample_rate`` (16000) is used as the fallback.
 
     Returns (pa, stream, None, capture_rate) on success where
     ``capture_rate`` is the int rate actually passed to ``pa.open()``.
@@ -165,18 +169,44 @@ def attempt_open_once(
     # key is missing, zero, or the call raises (coreaudiod storm).
     effective_rate = sample_rate
     try:
-        default_device_info = pa.get_default_input_device_info()
-        default_sample_rate = default_device_info["defaultSampleRate"]
-        if default_sample_rate is not None and default_sample_rate > 0:
-            effective_rate = int(default_sample_rate)
+        # Query the device actually being opened (the resolved
+        # device_index), not the default input device: the default can
+        # move between the index resolution and this query (e.g. AirPods
+        # disconnect mid-open), which would otherwise record a rate for
+        # a different device than the one opened (issue #55 lens review
+        # MEDIUM, security).
+        device_info = pa.get_device_info_by_index(device_index)
+        default_sample_rate = device_info["defaultSampleRate"]
     except (OSError, KeyError, TypeError, ValueError, OverflowError) as query_error:
-        # Missing key, None/zero/negative value, or the query itself
-        # raised (coreaudiod storm) or the value is non-numeric. All
-        # fall back to the provided ``sample_rate`` (16000); the print
-        # is the observability for why a device opened at the fallback.
+        # Missing key, or the query itself raised (coreaudiod storm), or
+        # the value is non-numeric. Fall back to the provided
+        # ``sample_rate`` (16000); the print is the observability for
+        # why a device opened at the fallback.
         print(
             f"Native rate query failed ({query_error!r}); falling back to {sample_rate}"
         )
+    else:
+        if default_sample_rate is None or default_sample_rate <= 0:
+            # A device that reports a present-but-corrupted (zero/negative)
+            # native rate is precisely the failure mode this ticket
+            # addresses; log it so an operator debugging a persistent
+            # -9986 storm can tell "opened at 16000 fallback because the
+            # device reported an invalid rate" from "opened at native".
+            print(
+                f"Native rate {default_sample_rate!r} invalid (<=0); "
+                f"falling back to {sample_rate}"
+            )
+        elif not (4000 <= default_sample_rate <= 192000):
+            # Sanity bound (generous superset of any real input device's
+            # native rate): a wildly out-of-range value is a corrupted
+            # device report, not a real rate -- fall back and say so.
+            print(
+                f"Native rate {default_sample_rate!r} out of bounds "
+                "(4000..192000); falling back to "
+                f"{sample_rate}"
+            )
+        else:
+            effective_rate = int(default_sample_rate)
 
     try:
         stream = pa.open(

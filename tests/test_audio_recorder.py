@@ -137,6 +137,11 @@ def _make_pyaudio_instance(
         device_info["defaultSampleRate"] = rate
     instance = MagicMock(name=f"PyAudioInstance-{index}")
     instance.get_default_input_device_info.return_value = device_info
+    # Issue #55 lens review MEDIUM (security): the open-time native-rate
+    # query now targets the resolved device via get_device_info_by_index
+    # (the default-device info is only used to resolve the index), so the
+    # fixture mirrors the rate on that path too.
+    instance.get_device_info_by_index.return_value = device_info
     return instance
 
 
@@ -2271,26 +2276,16 @@ def test_open_stream_falls_back_to_16000_when_rate_query_raises(
     native-rate query (coreaudiod storm), the stream opens at the fallback
     rate of 16000 and the fallback is printed -- never a silent skip.
 
-    The mock is constructed to return a valid device dict on the first call
-    (the __init__ device-index probe) and raise OSError on the second
-    (the open-time rate query) -- a per-attempt OSError is what the
-    edge-case spec describes for a coreaudiod storm mid-recording."""
+    The mock's open-time rate query (get_device_info_by_index -- the
+    exact device being opened, issue #55 lens review MEDIUM security)
+    raises OSError -- a per-attempt OSError is what the edge-case spec
+    describes for a coreaudiod storm mid-recording."""
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
-    # __init__'s device-index probe and the open path both need to read
-    # a dict; the rate query is the only call we want to raise. Since
-    # the mock is shared, the side_effect applies to every call -- use
-    # a function that returns a dict on the first two calls and raises
-    # on the third (the rate query in the open path).
-    call_count = {"n": 0}
-
-    def _device_info_side_effect():
-        call_count["n"] += 1
-        if call_count["n"] <= 2:
-            return {"index": 0}
-        raise OSError("-9986")
-
-    pa1.get_default_input_device_info.side_effect = _device_info_side_effect
+    # The device-index resolution (get_default_input_device_info) still
+    # works; only the open-time rate query against the resolved device
+    # (get_device_info_by_index) raises OSError -- a coreaudiod storm.
+    pa1.get_device_info_by_index.side_effect = OSError("-9986")
     release_event = threading.Event()
     stream = _blocking_stream(OSError("stop the loop"), release_event)
     pa1.open.return_value = stream
@@ -2312,10 +2307,10 @@ def test_open_stream_falls_back_to_16000_when_rate_query_raises(
 
 def test_open_stream_falls_back_to_16000_when_rate_is_nonfinite(audio_recorder_module):
     """Issue #55: a defaultSampleRate of float('inf') (a driver-reported
-    sentinel) must be treated as unusable (int(float('inf')) raises
-    OverflowError) and fall back to 16000 without killing the worker.
-    Same guard path as float('nan') (nan > 0 is False, the > 0 check
-    already rejects it)."""
+    sentinel) must be treated as unusable -- the sanity bounds check
+    (4000..192000) rejects any non-finite value (float('inf') fails the
+    upper bound, float('nan') fails both) -- and fall back to 16000
+    without killing the worker."""
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0, float("inf"))
     release_event = threading.Event()
