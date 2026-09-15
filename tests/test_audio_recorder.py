@@ -1955,25 +1955,41 @@ def test_on_capture_started_flag_resets_per_start_recording_cycle(
 
 def test_on_capture_started_not_called_on_empty_capture(audio_recorder_module):
     """Release-before-first-read (the race-lost case, issue #40's
-    newly-surfaced outcome): the worker breaks out of the loop before any
-    stream.read() succeeds, so the callback must never fire."""
+    newly-surfaced outcome): stop_recording() may land before the worker's
+    first stream.read() returns (or even before it is called), so the
+    queue is empty and the callback must never fire.
+
+    The stream.read mock blocks on a test-owned event (via _blocking_stream)
+    rather than returning an unconfigured MagicMock default, so the test is
+    deterministic regardless of which side of the race wins: if the worker
+    breaks before read() (the intended race-lost path), or if it enters
+    read() and blocks there, no MagicMock ever enters audio_queue and
+    b"".join() in stop_recording() never sees a non-bytes item."""
     module = audio_recorder_module
     callback = MagicMock()
     pa1 = _make_pyaudio_instance(0)
-    stream = MagicMock(name="never-read-stream")
-
-    # The while loop rechecks self.recording under lock before each read;
-    # if the test clears it before the first read, the worker breaks
-    # without ever calling stream.read().
-    pa1.open.return_value = stream
+    release_event = threading.Event()
+    pa1.open.return_value = _blocking_stream(OSError("stop the loop"), release_event)
 
     recorder = _make_recorder(module, init_probe=pa1, on_capture_started=callback)
     assert recorder.start_recording() is True
-    # stop_recording() clears self.recording under lock and joins.
-    recorder.stop_recording()
+    # stop_recording() clears self.recording under lock and joins the
+    # worker; if the worker is still blocked in read() the join times out
+    # (stuck-open path), which is fine -- the queue is still empty.
+    result = recorder.stop_recording()
+
+    # Unblock any worker that entered read() before the gate check, then
+    # let it finish its teardown. If the worker broke out before read()
+    # (the intended race-lost case) it has already exited and recording_thread
+    # is None; in that case this is a no-op.
+    release_event.set()
+    thread = recorder.recording_thread
+    if thread is not None:
+        thread.join(timeout=10.0)
+        assert not thread.is_alive()
 
     assert not recorder.recording
-    stream.read.assert_not_called()
+    assert result.size == 0
     assert callback.call_count == 0
 
 
