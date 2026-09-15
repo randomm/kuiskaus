@@ -4,8 +4,8 @@
 The recorder opens the stream at the device's native rate (issue #55)
 to avoid PortAudio sample-rate renegotiation on macOS 26 Tahoe; this
 module restores the 16 kHz mono float32 contract every downstream
-transcriber (parakeet/whisper/voxtral) depends on, using numpy.interp
-linear interpolation only.
+transcriber (parakeet/whisper/voxtral) depends on, using index-based
+linear interpolation (no scipy/librosa dependency).
 """
 
 import numpy as np
@@ -30,6 +30,8 @@ def resample_to_target(audio: np.ndarray, capture_rate: int | None) -> np.ndarra
         return audio
     if capture_rate is None or capture_rate == TARGET_RATE:
         return audio
+    if capture_rate <= 0:
+        raise ValueError(f"capture_rate must be positive, got {capture_rate}")
     target_len = max(1, int(audio.size * TARGET_RATE / capture_rate))
     if target_len == audio.size:
         return audio

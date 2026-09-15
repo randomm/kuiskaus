@@ -75,36 +75,17 @@ def attempt_open_once(
     stream at the device's native sample rate (issue #55).
 
     The native rate is queried from ``pa.get_device_info_by_index(
-    device_index)["defaultSampleRate"]`` -- the EXACT device the stream
-    opens against, never the default-device info, so a device change
-    between the device-index resolution and the rate query cannot make
-    the open() and the rate refer to different devices (TOCTOU, issue
-    #55 lens review MEDIUM, security). If the query fails or the value
-    is missing, non-positive, or outside the sanity bounds 4000..192000
-    Hz, the provided ``sample_rate`` (16000) is used as the fallback.
+    device_index)["defaultSampleRate"]``. If the query fails or the
+    value is missing/invalid, the provided ``sample_rate`` (16000)
+    is used as the fallback.
 
     Returns (pa, stream, None, capture_rate) on success where
     ``capture_rate`` is the int rate actually passed to ``pa.open()``.
-    Returns (None, None, error, None) on any failure.
-
-    The 4-tuple (widened from 3-tuple in issue #55) exists so the
-    successful rate reaches the recorder without a second query:
-    the only caller is AudioRecorder._open_stream_with_retry, which
-    adopts ``capture_rate`` under _lock (issue #55's _capture_rate
-    field) so stop_recording() can resample the assembled buffer
-    back to TARGET_RATE. Keeping it on the tuple keeps the open-and-
-    record rate atomic (same value passed to pa.open() as the one
-    recorded for resampling) without a shared mutable state that the
-    call site would have to write separately. With a constructed
+    Returns (None, None, error, None) on any failure. With a constructed
     (fresh) instance, the failed PyAudio is terminated internally and
-    NOT returned in the tuple -- it owns no stream and was never adopted
-    into self.pyaudio, so direct termination is always safe (issue #37
-    task-c) and pa is only ever returned alongside its stream, which
-    makes the "don't use a failed attempt's pa" contract structural
-    rather than documented. With ``existing_pa`` provided, the
+    NOT returned in the tuple; with ``existing_pa`` provided, the
     provided instance is NEVER terminated on failure: it is the
-    recorder's cached self.pyaudio, which the call site owns and may
-    keep using for subsequent attempts or recordings.
+    recorder's cached self.pyaudio, which the call site owns.
 
     Transient failures (PyAudio() construction failure, OSError from
     device enumeration or open()) are returned as the error so the
@@ -173,17 +154,20 @@ def attempt_open_once(
         # device_index), not the default input device: the default can
         # move between the index resolution and this query (e.g. AirPods
         # disconnect mid-open), which would otherwise record a rate for
-        # a different device than the one opened (issue #55 lens review
-        # MEDIUM, security).
+        # a different device than the one opened (TOCTOU, issue #55
+        # lens review MEDIUM, security).
         device_info = pa.get_device_info_by_index(device_index)
         default_sample_rate = device_info["defaultSampleRate"]
     except (OSError, KeyError, TypeError, ValueError, OverflowError) as query_error:
         # Missing key, or the query itself raised (coreaudiod storm), or
         # the value is non-numeric. Fall back to the provided
         # ``sample_rate`` (16000); the print is the observability for
-        # why a device opened at the fallback.
+        # why a device opened at the fallback. The message is bounded
+        # -- a pathological CoreAudio property value must not dump an
+        # unbounded (possibly binary) repr into stderr.
         print(
-            f"Native rate query failed ({query_error!r}); falling back to {sample_rate}"
+            f"Native rate query failed ({str(query_error)[:120]!r}); "
+            f"falling back to {sample_rate}"
         )
     else:
         if default_sample_rate is None or default_sample_rate <= 0:
@@ -225,6 +209,10 @@ def attempt_open_once(
             terminate_quietly(pa)
         return None, None, open_error, None
 
+    # 4-tuple (widened from 3-tuple in issue #55): the successful rate
+    # rides the return so the single caller adopts the exact value
+    # passed to pa.open() under _lock for stop_recording() resampling,
+    # keeping open-and-record rate atomic without shared mutable state.
     return pa, stream, None, effective_rate
 
 

@@ -2438,6 +2438,18 @@ def test_resample_helper_none_rate_is_noop(audio_recorder_module):
     assert np.array_equal(result, audio)
 
 
+def test_resample_helper_non_positive_rate_raises(audio_recorder_module):
+    """Issue #55: non-positive capture rates raise ValueError (0 would
+    divide by zero, negatives would corrupt the output silently)."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    audio = np.linspace(-1.0, 1.0, 100, dtype=np.float32)
+    with pytest.raises(ValueError, match="capture_rate must be positive"):
+        resample_to_target(audio, 0)
+    with pytest.raises(ValueError, match="capture_rate must be positive"):
+        resample_to_target(audio, -1)
+
+
 def test_resample_helper_44100_non_trivial_ratio(audio_recorder_module):
     """Issue #55: 44100 -> 16000 is a non-trivial ratio; the length must
     follow int(N * 16000 / 44100)."""
