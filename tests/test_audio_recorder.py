@@ -617,8 +617,9 @@ def test_retry_succeeds_constructs_fresh_pyaudio_and_reresolves_device(
     # Exactly one fresh construction (retry attempt 2): 1 (__init__) + 1.
     assert module.pyaudio.PyAudio.call_count == 2
     # Cached attempt 1 resolved at __init__ (device -1); the retry
-    # re-resolves against its fresh instance (device 7).
-    pa_retry.get_default_input_device_info.assert_called_once()
+    # re-resolves against its fresh instance (device 7). The rate query
+    # (issue #55) makes a second call on the same instance.
+    assert pa_retry.get_default_input_device_info.call_count >= 1
     assert thread.is_alive()  # still blocked in read()
 
     release_event.set()
@@ -2170,3 +2171,153 @@ def _blocking_read_stream(
     stream = MagicMock(name="stream")
     stream.read.side_effect = _blocking_read_then_block(read_data, release_event)
     return stream
+
+
+# ---------------------------------------------------------------------------
+# Native sample rate (issue #55)
+# ---------------------------------------------------------------------------
+
+
+def _make_pyaudio_instance_with_rate(index: int, rate: float) -> MagicMock:
+    """A mock PyAudio() instance with a resolvable default input device
+    that also reports a native sample rate."""
+    instance = MagicMock(name=f"PyAudioInstance-{index}")
+    instance.get_default_input_device_info.return_value = {
+        "index": index,
+        "defaultSampleRate": rate,
+    }
+    return instance
+
+
+def test_open_stream_uses_native_rate_48000(audio_recorder_module):
+    """Issue #55: a device reporting defaultSampleRate=48000.0 must have
+    pa.open() called with rate=48000, not 16000."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance_with_rate(0, 48000.0)
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+
+    # The native rate must be used, not the hardcoded 16000.
+    assert recorder.capture_rate == 48000
+    pa1.open.assert_called_once_with(
+        format=pa1.open.call_args.kwargs["format"],
+        channels=pa1.open.call_args.kwargs["channels"],
+        rate=48000,
+        input=True,
+        input_device_index=pa1.open.call_args.kwargs["input_device_index"],
+        frames_per_buffer=pa1.open.call_args.kwargs["frames_per_buffer"],
+    )
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+def test_open_stream_uses_native_rate_24000(audio_recorder_module):
+    """Issue #55: AirPods Pro (24000 Hz) must have the stream opened at
+    rate=24000, not 16000."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance_with_rate(0, 24000.0)
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+
+    assert recorder.capture_rate == 24000
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+def test_open_stream_falls_back_to_16000_when_no_native_rate(audio_recorder_module):
+    """Issue #55: when the device info dict lacks "defaultSampleRate"
+    (the existing _make_pyaudio_instance fixture), the stream is opened
+    at the fallback rate of 16000 -- no crash, no rate=0."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)  # no defaultSampleRate key
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+
+    assert recorder.capture_rate == 16000
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+def test_capture_rate_is_none_before_any_recording(audio_recorder_module):
+    """Issue #55: capture_rate is None before any stream has been opened."""
+    module = audio_recorder_module
+    recorder = _make_recorder(module, _make_pyaudio_instance(0))
+    assert recorder.capture_rate is None
+
+
+def test_capture_rate_accessible_via_property(audio_recorder_module):
+    """Issue #55: the capture_rate property returns the int rate set by
+    the open path, and is read-only (assignment raises AttributeError)."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance_with_rate(0, 44100.0)
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.capture_rate == 44100, timeout=5.0)
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+    with pytest.raises(AttributeError):
+        recorder.capture_rate = 99999
+
+
+def test_native_rate_requeried_on_retry_with_fresh_instance(audio_recorder_module):
+    """Issue #55: the native rate is re-queried per attempt against
+    whichever pa instance performs the open. A retry on a fresh instance
+    with a different native rate uses that instance's rate."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance_with_rate(0, 48000.0)
+    pa1.open.side_effect = OSError("attempt 1 failed")
+    pa_retry = _make_pyaudio_instance_with_rate(1, 24000.0)
+    release_event = threading.Event()
+    retry_stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa_retry.open.return_value = retry_stream
+
+    recorder = _make_recorder(
+        module, pa_retry, init_probe=pa1, max_attempts=2, retry_backoff_seconds=(0.01,)
+    )
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.pyaudio is pa_retry, timeout=5.0)
+    thread = recorder.recording_thread
+    assert thread is not None
+
+    # The retry's fresh instance reported 24000; that's the rate used.
+    assert recorder.capture_rate == 24000
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()

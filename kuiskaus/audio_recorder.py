@@ -39,8 +39,7 @@ class AudioRecorder:
         on_capture_started: Callable[[], None] | None = None,
     ):
         # Defensive state first, before validation can raise: __del__
-        # -> cleanup() can run on a partially-constructed instance without
-        # a hasattr guard (issue #37 lens review MEDIUM #5).
+        # -> cleanup() can run on a partially-constructed instance.
         self.pyaudio: pyaudio.PyAudio | None = None
         self.stream: pyaudio.Stream | None = None
         self.recording = False
@@ -58,6 +57,7 @@ class AudioRecorder:
         self.chunk_size = chunk_size
         self.channels = channels
         self.format = pyaudio.paInt16
+        self._capture_rate: int | None = None
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if max_attempts > 1 and not retry_backoff_seconds:
@@ -106,6 +106,11 @@ class AudioRecorder:
         mutation happens under _lock."""
         return self._generation
 
+    @property
+    def capture_rate(self) -> int | None:
+        """Native rate the stream was opened at (issue #55), or None."""
+        return self._capture_rate
+
     def _find_default_input_device(self, pa: "pyaudio.PyAudio") -> int:
         """Find the default system microphone for the given PyAudio instance."""
         try:
@@ -121,7 +126,7 @@ class AudioRecorder:
 
     @staticmethod
     def _close_stream_quietly(stream: "pyaudio.Stream") -> None:
-        """Best-effort stream teardown; a close failure must not propagate."""
+        """Best-effort stream teardown; close failures must not propagate."""
         try:
             stream.stop_stream()
             stream.close()
@@ -217,7 +222,7 @@ class AudioRecorder:
                 if self._check_superseded(my_gen, attempt, attempt_start):
                     return None
 
-            pa, stream, error = attempt_open_once(
+            pa, stream, error, capture_rate = attempt_open_once(
                 pyaudio,
                 self.format,
                 self.channels,
@@ -248,6 +253,7 @@ class AudioRecorder:
                 pa, stream, my_gen, attempt, attempt_start
             ):
                 return None
+            self._capture_rate = capture_rate
             log_retry_attempt(attempt, self.max_attempts, attempt_start, None, "adopt")
             return stream
 
@@ -491,5 +497,4 @@ class AudioRecorder:
             terminate_quietly(old_pyaudio)
 
     def __del__(self):
-        """Ensure cleanup on deletion"""
         self.cleanup()

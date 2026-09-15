@@ -34,20 +34,25 @@ def test_attempt_open_once_success_returns_pa_stream_and_no_error():
 
     pa_module, pa_ok = _fake_pa_module()
     pa_module.PyAudio = MagicMock(return_value=pa_ok)
+    pa_ok.get_default_input_device_info.return_value = {
+        "index": 7,
+        "defaultSampleRate": 48000.0,
+    }
     stream = MagicMock(name="stream")
     pa_ok.open.return_value = stream
 
-    pa, got_stream, error = attempt_open_once(
+    pa, got_stream, error, capture_rate = attempt_open_once(
         pa_module, 8, 1, 16000, 1024, _find_device, 4, 1, 0.0
     )
 
     assert error is None
     assert pa is pa_ok
     assert got_stream is stream
+    assert capture_rate == 48000
     pa_ok.open.assert_called_once_with(
         format=8,
         channels=1,
-        rate=16000,
+        rate=48000,
         input=True,
         input_device_index=7,
         frames_per_buffer=1024,
@@ -63,7 +68,7 @@ def test_attempt_open_once_construction_failure_returns_oserror_and_terminates_n
 
     pa_module = _fake_pa_module()[0]
 
-    pa, got_stream, error = attempt_open_once(
+    pa, got_stream, error, _rate = attempt_open_once(
         pa_module, 8, 1, 16000, 1024, _find_device, 4, 2, 0.0
     )
 
@@ -87,7 +92,7 @@ def test_attempt_open_once_with_existing_pa_reuses_it_and_skips_resolution():
     stream = MagicMock(name="stream")
     cached_pa.open.return_value = stream
 
-    pa, got_stream, error = attempt_open_once(
+    pa, got_stream, error, capture_rate = attempt_open_once(
         pa_module,
         8,
         1,
@@ -104,11 +109,12 @@ def test_attempt_open_once_with_existing_pa_reuses_it_and_skips_resolution():
     assert error is None
     assert pa is cached_pa
     assert got_stream is stream
+    assert capture_rate is not None
     pa_module.PyAudio.assert_not_called()
     cached_pa.open.assert_called_once_with(
         format=8,
         channels=1,
-        rate=16000,
+        rate=capture_rate,
         input=True,
         input_device_index=42,
         frames_per_buffer=1024,
@@ -127,7 +133,7 @@ def test_attempt_open_once_existing_pa_open_failure_does_not_terminate_cached():
     open_error = OSError("stale session")
     cached_pa.open.side_effect = open_error
 
-    pa, got_stream, error = attempt_open_once(
+    pa, got_stream, error, _rate = attempt_open_once(
         pa_module,
         8,
         1,
@@ -157,7 +163,7 @@ def test_attempt_open_once_existing_pa_runtime_error_does_not_terminate_cached()
     pa_module = MagicMock(name="pyaudio")
     cached_pa = MagicMock(name="cached-pa")
 
-    pa, got_stream, error = attempt_open_once(
+    pa, got_stream, error, _rate = attempt_open_once(
         pa_module,
         8,
         1,
@@ -186,7 +192,7 @@ def test_attempt_open_once_open_failure_terminates_the_failed_pa():
     open_error = OSError("device busy")
     pa_ok.open.side_effect = open_error
 
-    pa, got_stream, error = attempt_open_once(
+    pa, got_stream, error, _rate = attempt_open_once(
         pa_module, 8, 1, 16000, 1024, _find_device, 4, 2, 0.0
     )
 
@@ -194,3 +200,149 @@ def test_attempt_open_once_open_failure_terminates_the_failed_pa():
     assert got_stream is None
     assert error is open_error
     pa_ok.terminate.assert_called_once()
+
+
+def test_attempt_open_once_queries_native_rate_24000():
+    """Issue #55: a device reporting defaultSampleRate=24000.0
+    (AirPods Pro) must have the stream opened at rate=24000, not 16000."""
+    from kuiskaus.audio_retry import attempt_open_once
+
+    pa_module = MagicMock(name="pyaudio")
+    pa_ok = MagicMock(name="pa-ok")
+    pa_ok.get_default_input_device_info.return_value = {
+        "index": 7,
+        "defaultSampleRate": 24000.0,
+    }
+    stream = MagicMock(name="stream")
+    pa_ok.open.return_value = stream
+    pa_module.PyAudio = MagicMock(return_value=pa_ok)
+
+    _pa, _got_stream, error, capture_rate = attempt_open_once(
+        pa_module, 8, 1, 16000, 1024, _find_device, 4, 1, 0.0
+    )
+
+    assert error is None
+    assert capture_rate == 24000
+    pa_ok.open.assert_called_once_with(
+        format=8,
+        channels=1,
+        rate=24000,
+        input=True,
+        input_device_index=7,
+        frames_per_buffer=1024,
+    )
+
+
+def test_attempt_open_once_falls_back_to_sample_rate_when_no_defaultSampleRate():
+    """Issue #55: when get_default_input_device_info() returns a dict
+    without a "defaultSampleRate" key, the provided sample_rate (16000)
+    is used as the fallback -- no crash, no rate=0."""
+    from kuiskaus.audio_retry import attempt_open_once
+
+    pa_module = MagicMock(name="pyaudio")
+    pa_ok = MagicMock(name="pa-ok")
+    pa_ok.get_default_input_device_info.return_value = {"index": 7}
+    stream = MagicMock(name="stream")
+    pa_ok.open.return_value = stream
+    pa_module.PyAudio = MagicMock(return_value=pa_ok)
+
+    _pa, _got_stream, error, capture_rate = attempt_open_once(
+        pa_module, 8, 1, 16000, 1024, _find_device, 4, 1, 0.0
+    )
+
+    assert error is None
+    assert capture_rate == 16000
+    pa_ok.open.assert_called_once_with(
+        format=8,
+        channels=1,
+        rate=16000,
+        input=True,
+        input_device_index=7,
+        frames_per_buffer=1024,
+    )
+
+
+def test_attempt_open_once_falls_back_to_sample_rate_when_rate_is_zero():
+    """Issue #55: a device reporting defaultSampleRate=0.0 (some driver
+    combos) must fall back to the provided sample_rate, not open at
+    rate=0."""
+    from kuiskaus.audio_retry import attempt_open_once
+
+    pa_module = MagicMock(name="pyaudio")
+    pa_ok = MagicMock(name="pa-ok")
+    pa_ok.get_default_input_device_info.return_value = {
+        "index": 7,
+        "defaultSampleRate": 0.0,
+    }
+    stream = MagicMock(name="stream")
+    pa_ok.open.return_value = stream
+    pa_module.PyAudio = MagicMock(return_value=pa_ok)
+
+    _pa, _got_stream, error, capture_rate = attempt_open_once(
+        pa_module, 8, 1, 16000, 1024, _find_device, 4, 1, 0.0
+    )
+
+    assert error is None
+    assert capture_rate == 16000
+
+
+def test_attempt_open_once_falls_back_to_sample_rate_on_oserror():
+    """Issue #55: a coreaudiod storm making
+    get_default_input_device_info() raise OSError must fall back to the
+    provided sample_rate, not propagate the OSError."""
+    from kuiskaus.audio_retry import attempt_open_once
+
+    pa_module = MagicMock(name="pyaudio")
+    pa_ok = MagicMock(name="pa-ok")
+    pa_ok.get_default_input_device_info.side_effect = OSError("coreaudiod storm")
+    stream = MagicMock(name="stream")
+    pa_ok.open.return_value = stream
+    pa_module.PyAudio = MagicMock(return_value=pa_ok)
+
+    _pa, _got_stream, error, capture_rate = attempt_open_once(
+        pa_module, 8, 1, 16000, 1024, _find_device, 4, 1, 0.0
+    )
+
+    assert error is None
+    assert capture_rate == 16000
+
+
+def test_attempt_open_once_native_rate_with_existing_pa():
+    """Issue #55: the cached-instance path (existing_pa) also queries
+    the native rate from the cached pa instance."""
+    from kuiskaus.audio_retry import attempt_open_once
+
+    pa_module = MagicMock(name="pyaudio")
+    cached_pa = MagicMock(name="cached-pa")
+    cached_pa.get_default_input_device_info.return_value = {
+        "index": 42,
+        "defaultSampleRate": 48000.0,
+    }
+    stream = MagicMock(name="stream")
+    cached_pa.open.return_value = stream
+
+    pa, _got_stream, error, capture_rate = attempt_open_once(
+        pa_module,
+        8,
+        1,
+        16000,
+        1024,
+        _find_device,
+        4,
+        1,
+        0.0,
+        existing_pa=cached_pa,
+        existing_device_index=42,
+    )
+
+    assert error is None
+    assert pa is cached_pa
+    assert capture_rate == 48000
+    cached_pa.open.assert_called_once_with(
+        format=8,
+        channels=1,
+        rate=48000,
+        input=True,
+        input_device_index=42,
+        frames_per_buffer=1024,
+    )

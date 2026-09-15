@@ -66,17 +66,25 @@ def attempt_open_once(
     attempt_start: float,
     existing_pa: "pyaudio.PyAudio | None" = None,
     existing_device_index: int | None = None,
-) -> tuple["pyaudio.PyAudio | None", "pyaudio.Stream | None", "Exception | None"]:
+) -> tuple[
+    "pyaudio.PyAudio | None", "pyaudio.Stream | None", "Exception | None", int | None
+]:
     """One attempt: construct a fresh PyAudio() (or reuse ``existing_pa``
     when provided -- issue #42's attempt 1 reuses the cached instance
     and its cached device index, skipping re-resolution) and open the
-    stream against the re-resolved default input device.
+    stream at the device's native sample rate (issue #55).
 
-    Returns (pa, stream, None) on success. Returns (None, None,
-    error) on any failure. With a constructed (fresh) instance, the
-    failed PyAudio is terminated internally and NOT returned in the
-    tuple -- it owns no stream and was never adopted into
-    self.pyaudio, so direct termination is always safe (issue #37
+    The native rate is queried from ``pa.get_default_input_device_info()[
+    "defaultSampleRate"]`` after device resolution. If the query fails
+    or the value is missing/invalid, the provided ``sample_rate``
+    (16000) is used as the fallback.
+
+    Returns (pa, stream, None, capture_rate) on success where
+    ``capture_rate`` is the int rate actually passed to ``pa.open()``.
+    Returns (None, None, error, None) on any failure. With a constructed
+    (fresh) instance, the failed PyAudio is terminated internally and
+    NOT returned in the tuple -- it owns no stream and was never adopted
+    into self.pyaudio, so direct termination is always safe (issue #37
     task-c) and pa is only ever returned alongside its stream, which
     makes the "don't use a failed attempt's pa" contract structural
     rather than documented. With ``existing_pa`` provided, the
@@ -91,8 +99,9 @@ def attempt_open_once(
     type at the call site, which aborts the loop.
 
     The contract for the call site is: ``stream is not None``
-    (success) implies ``pa is not None``; ``stream is None``
-    implies the attempt failed and ``error`` is set.
+    (success) implies ``pa is not None`` and ``capture_rate is not
+    None``; ``stream is None`` implies the attempt failed and
+    ``error`` is set.
     """
     owns_pa = existing_pa is None
     pa: pyaudio.PyAudio | None
@@ -106,7 +115,7 @@ def attempt_open_once(
             # (errno None) so the loop's RuntimeError check -- reserved
             # for persistent device-lookup failures -- stays unambiguous.
             log_retry_attempt(attempt, max_attempts, attempt_start, None, "open")
-            return None, None, OSError(construct_error)
+            return None, None, OSError(construct_error), None
     else:
         # Issue #42 attempt 1: reuse the recorder's cached instance; the
         # call site owns it and keeps it on failure.
@@ -130,20 +139,33 @@ def attempt_open_once(
             )
             if owns_pa:
                 terminate_quietly(pa)
-            return None, None, device_error
+            return None, None, device_error, None
         except RuntimeError as device_error:
             # find_default_input_device's own documented failure (no
             # input device found at all) -- persistent state.
             log_retry_attempt(attempt, max_attempts, attempt_start, None, "abort")
             if owns_pa:
                 terminate_quietly(pa)
-            return None, None, device_error
+            return None, None, device_error, None
+
+    # Issue #55: query the device's native sample rate so the stream
+    # is opened at the rate CoreAudio actually uses, avoiding the
+    # sample-rate renegotiation that triggers Tahoe's -9986 storm.
+    # Falls back to the provided ``sample_rate`` (16000) when the
+    # key is missing, zero, or the call raises (coreaudiod storm).
+    effective_rate = sample_rate
+    try:
+        _rate_val = pa.get_default_input_device_info()["defaultSampleRate"]
+        if _rate_val is not None and _rate_val > 0:
+            effective_rate = int(_rate_val)
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
 
     try:
         stream = pa.open(
             format=format,
             channels=channels,
-            rate=sample_rate,
+            rate=effective_rate,
             input=True,
             input_device_index=device_index,
             frames_per_buffer=chunk_size,
@@ -154,9 +176,9 @@ def attempt_open_once(
         )
         if owns_pa:
             terminate_quietly(pa)
-        return None, None, open_error
+        return None, None, open_error, None
 
-    return pa, stream, None
+    return pa, stream, None, effective_rate
 
 
 def terminate_quietly(pa: "pyaudio.PyAudio") -> None:
