@@ -35,4 +35,9 @@ def resample_to_target(audio: np.ndarray, capture_rate: int | None) -> np.ndarra
         return audio
     x_old = np.linspace(0.0, 1.0, num=audio.size, endpoint=False)
     x_new = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+    # np.interp allocates three float64 temporaries (the two linspace
+    # arrays and its output); at a 1024-frame chunk this is negligible
+    # versus the int16->float32 conversion, and no cheaper path exists
+    # without a second dependency, so this is accepted as-is (issue #55
+    # performance note).
     return np.interp(x_new, x_old, audio).astype(np.float32)

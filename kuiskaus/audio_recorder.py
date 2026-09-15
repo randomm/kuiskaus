@@ -29,6 +29,23 @@ __all__ = [
 ]
 
 
+def _close_stream_quietly(stream: "pyaudio.Stream") -> None:
+    """Best-effort stream teardown; close failures must not propagate."""
+    try:
+        stream.stop_stream()
+        stream.close()
+    except OSError as e:
+        print(f"Error closing stream: {e}")
+
+
+def _worker_alive(thread: "threading.Thread | None") -> bool:
+    """Lock-free worker-thread liveness predicate (issue #16). The
+    thread attribute is assigned once per generation (not mutated)
+    and is_alive() on a dead thread is idempotent, so this is safe
+    to call outside recorder._lock."""
+    return thread is not None and thread.is_alive()
+
+
 class AudioRecorder:
     def __init__(
         self,
@@ -50,9 +67,7 @@ class AudioRecorder:
         self._lock = threading.Lock()
         self._generation = 0
         self._capture_rate: int | None = None  # issue #55 (adoption)
-        # Monotonic start timestamp of the current/last recording
-        # (issue #40), used for the [audio.stop] duration_ms field.
-        self._start_monotonic: float | None = None
+        self._start_monotonic: float | None = None  # issue #40
         self.on_capture_started = on_capture_started
         self._capture_announced = False
         self.sample_rate = sample_rate
@@ -108,7 +123,9 @@ class AudioRecorder:
         return self._generation
 
     @property
-    def capture_rate(self) -> int | None:  # rate opened at (issue #55)
+    def capture_rate(self) -> int | None:
+        """Native rate the stream was opened at (issue #55), or None
+        before any open succeeds."""
         return self._capture_rate
 
     def _find_default_input_device(self, pa: "pyaudio.PyAudio") -> int:
@@ -123,15 +140,6 @@ class AudioRecorder:
                 if info["maxInputChannels"] > 0:
                     return i
             raise RuntimeError("No input device found")
-
-    @staticmethod
-    def _close_stream_quietly(stream: "pyaudio.Stream") -> None:
-        """Best-effort stream teardown; close failures must not propagate."""
-        try:
-            stream.stop_stream()
-            stream.close()
-        except OSError as e:
-            print(f"Error closing stream: {e}")
 
     def _check_superseded(
         self, my_gen: int, attempt: int, attempt_start: float
@@ -157,14 +165,14 @@ class AudioRecorder:
         attempt: int,
         attempt_start: float,
     ) -> bool:
-        """Lock-scoped local-capture ownership transfer: adopt new_pa, its
-        stream, and the capture rate into self.pyaudio, terminating the
-        previous session's instance. A retry (attempt >= 2) adopts a fresh
-        instance and disposes the previous; attempt 1 (issue #42) adopts
-        the cached instance. Returns False if superseded while retrying."""
+        """Lock-scoped ownership transfer: adopt new_pa, its stream, and
+        the capture rate into self.pyaudio, terminating the previous
+        session's instance. A retry (attempt >= 2) adopts a fresh instance
+        and disposes the previous; attempt 1 (issue #42) adopts the cached
+        instance. Returns False if superseded while retrying."""
         with self._lock:
             if self._generation != my_gen or not self.recording:
-                self._close_stream_quietly(stream)
+                _close_stream_quietly(stream)
                 # A fresh (unadopted) retry instance: this worker owns its
                 # termination -- cleanup() never sees it (not reassigned).
                 if attempt > 1:
@@ -173,9 +181,10 @@ class AudioRecorder:
                     attempt, self.max_attempts, attempt_start, None, "abort"
                 )
                 return False
-            # Capture the previous instance locally and reassign under the
-            # same lock acquisition that writes self.pyaudio (issue #55
-            # capture rate is written alongside the stream).
+            # Capture the previous instance locally and reassign under
+            # the same lock acquisition that writes self.pyaudio
+            # (issue #55: the capture rate is written alongside the
+            # stream so stop_recording() sees an atomic rate + stream).
             old_pyaudio = self.pyaudio
             self.pyaudio = new_pa
             self._capture_rate = capture_rate
@@ -183,13 +192,13 @@ class AudioRecorder:
                 return True  # cached instance: device index still valid
 
         # Outside the lock: whoever captures old_pyaudio owns its
-        # termination; cleanup() uses the same pattern, so
-        # double-terminate is impossible by construction.
+        # termination (cleanup() uses the same pattern, so double-
+        # terminate is impossible by construction).
         #
         # Invariant (lens review HIGH #3): self.stream is ALWAYS None
         # here -- only _recording_worker writes it, AFTER
         # _open_stream_with_retry returns, so the post-lock read is a
-        # defensive guard, not a racy gate. No leak on any current path.
+        # defensive guard, not a racy gate.
         if old_pyaudio is not None and self.stream is None:
             terminate_quietly(old_pyaudio)
         return True
@@ -197,8 +206,8 @@ class AudioRecorder:
     def _open_stream_with_retry(self, my_gen: int) -> "pyaudio.Stream | None":
         """Open the input stream, retrying with backoff up to
         ``self.max_attempts``. Attempt 1 reuses the cached ``self.pyaudio``
-        and ``self.input_device_index`` (issue #42); retries 2..N construct
-        a fresh PyAudio() and re-resolve the device (issue #37, unchanged).
+        and ``self.input_device_index`` (issue #42); retries 2..N
+        construct a fresh PyAudio() and re-resolve the device (issue #37).
         Returns the opened stream, or None if all attempts failed or the
         generation was superseded mid-retry."""
         last_error: Exception | None = None
@@ -236,7 +245,9 @@ class AudioRecorder:
                 # construction/poll time (issue #38's per-attempt
                 # re-resolution stays on retries 2..N).
                 existing_pa=self.pyaudio if attempt == 1 else None,
-                existing_device_index=self.input_device_index if attempt == 1 else None,
+                existing_device_index=(
+                    self.input_device_index if attempt == 1 else None
+                ),
             )
             if stream is None:
                 last_error = error
@@ -298,17 +309,14 @@ class AudioRecorder:
             return  # last_error already set (or generation superseded)
         with self._lock:
             if self._generation != my_gen:
-                self._close_stream_quietly(stream)
+                _close_stream_quietly(stream)
                 return
             self.stream = stream
             # Only clear last_error if this generation's session is
-            # still active. If self.recording is already False here, the
-            # session was ended (e.g. stop_recording()'s stuck-open path
-            # already surfaced an error for this generation) before this
-            # late open() returned; clobbering that error would hide it
-            # from a release handler that may have already read it. The
-            # while loop below still breaks immediately (recording is
-            # False).
+            # still active: after stop_recording()'s stuck-open path,
+            # self.recording is False while a late open() may still be
+            # returning; clobbering last_error there would hide the
+            # error a release handler may have already read.
             if self.recording:
                 self.last_error = None
 
@@ -317,10 +325,10 @@ class AudioRecorder:
                 if self._generation != my_gen or not self.recording:
                     break
                 # Announce capture-start at most once per start_recording()
-                # cycle (issue #43 task-c). The predicate is deliberately
-                # not re-checked here: the generation/recording gate below
-                # (re-acquired before the callback fires) is the actual
-                # staleness defence, and the flag is reset once per cycle.
+                # cycle (issue #43 task-c); the flag is reset once per
+                # cycle and the generation/recording gate below (re-
+                # acquired before the callback fires) is the staleness
+                # defence.
                 capture_announced = self._capture_announced
             try:
                 data = stream.read(self.chunk_size, exception_on_overflow=False)
@@ -348,7 +356,7 @@ class AudioRecorder:
                         print("on_capture_started callback raised")
                         continue
 
-        self._close_stream_quietly(stream)
+        _close_stream_quietly(stream)
 
         with self._lock:
             if self._generation == my_gen:
@@ -356,22 +364,21 @@ class AudioRecorder:
                 self.stream = None
                 self.recording_thread = None
 
-    def start_recording(self) -> bool:  # issue #40/#55 see docstring
-        """Start recording audio.
+    def start_recording(self) -> bool:
+        """Admit a new recording and spawn its worker (issue #16).
 
-        True if admitted and a worker spawned, False if refused (a
-        worker is already alive). Liveness (not ``self.recording``)
-        is the sole refusal signal: after stop_recording()'s stuck-open
-        path, self.recording is already False while recording_thread
-        may still be blocked in a native pyaudio call. Gating refusal
-        on self.recording as well would let a second worker call
-        pyaudio.open() on the same shared self.pyaudio concurrently
-        with the still-running one -- the hazard issue #16 closes.
-        Liveness alone is race-free: a thread observed not-alive can
-        never become alive again, so the reassignment is always safe.
+        The admission gate is liveness, not ``self.recording``: after
+        ``stop_recording()``'s stuck-open path, ``self.recording`` is
+        already False while ``recording_thread`` may still be blocked
+        in a native pyaudio call. Gating on ``self.recording`` as well
+        would let a second worker call ``pyaudio.open()`` on the same
+        shared ``self.pyaudio`` concurrently with the still-running
+        one -- the hazard issue #16 closes. A thread observed
+        not-alive can never become alive again, so the reassignment
+        below is race-free on liveness alone.
         """
         with self._lock:
-            if self.recording_thread is not None and self.recording_thread.is_alive():
+            if _worker_alive(self.recording_thread):
                 return False
 
             if self.recording:
@@ -403,15 +410,12 @@ class AudioRecorder:
         return True
 
     def stop_recording(self) -> np.ndarray:
-        """Stop recording and return the audio data as numpy array.
+        """Stop recording and return the audio as a numpy array.
 
         Every empty-array return logs one ``[audio.stop] chunks=<n>
-        duration_ms=<m> reason=<value>`` line (issue #40), with the
-        reason: no-worker (no live session, no error), retry-exhausted
-        (no live session, last_error set), stuck-open (worker still
-        alive after the join timeout), or race-lost (clean join, empty
-        queue, no error).
-        """
+        duration_ms=<m> reason=<value>`` line (issue #40): the
+        reason is no-worker, retry-exhausted, stuck-open, or
+        race-lost (classified from observable state)."""
         with self._lock:
             was_recording = self.recording
             thread = self.recording_thread
@@ -431,9 +435,10 @@ class AudioRecorder:
         if thread is not None:
             thread.join(timeout=self._stuck_open_timeout_seconds)
             if thread.is_alive():
-                # Stuck-open detection: without this, a stuck (as opposed
-                # to failed) open surfaces as "no speech" because
-                # last_error hasn't been written yet.
+                # Stuck-open detection: a stuck (not failed) open
+                # surfaces as "no speech" because last_error hasn't
+                # been written yet -- the join timeout is the only
+                # observable signal.
                 with self._lock:
                     if self._generation == my_gen:
                         self.last_error = "microphone busy — recording did not start"
@@ -448,7 +453,6 @@ class AudioRecorder:
             audio_chunks.append(self.audio_queue.get())
 
         if audio_chunks:
-            # Convert to numpy array
             audio_data = b"".join(audio_chunks)
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
             # Convert to float32, normalize, then resample the assembled
@@ -468,23 +472,17 @@ class AudioRecorder:
         return np.array([], dtype=np.float32)
 
     def cleanup(self) -> None:
-        """Clean up PyAudio resources.
-
-        terminate() is skipped -- and logged -- if a worker may still
-        be alive, since terminate() while another thread holds/uses a
-        stream is unsafe. Same lock-scoped local-capture pattern as the
-        between-recordings adoption (issue #37 task-c): whoever captures
-        self.pyaudio into a local owns its termination, so a concurrent
-        adoption and cleanup() can never double-terminate.
+        """Clean up PyAudio resources. terminate() is skipped -- and
+        logged -- if a worker may still be alive, since terminate() while
+        another thread holds a stream is unsafe (lock-scoped local-capture
+        pattern, issue #37 task-c).
         """
         if self.recording:
             self.stop_recording()
 
+        worker_thread = self.recording_thread
         with self._lock:
-            worker_alive = (
-                self.recording_thread is not None and self.recording_thread.is_alive()
-            )
-            if self.recording or worker_alive:
+            if self.recording or _worker_alive(worker_thread):
                 print(
                     "Recording worker still active at cleanup; skipping "
                     "PyAudio.terminate()"

@@ -124,9 +124,14 @@ def audio_recorder_module(monkeypatch: pytest.MonkeyPatch):
     importlib.reload(module)
 
 
-def _make_pyaudio_instance(index: int = 0, rate: float | None = None) -> MagicMock:
+def _make_pyaudio_instance(
+    index: int = 0,
+    rate: float | None = None,
+) -> MagicMock:
     """A mock PyAudio() instance with a resolvable default input device.
-    Pass ``rate`` to also report a native defaultSampleRate (issue #55)."""
+
+    ``rate`` adds a native ``defaultSampleRate`` to the device info (issue #55).
+    """
     device_info: dict = {"index": index}
     if rate is not None:
         device_info["defaultSampleRate"] = rate
@@ -2250,8 +2255,79 @@ def test_open_stream_falls_back_to_16000_when_no_native_rate(audio_recorder_modu
     thread = recorder.recording_thread
     assert thread is not None
     assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    # Wait for adoption: the capture_rate is only written when the open
+    # succeeds and is adopted, so it is the race-free synchronization.
+    assert _wait_until(lambda: recorder.capture_rate == 16000, timeout=5.0)
 
-    assert recorder.capture_rate == 16000
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+def test_open_stream_falls_back_to_16000_when_rate_query_raises(
+    audio_recorder_module, capsys
+):
+    """Issue #55: when get_default_input_device_info() raises during the
+    native-rate query (coreaudiod storm), the stream opens at the fallback
+    rate of 16000 and the fallback is printed -- never a silent skip.
+
+    The mock is constructed to return a valid device dict on the first call
+    (the __init__ device-index probe) and raise OSError on the second
+    (the open-time rate query) -- a per-attempt OSError is what the
+    edge-case spec describes for a coreaudiod storm mid-recording."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)
+    # __init__'s device-index probe and the open path both need to read
+    # a dict; the rate query is the only call we want to raise. Since
+    # the mock is shared, the side_effect applies to every call -- use
+    # a function that returns a dict on the first two calls and raises
+    # on the third (the rate query in the open path).
+    call_count = {"n": 0}
+
+    def _device_info_side_effect():
+        call_count["n"] += 1
+        if call_count["n"] <= 2:
+            return {"index": 0}
+        raise OSError("-9986")
+
+    pa1.get_default_input_device_info.side_effect = _device_info_side_effect
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    assert _wait_until(lambda: recorder.capture_rate == 16000, timeout=5.0)
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+    out = capsys.readouterr().out
+    assert "falling back to 16000" in out
+
+
+def test_open_stream_falls_back_to_16000_when_rate_is_nonfinite(audio_recorder_module):
+    """Issue #55: a defaultSampleRate of float('inf') (a driver-reported
+    sentinel) must be treated as unusable (int(float('inf')) raises
+    OverflowError) and fall back to 16000 without killing the worker.
+    Same guard path as float('nan') (nan > 0 is False, the > 0 check
+    already rejects it)."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0, float("inf"))
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    assert _wait_until(lambda: recorder.capture_rate == 16000, timeout=5.0)
 
     release_event.set()
     thread.join(timeout=10.0)
@@ -2378,6 +2454,23 @@ def test_resample_helper_44100_non_trivial_ratio(audio_recorder_module):
     assert len(result) == int(n * 16000 / 44100)  # 16000
 
 
+def _drain_worker_queue(recorder) -> bytes:
+    """Drain the worker's audio queue without deadlocking on its read loop.
+
+    While the worker is blocked in read() (a test-owned release event
+    governs its next read), the queue contents are stable; the test can
+    drain them here and replicate the stop_recording() normalize +
+    resample to verify the 16 kHz contract without needing the worker
+    to join (setting the release event would let its next read yield
+    more frames and defeat the drain). The fixture teardown
+    (_cleanup_recorder) reclaims the daemon worker.
+    """
+    drained = b""
+    while not recorder.audio_queue.empty():
+        drained += recorder.audio_queue.get()
+    return drained
+
+
 def test_stop_recording_resamples_48000(audio_recorder_module):
     """Issue #55: a 48 kHz capture must return 16 kHz-equivalent length
     from stop_recording() -- the downstream transcriber contract."""
@@ -2386,9 +2479,6 @@ def test_stop_recording_resamples_48000(audio_recorder_module):
     release_event = threading.Event()
     # 1024 frames at 48 kHz = 48000 Hz worth of data in one chunk.
     frame = (np.zeros(1024, dtype=np.int16)).tobytes()
-
-    # Yield exactly one frame, then block (so the worker stays alive until
-    # release_event is set and stop_recording() joins cleanly).
     frame_yielded = threading.Event()
 
     def fake_read(*_args, **_kwargs):
@@ -2405,22 +2495,10 @@ def test_stop_recording_resamples_48000(audio_recorder_module):
     recorder = _make_recorder(module, init_probe=pa1)
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
-    thread = recorder.recording_thread
-    assert thread is not None
-    # Wait until the worker has delivered its one frame into the queue.
     assert _wait_until(lambda: not recorder.audio_queue.empty(), timeout=5.0)
 
-    # Drain the frame while the worker is blocked in read(). If we set
-    # release_event first, the worker's next read returns the frame again
-    # and stop_recording()'s drain loop never terminates. Instead we
-    # replicate the drain + resample here to verify the 16 kHz contract
-    # without deadlocking on the worker's infinite read loop.
-    drained = recorder.audio_queue.get()
+    drained = _drain_worker_queue(recorder)
     release_event.set()
-    # Do NOT join the worker thread: once release_event is set the
-    # worker's next read returns the frame again (infinite loop) and
-    # thread.join(timeout=10) still blocks until the timeout. The fixture
-    # teardown (_cleanup_recorder) handles the daemon thread.
 
     # The drained bytes are one int16 frame at 48 kHz; resample to 16 kHz.
     arr = np.frombuffer(drained, dtype=np.int16).astype(np.float32) / 32768.0
@@ -2455,19 +2533,10 @@ def test_stop_recording_resamples_24000(audio_recorder_module):
     recorder = _make_recorder(module, init_probe=pa1)
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
-    thread = recorder.recording_thread
-    assert thread is not None
     assert _wait_until(lambda: not recorder.audio_queue.empty(), timeout=5.0)
 
-    # Drain the frame while the worker is blocked in read(). If we set
-    # release_event first, the worker's next read returns the frame again
-    # and stop_recording()'s drain loop never terminates.
-    drained = recorder.audio_queue.get()
+    drained = _drain_worker_queue(recorder)
     release_event.set()
-    # Do NOT join the worker thread: once release_event is set the
-    # worker's next read returns the frame again (infinite loop) and
-    # thread.join(timeout=10) still blocks until the timeout. The fixture
-    # teardown (_cleanup_recorder) handles the daemon thread.
 
     # The drained bytes are one int16 frame at 24 kHz; resample to 16 kHz.
     arr = np.frombuffer(drained, dtype=np.int16).astype(np.float32) / 32768.0
@@ -2504,19 +2573,10 @@ def test_stop_recording_16000_noop_bit_identical(audio_recorder_module):
     recorder = _make_recorder(module, init_probe=pa1)
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
-    thread = recorder.recording_thread
-    assert thread is not None
     assert _wait_until(lambda: not recorder.audio_queue.empty(), timeout=5.0)
 
-    # Drain the frame while the worker is blocked in read(). If we set
-    # release_event first, the worker's next read returns the frame again
-    # and stop_recording()'s drain loop never terminates.
-    drained = recorder.audio_queue.get()
+    drained = _drain_worker_queue(recorder)
     release_event.set()
-    # Do NOT join the worker thread: once release_event is set the
-    # worker's next read returns the frame again (infinite loop) and
-    # thread.join(timeout=10) still blocks until the timeout. The fixture
-    # teardown (_cleanup_recorder) handles the daemon thread.
 
     # The drained bytes are one int16 frame at 16 kHz; resample is a no-op
     # (rate == 16000), so the output must be bit-identical to the

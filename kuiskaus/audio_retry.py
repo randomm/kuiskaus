@@ -81,7 +81,17 @@ def attempt_open_once(
 
     Returns (pa, stream, None, capture_rate) on success where
     ``capture_rate`` is the int rate actually passed to ``pa.open()``.
-    Returns (None, None, error, None) on any failure. With a constructed
+    Returns (None, None, error, None) on any failure.
+
+    The 4-tuple (widened from 3-tuple in issue #55) exists so the
+    successful rate reaches the recorder without a second query:
+    the only caller is AudioRecorder._open_stream_with_retry, which
+    adopts ``capture_rate`` under _lock (issue #55's _capture_rate
+    field) so stop_recording() can resample the assembled buffer
+    back to TARGET_RATE. Keeping it on the tuple keeps the open-and-
+    record rate atomic (same value passed to pa.open() as the one
+    recorded for resampling) without a shared mutable state that the
+    call site would have to write separately. With a constructed
     (fresh) instance, the failed PyAudio is terminated internally and
     NOT returned in the tuple -- it owns no stream and was never adopted
     into self.pyaudio, so direct termination is always safe (issue #37
@@ -155,19 +165,17 @@ def attempt_open_once(
     # key is missing, zero, or the call raises (coreaudiod storm).
     effective_rate = sample_rate
     try:
-        native_rate = pa.get_default_input_device_info()["defaultSampleRate"]
-        if native_rate is not None and native_rate > 0:
-            effective_rate = int(native_rate)
-    except (
-        OSError,
-        KeyError,
-        TypeError,
-        ValueError,
-        OverflowError,
-    ) as rate_query_error:
+        default_device_info = pa.get_default_input_device_info()
+        default_sample_rate = default_device_info["defaultSampleRate"]
+        if default_sample_rate is not None and default_sample_rate > 0:
+            effective_rate = int(default_sample_rate)
+    except (OSError, KeyError, TypeError, ValueError, OverflowError) as query_error:
+        # Missing key, None/zero/negative value, or the query itself
+        # raised (coreaudiod storm) or the value is non-numeric. All
+        # fall back to the provided ``sample_rate`` (16000); the print
+        # is the observability for why a device opened at the fallback.
         print(
-            f"Native rate query failed ({rate_query_error!r}); "
-            f"falling back to {sample_rate}"
+            f"Native rate query failed ({query_error!r}); falling back to {sample_rate}"
         )
 
     try:
