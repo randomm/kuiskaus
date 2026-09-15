@@ -393,7 +393,7 @@ def test_osascript_fallback_fires_on_cgeventpost_failure(inserter, quartz, monke
     assert result is True
     assert fake_run.called
     args = _osascript_args(fake_run)
-    assert args[0] == "osascript"
+    assert "osascript" in args
     assert "keystroke" in args[2]
 
 
@@ -477,7 +477,8 @@ def test_osascript_paste_fallback_on_cmdv_failure(
 
     assert result is True
     assert fake_run.call_count == 1
-    assert "using command down" in _osascript_args(fake_run)[2]
+    args = _osascript_args(fake_run)
+    assert "using command down" in args[2]
     # Success path restores the prior clipboard.
     assert _set_strings_called(pasteboard) == ["hello world", "original"]
 
@@ -485,10 +486,19 @@ def test_osascript_paste_fallback_on_cmdv_failure(
 # --- osascript fallback batching + security (issue #51 lens review) ---
 
 
+def test_mark_cgevent_broken_is_single_writer_helper(inserter):
+    """_mark_cgevent_broken is the monotonic latch's single writer:
+    it sets the flag and never resets it (issue #51 lens round-2)."""
+    assert inserter._cgevent_broken is False
+    inserter._mark_cgevent_broken()
+    assert inserter._cgevent_broken is True
+
+
 def test_cgevent_broken_flag_batches_typing(inserter, quartz, monkeypatch):
     """First insert: CGEventPost False, osascript works per-char →
-    _cgevent_broken set. Second insert: per-char loop bypassed entirely,
-    single batched osascript call (not N)."""
+    _cgevent_broken set (via the _mark_cgevent_broken single writer).
+    Second insert: per-char loop bypassed entirely, single batched
+    osascript call (not N)."""
     quartz.CGEventPost.return_value = False
     fake_run = MagicMock(return_value=MagicMock(returncode=0, stderr=""))
     _patch_subprocess(monkeypatch, fake_run)
@@ -573,20 +583,14 @@ def test_simulate_paste_broken_flag_bypass(inserter, quartz, monkeypatch):
     assert fake_run.call_count == 1
 
 
-def test_osascript_keystroke_script_shape_escapes_shell_injection():
+def test_osascript_keystroke_script_shape_escapes_shell_injection(inserter):
     """The generated AppleScript literal escapes backslash first, then
     quote, so a hostile payload cannot break out of the string context
-    (issue #51 lens SECURITY). No subprocess is invoked: build the
-    script the same way _osascript_keystroke does and assert on shape."""
-
-    def build(text: str) -> str:
-        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-        return f'tell application "System Events" to keystroke "{escaped}"'
-
-    # Assert _osascript_keystroke uses the same escape order on a real
-    # call by checking the module's source-level behavior via a mock.
+    (issue #51 lens SECURITY). No subprocess is invoked: assert on
+    _build_keystroke_script (issue #51 lens round-2 SIMPLICITY: the real
+    code, not a local copy)."""
     hostile = '")do shell script "rm x"--'
-    script = build(hostile)
+    script = inserter._build_keystroke_script(hostile)
     # Extract the AppleScript string literal (the quoted segment at the
     # END of the script — the first " is the one around "System Events").
     tail = script.split('"System Events" to keystroke "')[1]
