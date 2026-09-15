@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 
+from .audio_resample import TARGET_RATE
 from .transcriber import TranscriptionResult
 
 
@@ -68,7 +69,7 @@ class ParakeetTranscriber:
             alignments = self.model.generate(mel)
 
         transcribe_time = time.time() - start
-        audio_duration = len(audio) / 16000.0
+        audio_duration = len(audio) / float(TARGET_RATE)
 
         text = ""
         if alignments:

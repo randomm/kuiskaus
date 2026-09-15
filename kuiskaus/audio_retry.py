@@ -66,23 +66,26 @@ def attempt_open_once(
     attempt_start: float,
     existing_pa: "pyaudio.PyAudio | None" = None,
     existing_device_index: int | None = None,
-) -> tuple["pyaudio.PyAudio | None", "pyaudio.Stream | None", "Exception | None"]:
+) -> tuple[
+    "pyaudio.PyAudio | None", "pyaudio.Stream | None", "Exception | None", int | None
+]:
     """One attempt: construct a fresh PyAudio() (or reuse ``existing_pa``
     when provided -- issue #42's attempt 1 reuses the cached instance
     and its cached device index, skipping re-resolution) and open the
-    stream against the re-resolved default input device.
+    stream at the device's native sample rate (issue #55).
 
-    Returns (pa, stream, None) on success. Returns (None, None,
-    error) on any failure. With a constructed (fresh) instance, the
-    failed PyAudio is terminated internally and NOT returned in the
-    tuple -- it owns no stream and was never adopted into
-    self.pyaudio, so direct termination is always safe (issue #37
-    task-c) and pa is only ever returned alongside its stream, which
-    makes the "don't use a failed attempt's pa" contract structural
-    rather than documented. With ``existing_pa`` provided, the
+    The native rate is queried from ``pa.get_device_info_by_index(
+    device_index)["defaultSampleRate"]``. If the query fails or the
+    value is missing/invalid, the provided ``sample_rate`` (16000)
+    is used as the fallback.
+
+    Returns (pa, stream, None, capture_rate) on success where
+    ``capture_rate`` is the int rate actually passed to ``pa.open()``.
+    Returns (None, None, error, None) on any failure. With a constructed
+    (fresh) instance, the failed PyAudio is terminated internally and
+    NOT returned in the tuple; with ``existing_pa`` provided, the
     provided instance is NEVER terminated on failure: it is the
-    recorder's cached self.pyaudio, which the call site owns and may
-    keep using for subsequent attempts or recordings.
+    recorder's cached self.pyaudio, which the call site owns.
 
     Transient failures (PyAudio() construction failure, OSError from
     device enumeration or open()) are returned as the error so the
@@ -91,8 +94,9 @@ def attempt_open_once(
     type at the call site, which aborts the loop.
 
     The contract for the call site is: ``stream is not None``
-    (success) implies ``pa is not None``; ``stream is None``
-    implies the attempt failed and ``error`` is set.
+    (success) implies ``pa is not None`` and ``capture_rate is not
+    None``; ``stream is None`` implies the attempt failed and
+    ``error`` is set.
     """
     owns_pa = existing_pa is None
     pa: pyaudio.PyAudio | None
@@ -106,7 +110,7 @@ def attempt_open_once(
             # (errno None) so the loop's RuntimeError check -- reserved
             # for persistent device-lookup failures -- stays unambiguous.
             log_retry_attempt(attempt, max_attempts, attempt_start, None, "open")
-            return None, None, OSError(construct_error)
+            return None, None, OSError(construct_error), None
     else:
         # Issue #42 attempt 1: reuse the recorder's cached instance; the
         # call site owns it and keeps it on failure.
@@ -130,20 +134,69 @@ def attempt_open_once(
             )
             if owns_pa:
                 terminate_quietly(pa)
-            return None, None, device_error
+            return None, None, device_error, None
         except RuntimeError as device_error:
             # find_default_input_device's own documented failure (no
             # input device found at all) -- persistent state.
             log_retry_attempt(attempt, max_attempts, attempt_start, None, "abort")
             if owns_pa:
                 terminate_quietly(pa)
-            return None, None, device_error
+            return None, None, device_error, None
+
+    # Issue #55: query the device's native sample rate so the stream
+    # is opened at the rate CoreAudio actually uses, avoiding the
+    # sample-rate renegotiation that triggers Tahoe's -9986 storm.
+    # Falls back to the provided ``sample_rate`` (16000) when the
+    # key is missing, zero, or the call raises (coreaudiod storm).
+    effective_rate = sample_rate
+    try:
+        # Query the device actually being opened (the resolved
+        # device_index), not the default input device: the default can
+        # move between the index resolution and this query (e.g. AirPods
+        # disconnect mid-open), which would otherwise record a rate for
+        # a different device than the one opened (TOCTOU, issue #55
+        # lens review MEDIUM, security).
+        device_info = pa.get_device_info_by_index(device_index)
+        default_sample_rate = device_info["defaultSampleRate"]
+    except (OSError, KeyError, TypeError, ValueError, OverflowError) as query_error:
+        # Missing key, or the query itself raised (coreaudiod storm), or
+        # the value is non-numeric. Fall back to the provided
+        # ``sample_rate`` (16000); the print is the observability for
+        # why a device opened at the fallback. The message is bounded
+        # -- a pathological CoreAudio property value must not dump an
+        # unbounded (possibly binary) repr into stderr.
+        print(
+            f"Native rate query failed ({str(query_error)[:120]!r}); "
+            f"falling back to {sample_rate}"
+        )
+    else:
+        if default_sample_rate is None or default_sample_rate <= 0:
+            # A device that reports a present-but-corrupted (zero/negative)
+            # native rate is precisely the failure mode this ticket
+            # addresses; log it so an operator debugging a persistent
+            # -9986 storm can tell "opened at 16000 fallback because the
+            # device reported an invalid rate" from "opened at native".
+            print(
+                f"Native rate {default_sample_rate!r} invalid (<=0); "
+                f"falling back to {sample_rate}"
+            )
+        elif not (4000 <= default_sample_rate <= 192000):
+            # Sanity bound (generous superset of any real input device's
+            # native rate): a wildly out-of-range value is a corrupted
+            # device report, not a real rate -- fall back and say so.
+            print(
+                f"Native rate {default_sample_rate!r} out of bounds "
+                "(4000..192000); falling back to "
+                f"{sample_rate}"
+            )
+        else:
+            effective_rate = int(default_sample_rate)
 
     try:
         stream = pa.open(
             format=format,
             channels=channels,
-            rate=sample_rate,
+            rate=effective_rate,
             input=True,
             input_device_index=device_index,
             frames_per_buffer=chunk_size,
@@ -154,9 +207,13 @@ def attempt_open_once(
         )
         if owns_pa:
             terminate_quietly(pa)
-        return None, None, open_error
+        return None, None, open_error, None
 
-    return pa, stream, None
+    # 4-tuple (widened from 3-tuple in issue #55): the successful rate
+    # rides the return so the single caller adopts the exact value
+    # passed to pa.open() under _lock for stop_recording() resampling,
+    # keeping open-and-record rate atomic without shared mutable state.
+    return pa, stream, None, effective_rate
 
 
 def terminate_quietly(pa: "pyaudio.PyAudio") -> None:

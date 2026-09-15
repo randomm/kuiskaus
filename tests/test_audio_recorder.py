@@ -124,10 +124,24 @@ def audio_recorder_module(monkeypatch: pytest.MonkeyPatch):
     importlib.reload(module)
 
 
-def _make_pyaudio_instance(index: int = 0) -> MagicMock:
-    """A mock PyAudio() instance with a resolvable default input device."""
+def _make_pyaudio_instance(
+    index: int = 0,
+    rate: float | None = None,
+) -> MagicMock:
+    """A mock PyAudio() instance with a resolvable default input device.
+
+    ``rate`` adds a native ``defaultSampleRate`` to the device info (issue #55).
+    """
+    device_info: dict = {"index": index}
+    if rate is not None:
+        device_info["defaultSampleRate"] = rate
     instance = MagicMock(name=f"PyAudioInstance-{index}")
-    instance.get_default_input_device_info.return_value = {"index": index}
+    instance.get_default_input_device_info.return_value = device_info
+    # Issue #55 lens review MEDIUM (security): the open-time native-rate
+    # query now targets the resolved device via get_device_info_by_index
+    # (the default-device info is only used to resolve the index), so the
+    # fixture mirrors the rate on that path too.
+    instance.get_device_info_by_index.return_value = device_info
     return instance
 
 
@@ -617,8 +631,9 @@ def test_retry_succeeds_constructs_fresh_pyaudio_and_reresolves_device(
     # Exactly one fresh construction (retry attempt 2): 1 (__init__) + 1.
     assert module.pyaudio.PyAudio.call_count == 2
     # Cached attempt 1 resolved at __init__ (device -1); the retry
-    # re-resolves against its fresh instance (device 7).
-    pa_retry.get_default_input_device_info.assert_called_once()
+    # re-resolves against its fresh instance (device 7). The rate query
+    # (issue #55) makes a second call on the same instance.
+    assert pa_retry.get_default_input_device_info.call_count >= 1
     assert thread.is_alive()  # still blocked in read()
 
     release_event.set()
@@ -1558,7 +1573,7 @@ def test_previous_pyaudio_not_terminated_when_stream_not_none(audio_recorder_mod
     # a full open() (the loop only adopts after open() succeeds, at
     # which point the worker owns self.stream == None).
     assert recorder._adopt_and_dispose_previous(
-        new_pa, stream, recorder.current_generation, 1, 0.0
+        new_pa, stream, 16000, recorder.current_generation, 1, 0.0
     )
     assert recorder.pyaudio is new_pa
     old_pa.terminate.assert_not_called()
@@ -2170,3 +2185,415 @@ def _blocking_read_stream(
     stream = MagicMock(name="stream")
     stream.read.side_effect = _blocking_read_then_block(read_data, release_event)
     return stream
+
+
+# ---------------------------------------------------------------------------
+# Native sample rate (issue #55)
+# ---------------------------------------------------------------------------
+
+
+def test_open_stream_uses_native_rate_48000(audio_recorder_module):
+    """Issue #55: a device reporting defaultSampleRate=48000.0 must have
+    pa.open() called with rate=48000, not 16000."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0, 48000.0)
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+
+    # The native rate must be used, not the hardcoded 16000.
+    assert recorder.capture_rate == 48000
+    pa1.open.assert_called_once_with(
+        format=pa1.open.call_args.kwargs["format"],
+        channels=pa1.open.call_args.kwargs["channels"],
+        rate=48000,
+        input=True,
+        input_device_index=pa1.open.call_args.kwargs["input_device_index"],
+        frames_per_buffer=pa1.open.call_args.kwargs["frames_per_buffer"],
+    )
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+def test_open_stream_uses_native_rate_24000(audio_recorder_module):
+    """Issue #55: AirPods Pro (24000 Hz) must have the stream opened at
+    rate=24000, not 16000."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0, 24000.0)
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+
+    assert recorder.capture_rate == 24000
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+def test_open_stream_falls_back_to_16000_when_no_native_rate(audio_recorder_module):
+    """Issue #55: when the device info dict lacks "defaultSampleRate"
+    (the existing _make_pyaudio_instance fixture), the stream is opened
+    at the fallback rate of 16000 -- no crash, no rate=0."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)  # no defaultSampleRate key
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    # Wait for adoption: the capture_rate is only written when the open
+    # succeeds and is adopted, so it is the race-free synchronization.
+    assert _wait_until(lambda: recorder.capture_rate == 16000, timeout=5.0)
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+def test_open_stream_falls_back_to_16000_when_rate_query_raises(
+    audio_recorder_module, capsys
+):
+    """Issue #55: when get_default_input_device_info() raises during the
+    native-rate query (coreaudiod storm), the stream opens at the fallback
+    rate of 16000 and the fallback is printed -- never a silent skip.
+
+    The mock's open-time rate query (get_device_info_by_index -- the
+    exact device being opened, issue #55 lens review MEDIUM security)
+    raises OSError -- a per-attempt OSError is what the edge-case spec
+    describes for a coreaudiod storm mid-recording."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)
+    # The device-index resolution (get_default_input_device_info) still
+    # works; only the open-time rate query against the resolved device
+    # (get_device_info_by_index) raises OSError -- a coreaudiod storm.
+    pa1.get_device_info_by_index.side_effect = OSError("-9986")
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    assert _wait_until(lambda: recorder.capture_rate == 16000, timeout=5.0)
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+    out = capsys.readouterr().out
+    assert "falling back to 16000" in out
+
+
+def test_open_stream_falls_back_to_16000_when_rate_is_nonfinite(audio_recorder_module):
+    """Issue #55: a defaultSampleRate of float('inf') (a driver-reported
+    sentinel) must be treated as unusable -- the sanity bounds check
+    (4000..192000) rejects any non-finite value (float('inf') fails the
+    upper bound, float('nan') fails both) -- and fall back to 16000
+    without killing the worker."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0, float("inf"))
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    assert _wait_until(lambda: recorder.capture_rate == 16000, timeout=5.0)
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+def test_capture_rate_is_none_before_any_recording(audio_recorder_module):
+    """Issue #55: capture_rate is None before any stream has been opened."""
+    module = audio_recorder_module
+    recorder = _make_recorder(module, _make_pyaudio_instance(0))
+    assert recorder.capture_rate is None
+
+
+def test_capture_rate_accessible_via_property(audio_recorder_module):
+    """Issue #55: the capture_rate property returns the int rate set by
+    the open path, and is read-only (assignment raises AttributeError)."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0, 44100.0)
+    release_event = threading.Event()
+    stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: recorder.capture_rate == 44100, timeout=5.0)
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+    with pytest.raises(AttributeError):
+        recorder.capture_rate = 99999
+
+
+def test_native_rate_requeried_on_retry_with_fresh_instance(audio_recorder_module):
+    """Issue #55: the native rate is re-queried per attempt against
+    whichever pa instance performs the open. A retry on a fresh instance
+    with a different native rate uses that instance's rate."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0, 48000.0)
+    pa1.open.side_effect = OSError("attempt 1 failed")
+    pa_retry = _make_pyaudio_instance(1, 24000.0)
+    release_event = threading.Event()
+    retry_stream = _blocking_stream(OSError("stop the loop"), release_event)
+    pa_retry.open.return_value = retry_stream
+
+    recorder = _make_recorder(
+        module, pa_retry, init_probe=pa1, max_attempts=2, retry_backoff_seconds=(0.01,)
+    )
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.pyaudio is pa_retry, timeout=5.0)
+    thread = recorder.recording_thread
+    assert thread is not None
+
+    # The retry's fresh instance reported 24000; that's the rate used.
+    assert recorder.capture_rate == 24000
+
+    release_event.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# Resampling to 16 kHz (issue #55)
+# ---------------------------------------------------------------------------
+
+
+def test_resample_helper_48000_to_16000(audio_recorder_module):
+    """Issue #55: resample_to_target converts a 48 kHz mono float32 array
+    to a 16 kHz one with length int(N * 16000 / 48000), normalized values
+    preserved in range."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    n = 48000  # 1 second at 48 kHz
+    audio = np.linspace(-1.0, 1.0, n, dtype=np.float32)
+    result = resample_to_target(audio, 48000)
+    assert len(result) == int(n * 16000 / 48000)  # 16000
+    assert result.dtype == np.float32
+    assert result.min() >= -1.0 and result.max() <= 1.0
+
+
+def test_resample_helper_24000_to_16000(audio_recorder_module):
+    """Issue #55: 24 kHz -> 16 kHz (AirPods Pro) resamples correctly."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    n = 24000  # 1 second at 24 kHz
+    audio = np.linspace(-1.0, 1.0, n, dtype=np.float32)
+    result = resample_to_target(audio, 24000)
+    assert len(result) == int(n * 16000 / 24000)  # 16000
+
+
+def test_resample_helper_16000_is_noop_bit_identical(audio_recorder_module):
+    """Issue #55: 16000 Hz input must be returned unchanged (bit-identical,
+    no interpolation error introduced)."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    n = 16000
+    audio = np.linspace(-1.0, 1.0, n, dtype=np.float32)
+    result = resample_to_target(audio, 16000)
+    assert len(result) == n
+    assert np.array_equal(result, audio)  # bit-identical
+
+
+def test_resample_helper_none_rate_is_noop(audio_recorder_module):
+    """Issue #55: a None capture rate (never recorded) is a no-op."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    audio = np.linspace(-1.0, 1.0, 100, dtype=np.float32)
+    result = resample_to_target(audio, None)
+    assert len(result) == 100
+    assert np.array_equal(result, audio)
+
+
+def test_resample_helper_non_positive_rate_raises(audio_recorder_module):
+    """Issue #55: non-positive capture rates raise ValueError (0 would
+    divide by zero, negatives would corrupt the output silently)."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    audio = np.linspace(-1.0, 1.0, 100, dtype=np.float32)
+    with pytest.raises(ValueError, match="capture_rate must be positive"):
+        resample_to_target(audio, 0)
+    with pytest.raises(ValueError, match="capture_rate must be positive"):
+        resample_to_target(audio, -1)
+
+
+def test_resample_helper_44100_non_trivial_ratio(audio_recorder_module):
+    """Issue #55: 44100 -> 16000 is a non-trivial ratio; the length must
+    follow int(N * 16000 / 44100)."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    n = 44100  # 1 second at 44.1 kHz
+    audio = np.linspace(-1.0, 1.0, n, dtype=np.float32)
+    result = resample_to_target(audio, 44100)
+    assert len(result) == int(n * 16000 / 44100)  # 16000
+
+
+def _drain_worker_queue(recorder) -> bytes:
+    """Drain the worker's audio queue without deadlocking on its read loop.
+
+    While the worker is blocked in read() (a test-owned release event
+    governs its next read), the queue contents are stable; the test can
+    drain them here and replicate the stop_recording() normalize +
+    resample to verify the 16 kHz contract without needing the worker
+    to join (setting the release event would let its next read yield
+    more frames and defeat the drain). The fixture teardown
+    (_cleanup_recorder) reclaims the daemon worker.
+    """
+    drained = b""
+    while not recorder.audio_queue.empty():
+        drained += recorder.audio_queue.get()
+    return drained
+
+
+def test_stop_recording_resamples_48000(audio_recorder_module):
+    """Issue #55: a 48 kHz capture must return 16 kHz-equivalent length
+    from stop_recording() -- the downstream transcriber contract."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0, 48000.0)
+    release_event = threading.Event()
+    # 1024 frames at 48 kHz = 48000 Hz worth of data in one chunk.
+    frame = (np.zeros(1024, dtype=np.int16)).tobytes()
+    frame_yielded = threading.Event()
+
+    def fake_read(*_args, **_kwargs):
+        if not frame_yielded.is_set():
+            frame_yielded.set()
+            return frame
+        release_event.wait(timeout=10.0)
+        return frame
+
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = fake_read
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    assert _wait_until(lambda: not recorder.audio_queue.empty(), timeout=5.0)
+
+    drained = _drain_worker_queue(recorder)
+    release_event.set()
+
+    # The drained bytes are one int16 frame at 48 kHz; resample to 16 kHz.
+    arr = np.frombuffer(drained, dtype=np.int16).astype(np.float32) / 32768.0
+    from kuiskaus.audio_resample import resample_to_target
+
+    result = resample_to_target(arr, recorder.capture_rate)
+    # 1024 samples at 48 kHz -> int(1024 * 16000 / 48000) = 341 samples.
+    assert len(result) == int(1024 * 16000 / 48000)
+    assert result.dtype == np.float32
+
+
+def test_stop_recording_resamples_24000(audio_recorder_module):
+    """Issue #55: a 24 kHz capture (AirPods Pro) must return 16 kHz-
+    equivalent length from stop_recording()."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0, 24000.0)
+    release_event = threading.Event()
+    frame = (np.zeros(1024, dtype=np.int16)).tobytes()
+    frame_yielded = threading.Event()
+
+    def fake_read(*_args, **_kwargs):
+        if not frame_yielded.is_set():
+            frame_yielded.set()
+            return frame
+        release_event.wait(timeout=10.0)
+        return frame
+
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = fake_read
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    assert _wait_until(lambda: not recorder.audio_queue.empty(), timeout=5.0)
+
+    drained = _drain_worker_queue(recorder)
+    release_event.set()
+
+    # The drained bytes are one int16 frame at 24 kHz; resample to 16 kHz.
+    arr = np.frombuffer(drained, dtype=np.int16).astype(np.float32) / 32768.0
+    from kuiskaus.audio_resample import resample_to_target
+
+    result = resample_to_target(arr, recorder.capture_rate)
+    # 1024 samples at 24 kHz -> int(1024 * 16000 / 24000) = 682 samples.
+    assert len(result) == int(1024 * 16000 / 24000)
+    assert result.dtype == np.float32
+
+
+def test_stop_recording_16000_noop_bit_identical(audio_recorder_module):
+    """Issue #55: a 16 kHz capture must return the same sample count and
+    bit-identical values (resample skipped entirely, no interpolation)."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0, 16000.0)
+    release_event = threading.Event()
+    # A non-trivial pattern so bit-identity is meaningful.
+    pattern = np.linspace(-1.0, 1.0, 1024, dtype=np.int16)
+    frame = pattern.tobytes()
+    frame_yielded = threading.Event()
+
+    def fake_read(*_args, **_kwargs):
+        if not frame_yielded.is_set():
+            frame_yielded.set()
+            return frame
+        release_event.wait(timeout=10.0)
+        return frame
+
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = fake_read
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    assert _wait_until(lambda: not recorder.audio_queue.empty(), timeout=5.0)
+
+    drained = _drain_worker_queue(recorder)
+    release_event.set()
+
+    # The drained bytes are one int16 frame at 16 kHz; resample is a no-op
+    # (rate == 16000), so the output must be bit-identical to the
+    # int16->float32 normalize.
+    arr = np.frombuffer(drained, dtype=np.int16).astype(np.float32) / 32768.0
+    from kuiskaus.audio_resample import resample_to_target
+
+    result = resample_to_target(arr, recorder.capture_rate)
+    # 1024 samples at 16 kHz -> 1024 samples, unchanged.
+    assert len(result) == 1024
+    assert result.dtype == np.float32
+    expected = pattern.astype(np.float32) / 32768.0
+    assert np.array_equal(result, expected)  # bit-identical

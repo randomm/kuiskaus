@@ -4,6 +4,7 @@ import time
 import mlx_whisper
 import numpy as np
 
+from .audio_resample import TARGET_RATE
 from .transcriber import TranscriptionResult
 
 
@@ -83,7 +84,7 @@ class WhisperTranscriber:
             audio = audio.astype(np.float32)
 
         # Pad audio if too short (Whisper expects at least 0.1 seconds)
-        min_length = int(0.1 * 16000)  # 0.1 seconds at 16kHz
+        min_length = int(0.1 * TARGET_RATE)  # 0.1 seconds at 16kHz
         if len(audio) < min_length:
             audio = np.pad(audio, (0, min_length - len(audio)), mode="constant")
 
@@ -118,7 +119,7 @@ class WhisperTranscriber:
 
             # Add timing information
             result["transcribe_time"] = transcribe_time
-            result["audio_duration"] = len(audio) / 16000.0
+            result["audio_duration"] = len(audio) / float(TARGET_RATE)
             result["rtf"] = (
                 transcribe_time / result["audio_duration"]
             )  # Real-time factor
