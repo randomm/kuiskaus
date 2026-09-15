@@ -68,7 +68,7 @@ def test_attempt_open_once_construction_failure_returns_oserror_and_terminates_n
 
     pa_module = _fake_pa_module()[0]
 
-    pa, got_stream, error, _rate = attempt_open_once(
+    pa, got_stream, error, _native_rate = attempt_open_once(
         pa_module, 8, 1, 16000, 1024, _find_device, 4, 2, 0.0
     )
 
@@ -133,7 +133,7 @@ def test_attempt_open_once_existing_pa_open_failure_does_not_terminate_cached():
     open_error = OSError("stale session")
     cached_pa.open.side_effect = open_error
 
-    pa, got_stream, error, _rate = attempt_open_once(
+    pa, got_stream, error, _native_rate = attempt_open_once(
         pa_module,
         8,
         1,
@@ -163,7 +163,7 @@ def test_attempt_open_once_existing_pa_runtime_error_does_not_terminate_cached()
     pa_module = MagicMock(name="pyaudio")
     cached_pa = MagicMock(name="cached-pa")
 
-    pa, got_stream, error, _rate = attempt_open_once(
+    pa, got_stream, error, _native_rate = attempt_open_once(
         pa_module,
         8,
         1,
@@ -192,7 +192,7 @@ def test_attempt_open_once_open_failure_terminates_the_failed_pa():
     open_error = OSError("device busy")
     pa_ok.open.side_effect = open_error
 
-    pa, got_stream, error, _rate = attempt_open_once(
+    pa, got_stream, error, _native_rate = attempt_open_once(
         pa_module, 8, 1, 16000, 1024, _find_device, 4, 2, 0.0
     )
 

@@ -10,7 +10,9 @@ linear interpolation only.
 
 import numpy as np
 
-#: The 16 kHz mono float32 contract all transcribers consume.
+#: The 16 kHz mono float32 contract all transcribers consume. The
+#: transcribers import this constant for their duration math so the
+#: rate cannot be desynchronized from the resampler.
 TARGET_RATE = 16000
 
 

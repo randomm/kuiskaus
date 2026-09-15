@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from .audio_resample import TARGET_RATE
 from .transcriber import TranscriptionResult
 
 # mzbac/voxtral-mini-3b-4bit-mixed: public, unauthenticated, non-gated HF
@@ -219,7 +220,9 @@ class VoxtralTranscriber:
             )
         return self._model, self._processor
 
-    def _audio_to_wav_file(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
+    def _audio_to_wav_file(
+        self, audio: np.ndarray, sample_rate: int = TARGET_RATE
+    ) -> str:
         """Write numpy audio array to a temp WAV file. Returns file path."""
         audio_int16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
         # NamedTemporaryFile(delete=False) is intentional: the path must
@@ -280,7 +283,7 @@ class VoxtralTranscriber:
                 except OSError:
                     pass
 
-        audio_duration = len(audio) / 16000.0
+        audio_duration = len(audio) / float(TARGET_RATE)
         return {
             "text": text,
             "transcribe_time": transcribe_time,

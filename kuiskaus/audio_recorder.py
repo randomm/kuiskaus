@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import pyaudio
 
-from kuiskaus.audio_resample import resample_to_target
+from kuiskaus.audio_resample import TARGET_RATE, resample_to_target
 from kuiskaus.audio_retry import (
     MAX_ATTEMPTS,
     PA_INTERNAL_ERROR_ERRNO,
@@ -32,7 +32,7 @@ __all__ = [
 class AudioRecorder:
     def __init__(
         self,
-        sample_rate: int = 16000,
+        sample_rate: int = TARGET_RATE,
         chunk_size: int = 1024,
         channels: int = 1,
         max_attempts: int = MAX_ATTEMPTS,
@@ -108,8 +108,7 @@ class AudioRecorder:
         return self._generation
 
     @property
-    def capture_rate(self) -> int | None:
-        """Native rate the stream was opened at (issue #55), or None."""
+    def capture_rate(self) -> int | None:  # rate opened at (issue #55)
         return self._capture_rate
 
     def _find_default_input_device(self, pa: "pyaudio.PyAudio") -> int:
@@ -357,20 +356,19 @@ class AudioRecorder:
                 self.stream = None
                 self.recording_thread = None
 
-    def start_recording(self) -> bool:
+    def start_recording(self) -> bool:  # issue #40/#55 see docstring
         """Start recording audio.
 
-        Returns True if a new recording was admitted and a worker
-        spawned, False if refused because a worker is already alive.
-        Liveness (not ``self.recording``) is the sole refusal signal:
-        after stop_recording()'s stuck-open path, self.recording is
-        already False while recording_thread may still be blocked in a
-        native pyaudio call. Gating refusal on self.recording as well
-        would let a second worker call pyaudio.open() on the same
-        shared self.pyaudio concurrently with the still-running one --
-        exactly the native-level hazard issue #16 closes. Liveness alone
-        is race-free: a thread observed not-alive can never become
-        alive again, so the reassignment below is always safe.
+        True if admitted and a worker spawned, False if refused (a
+        worker is already alive). Liveness (not ``self.recording``)
+        is the sole refusal signal: after stop_recording()'s stuck-open
+        path, self.recording is already False while recording_thread
+        may still be blocked in a native pyaudio call. Gating refusal
+        on self.recording as well would let a second worker call
+        pyaudio.open() on the same shared self.pyaudio concurrently
+        with the still-running one -- the hazard issue #16 closes.
+        Liveness alone is race-free: a thread observed not-alive can
+        never become alive again, so the reassignment is always safe.
         """
         with self._lock:
             if self.recording_thread is not None and self.recording_thread.is_alive():
@@ -407,12 +405,11 @@ class AudioRecorder:
     def stop_recording(self) -> np.ndarray:
         """Stop recording and return the audio data as numpy array.
 
-        Every empty-array return logs exactly one structured line
-        ``[audio.stop] chunks=<n> duration_ms=<m> reason=<value>``
-        (issue #40). The reason is classified from observable state:
-        no-worker (no live session, no error), retry-exhausted (no
-        live session, last_error set), stuck-open (worker still alive
-        after the join timeout), or race-lost (clean join, empty
+        Every empty-array return logs one ``[audio.stop] chunks=<n>
+        duration_ms=<m> reason=<value>`` line (issue #40), with the
+        reason: no-worker (no live session, no error), retry-exhausted
+        (no live session, last_error set), stuck-open (worker still
+        alive after the join timeout), or race-lost (clean join, empty
         queue, no error).
         """
         with self._lock:
@@ -454,9 +451,8 @@ class AudioRecorder:
             # Convert to numpy array
             audio_data = b"".join(audio_chunks)
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            # Convert to float32 and normalize, then resample the assembled
-            # buffer (not per chunk) from the native capture rate back to
-            # 16 kHz before returning (issue #55).
+            # Convert to float32, normalize, then resample the assembled
+            # buffer to 16 kHz (issue #55).
             audio_float = audio_array.astype(np.float32) / 32768.0
             return resample_to_target(audio_float, capture_rate)
 
@@ -485,9 +481,10 @@ class AudioRecorder:
             self.stop_recording()
 
         with self._lock:
-            if self.recording or (
+            worker_alive = (
                 self.recording_thread is not None and self.recording_thread.is_alive()
-            ):
+            )
+            if self.recording or worker_alive:
                 print(
                     "Recording worker still active at cleanup; skipping "
                     "PyAudio.terminate()"

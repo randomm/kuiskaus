@@ -124,10 +124,14 @@ def audio_recorder_module(monkeypatch: pytest.MonkeyPatch):
     importlib.reload(module)
 
 
-def _make_pyaudio_instance(index: int = 0) -> MagicMock:
-    """A mock PyAudio() instance with a resolvable default input device."""
+def _make_pyaudio_instance(index: int = 0, rate: float | None = None) -> MagicMock:
+    """A mock PyAudio() instance with a resolvable default input device.
+    Pass ``rate`` to also report a native defaultSampleRate (issue #55)."""
+    device_info: dict = {"index": index}
+    if rate is not None:
+        device_info["defaultSampleRate"] = rate
     instance = MagicMock(name=f"PyAudioInstance-{index}")
-    instance.get_default_input_device_info.return_value = {"index": index}
+    instance.get_default_input_device_info.return_value = device_info
     return instance
 
 
@@ -2178,22 +2182,11 @@ def _blocking_read_stream(
 # ---------------------------------------------------------------------------
 
 
-def _make_pyaudio_instance_with_rate(index: int, rate: float) -> MagicMock:
-    """A mock PyAudio() instance with a resolvable default input device
-    that also reports a native sample rate."""
-    instance = MagicMock(name=f"PyAudioInstance-{index}")
-    instance.get_default_input_device_info.return_value = {
-        "index": index,
-        "defaultSampleRate": rate,
-    }
-    return instance
-
-
 def test_open_stream_uses_native_rate_48000(audio_recorder_module):
     """Issue #55: a device reporting defaultSampleRate=48000.0 must have
     pa.open() called with rate=48000, not 16000."""
     module = audio_recorder_module
-    pa1 = _make_pyaudio_instance_with_rate(0, 48000.0)
+    pa1 = _make_pyaudio_instance(0, 48000.0)
     release_event = threading.Event()
     stream = _blocking_stream(OSError("stop the loop"), release_event)
     pa1.open.return_value = stream
@@ -2224,7 +2217,7 @@ def test_open_stream_uses_native_rate_24000(audio_recorder_module):
     """Issue #55: AirPods Pro (24000 Hz) must have the stream opened at
     rate=24000, not 16000."""
     module = audio_recorder_module
-    pa1 = _make_pyaudio_instance_with_rate(0, 24000.0)
+    pa1 = _make_pyaudio_instance(0, 24000.0)
     release_event = threading.Event()
     stream = _blocking_stream(OSError("stop the loop"), release_event)
     pa1.open.return_value = stream
@@ -2276,7 +2269,7 @@ def test_capture_rate_accessible_via_property(audio_recorder_module):
     """Issue #55: the capture_rate property returns the int rate set by
     the open path, and is read-only (assignment raises AttributeError)."""
     module = audio_recorder_module
-    pa1 = _make_pyaudio_instance_with_rate(0, 44100.0)
+    pa1 = _make_pyaudio_instance(0, 44100.0)
     release_event = threading.Event()
     stream = _blocking_stream(OSError("stop the loop"), release_event)
     pa1.open.return_value = stream
@@ -2300,9 +2293,9 @@ def test_native_rate_requeried_on_retry_with_fresh_instance(audio_recorder_modul
     whichever pa instance performs the open. A retry on a fresh instance
     with a different native rate uses that instance's rate."""
     module = audio_recorder_module
-    pa1 = _make_pyaudio_instance_with_rate(0, 48000.0)
+    pa1 = _make_pyaudio_instance(0, 48000.0)
     pa1.open.side_effect = OSError("attempt 1 failed")
-    pa_retry = _make_pyaudio_instance_with_rate(1, 24000.0)
+    pa_retry = _make_pyaudio_instance(1, 24000.0)
     release_event = threading.Event()
     retry_stream = _blocking_stream(OSError("stop the loop"), release_event)
     pa_retry.open.return_value = retry_stream
@@ -2389,7 +2382,7 @@ def test_stop_recording_resamples_48000(audio_recorder_module):
     """Issue #55: a 48 kHz capture must return 16 kHz-equivalent length
     from stop_recording() -- the downstream transcriber contract."""
     module = audio_recorder_module
-    pa1 = _make_pyaudio_instance_with_rate(0, 48000.0)
+    pa1 = _make_pyaudio_instance(0, 48000.0)
     release_event = threading.Event()
     # 1024 frames at 48 kHz = 48000 Hz worth of data in one chunk.
     frame = (np.zeros(1024, dtype=np.int16)).tobytes()
@@ -2443,7 +2436,7 @@ def test_stop_recording_resamples_24000(audio_recorder_module):
     """Issue #55: a 24 kHz capture (AirPods Pro) must return 16 kHz-
     equivalent length from stop_recording()."""
     module = audio_recorder_module
-    pa1 = _make_pyaudio_instance_with_rate(0, 24000.0)
+    pa1 = _make_pyaudio_instance(0, 24000.0)
     release_event = threading.Event()
     frame = (np.zeros(1024, dtype=np.int16)).tobytes()
     frame_yielded = threading.Event()
@@ -2490,7 +2483,7 @@ def test_stop_recording_16000_noop_bit_identical(audio_recorder_module):
     """Issue #55: a 16 kHz capture must return the same sample count and
     bit-identical values (resample skipped entirely, no interpolation)."""
     module = audio_recorder_module
-    pa1 = _make_pyaudio_instance_with_rate(0, 16000.0)
+    pa1 = _make_pyaudio_instance(0, 16000.0)
     release_event = threading.Event()
     # A non-trivial pattern so bit-identity is meaningful.
     pattern = np.linspace(-1.0, 1.0, 1024, dtype=np.int16)

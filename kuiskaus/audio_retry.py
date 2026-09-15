@@ -155,11 +155,20 @@ def attempt_open_once(
     # key is missing, zero, or the call raises (coreaudiod storm).
     effective_rate = sample_rate
     try:
-        _rate_val = pa.get_default_input_device_info()["defaultSampleRate"]
-        if _rate_val is not None and _rate_val > 0:
-            effective_rate = int(_rate_val)
-    except (OSError, KeyError, TypeError, ValueError):
-        pass
+        native_rate = pa.get_default_input_device_info()["defaultSampleRate"]
+        if native_rate is not None and native_rate > 0:
+            effective_rate = int(native_rate)
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ) as rate_query_error:
+        print(
+            f"Native rate query failed ({rate_query_error!r}); "
+            f"falling back to {sample_rate}"
+        )
 
     try:
         stream = pa.open(
