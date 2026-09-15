@@ -60,13 +60,10 @@ class TextInserter:
         # session: once trust is revoked it stays revoked until restart,
         # and the check itself can prompt the TCC dialog.
         self._ax_trusted: bool | None = None
-        # Monotonic latch (issue #51 lens round-2): set only on
-        # osascript-fallback success via _mark_cgevent_broken(); never
-        # reset for the session. Once CGEventPost has failed this
-        # session, per-char CGEvent attempts are doomed — insert_text_typing
-        # and _simulate_paste read it as a fast-path bypass so future
-        # insertions batch straight to osascript instead of N per-char
-        # subprocess spawns (issue #51 lens PERFORMANCE).
+        # Once CGEventPost has failed this session, per-char CGEvent
+        # attempts are doomed: remember it so future insertions batch
+        # straight to osascript instead of N per-char subprocess spawns
+        # (issue #51 lens PERFORMANCE).
         self._cgevent_broken: bool = False
 
     def insert_text_typing(self, text: str, delay: float = 0.001) -> bool:
@@ -95,9 +92,9 @@ class TextInserter:
                     return False
                 if self._cgevent_broken:
                     # _type_character just fell back to osascript (it
-                    # latched the breakage via _mark_cgevent_broken):
-                    # batch the remaining characters in a single osascript
-                    # call instead of N more per-char subprocess spawns.
+                    # remembered the breakage): batch the remaining
+                    # characters in a single osascript call instead of
+                    # N more per-char subprocess spawns.
                     remaining = text[i + 1 :]
                     if remaining:
                         return self._fallback_keystroke_batch(remaining)
@@ -184,30 +181,38 @@ class TextInserter:
         # Key code for 'v' is 9
         v_key = 9
 
+        def _fallback(step: str) -> bool:
+            ok = self._fallback_cmd_v(step)
+            # CGEvent broke and the osascript fallback worked: remember
+            # it so the next paste skips doomed CGEvent attempts.
+            if ok:
+                self._cgevent_broken = True
+            return ok
+
         # Press Cmd key
         cmd_down = Quartz.CGEventCreateKeyboardEvent(
             None, 0x37, True
         )  # 0x37 is Command key
         Quartz.CGEventSetFlags(cmd_down, Quartz.kCGEventFlagMaskCommand)
         if not Quartz.CGEventPost(Quartz.kCGSessionEventTap, cmd_down):
-            return self._fallback_cmd_v("Cmd down")
+            return _fallback("Cmd down")
 
         # Press 'v' with Cmd held
         v_down = Quartz.CGEventCreateKeyboardEvent(None, v_key, True)
         Quartz.CGEventSetFlags(v_down, Quartz.kCGEventFlagMaskCommand)
         if not Quartz.CGEventPost(Quartz.kCGSessionEventTap, v_down):
-            return self._fallback_cmd_v("V down")
+            return _fallback("V down")
 
         # Release 'v'
         v_up = Quartz.CGEventCreateKeyboardEvent(None, v_key, False)
         Quartz.CGEventSetFlags(v_up, Quartz.kCGEventFlagMaskCommand)
         if not Quartz.CGEventPost(Quartz.kCGSessionEventTap, v_up):
-            return self._fallback_cmd_v("V up")
+            return _fallback("V up")
 
         # Release Cmd
         cmd_up = Quartz.CGEventCreateKeyboardEvent(None, 0x37, False)
         if not Quartz.CGEventPost(Quartz.kCGSessionEventTap, cmd_up):
-            return self._fallback_cmd_v("Cmd up")
+            return _fallback("Cmd up")
         return True
 
     def _fallback_keystroke_batch(self, text: str) -> bool:
@@ -229,13 +234,13 @@ class TextInserter:
 
         osascript is Apple-signed with a stable TCC identity, so its
         automation grant survives uv-Python path/signature churn that
-        breaks CGEventPost on macOS 26 (issue #51). On success, latch
+        breaks CGEventPost on macOS 26 (issue #51). On success, remember
         that CGEvent is broken this session so the next insertion can
         batch straight to osascript (issue #51 lens PERFORMANCE).
         """
         ok, err = self._osascript_keystroke(char)
         if ok:
-            self._mark_cgevent_broken()
+            self._cgevent_broken = True
             return True
         self.last_error = (
             f"CGEventPost failed ({cgevent_step}) AND osascript keystroke failed: {err}"
@@ -245,41 +250,25 @@ class TextInserter:
     def _fallback_cmd_v(self, cgevent_step: str) -> bool:
         """Fall back to osascript Cmd+V when CGEventPost(cgevent_step)
         failed. The pasteboard was already populated by the caller, so
-        this only needs to trigger the paste keystroke. On success,
-        latch that CGEvent is broken this session — symmetric with
-        _fallback_keystroke — so the next paste bypasses the doomed
-        CGEventPost attempts (issue #51 lens round-2)."""
+        this only needs to trigger the paste keystroke."""
         ok, err = self._osascript_cmd_v()
         if ok:
-            self._mark_cgevent_broken()
             return True
         self.last_error = (
             f"CGEventPost failed ({cgevent_step}) AND osascript Cmd+V failed: {err}"
         )
         return False
 
-    def _mark_cgevent_broken(self) -> None:
-        """Single-writer for the _cgevent_broken monotonic latch
-        (issue #51 lens round-2). See the field's docstring in
-        __init__ for the invariant."""
-        self._cgevent_broken = True
-
     @staticmethod
-    def _build_keystroke_script(text: str) -> str:
-        """Build the AppleScript keystroke script for text (issue #51
-        lens round-2 SIMPLICITY: extracted so the security test can
-        assert on the real code, not a local copy).
+    def _osascript_keystroke(text: str) -> tuple[bool, str]:
+        """Type text via osascript keystroke. Returns (ok, error).
 
         Escapes backslash first, then double-quote (order matters) for
         the AppleScript string literal.
         """
         escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-        return f'tell application "System Events" to keystroke "{escaped}"'
-
-    @classmethod
-    def _osascript_keystroke(cls, text: str) -> tuple[bool, str]:
-        """Type text via osascript keystroke. Returns (ok, error)."""
-        return _run_osascript(cls._build_keystroke_script(text))
+        script = f'tell application "System Events" to keystroke "{escaped}"'
+        return _run_osascript(script)
 
     @staticmethod
     def _osascript_cmd_v() -> tuple[bool, str]:
