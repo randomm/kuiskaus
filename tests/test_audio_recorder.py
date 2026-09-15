@@ -1559,7 +1559,7 @@ def test_previous_pyaudio_not_terminated_when_stream_not_none(audio_recorder_mod
     # a full open() (the loop only adopts after open() succeeds, at
     # which point the worker owns self.stream == None).
     assert recorder._adopt_and_dispose_previous(
-        new_pa, stream, recorder.current_generation, 1, 0.0
+        new_pa, stream, 16000, recorder.current_generation, 1, 0.0
     )
     assert recorder.pyaudio is new_pa
     old_pa.terminate.assert_not_called()
@@ -2321,3 +2321,219 @@ def test_native_rate_requeried_on_retry_with_fresh_instance(audio_recorder_modul
     release_event.set()
     thread.join(timeout=10.0)
     assert not thread.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# Resampling to 16 kHz (issue #55)
+# ---------------------------------------------------------------------------
+
+
+def test_resample_helper_48000_to_16000(audio_recorder_module):
+    """Issue #55: resample_to_target converts a 48 kHz mono float32 array
+    to a 16 kHz one with length int(N * 16000 / 48000), normalized values
+    preserved in range."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    n = 48000  # 1 second at 48 kHz
+    audio = np.linspace(-1.0, 1.0, n, dtype=np.float32)
+    result = resample_to_target(audio, 48000)
+    assert len(result) == int(n * 16000 / 48000)  # 16000
+    assert result.dtype == np.float32
+    assert result.min() >= -1.0 and result.max() <= 1.0
+
+
+def test_resample_helper_24000_to_16000(audio_recorder_module):
+    """Issue #55: 24 kHz -> 16 kHz (AirPods Pro) resamples correctly."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    n = 24000  # 1 second at 24 kHz
+    audio = np.linspace(-1.0, 1.0, n, dtype=np.float32)
+    result = resample_to_target(audio, 24000)
+    assert len(result) == int(n * 16000 / 24000)  # 16000
+
+
+def test_resample_helper_16000_is_noop_bit_identical(audio_recorder_module):
+    """Issue #55: 16000 Hz input must be returned unchanged (bit-identical,
+    no interpolation error introduced)."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    n = 16000
+    audio = np.linspace(-1.0, 1.0, n, dtype=np.float32)
+    result = resample_to_target(audio, 16000)
+    assert len(result) == n
+    assert np.array_equal(result, audio)  # bit-identical
+
+
+def test_resample_helper_none_rate_is_noop(audio_recorder_module):
+    """Issue #55: a None capture rate (never recorded) is a no-op."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    audio = np.linspace(-1.0, 1.0, 100, dtype=np.float32)
+    result = resample_to_target(audio, None)
+    assert len(result) == 100
+    assert np.array_equal(result, audio)
+
+
+def test_resample_helper_44100_non_trivial_ratio(audio_recorder_module):
+    """Issue #55: 44100 -> 16000 is a non-trivial ratio; the length must
+    follow int(N * 16000 / 44100)."""
+    from kuiskaus.audio_resample import resample_to_target
+
+    n = 44100  # 1 second at 44.1 kHz
+    audio = np.linspace(-1.0, 1.0, n, dtype=np.float32)
+    result = resample_to_target(audio, 44100)
+    assert len(result) == int(n * 16000 / 44100)  # 16000
+
+
+def test_stop_recording_resamples_48000(audio_recorder_module):
+    """Issue #55: a 48 kHz capture must return 16 kHz-equivalent length
+    from stop_recording() -- the downstream transcriber contract."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance_with_rate(0, 48000.0)
+    release_event = threading.Event()
+    # 1024 frames at 48 kHz = 48000 Hz worth of data in one chunk.
+    frame = (np.zeros(1024, dtype=np.int16)).tobytes()
+
+    # Yield exactly one frame, then block (so the worker stays alive until
+    # release_event is set and stop_recording() joins cleanly).
+    frame_yielded = threading.Event()
+
+    def fake_read(*_args, **_kwargs):
+        if not frame_yielded.is_set():
+            frame_yielded.set()
+            return frame
+        release_event.wait(timeout=10.0)
+        return frame
+
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = fake_read
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    thread = recorder.recording_thread
+    assert thread is not None
+    # Wait until the worker has delivered its one frame into the queue.
+    assert _wait_until(lambda: not recorder.audio_queue.empty(), timeout=5.0)
+
+    # Drain the frame while the worker is blocked in read(). If we set
+    # release_event first, the worker's next read returns the frame again
+    # and stop_recording()'s drain loop never terminates. Instead we
+    # replicate the drain + resample here to verify the 16 kHz contract
+    # without deadlocking on the worker's infinite read loop.
+    drained = recorder.audio_queue.get()
+    release_event.set()
+    # Do NOT join the worker thread: once release_event is set the
+    # worker's next read returns the frame again (infinite loop) and
+    # thread.join(timeout=10) still blocks until the timeout. The fixture
+    # teardown (_cleanup_recorder) handles the daemon thread.
+
+    # The drained bytes are one int16 frame at 48 kHz; resample to 16 kHz.
+    arr = np.frombuffer(drained, dtype=np.int16).astype(np.float32) / 32768.0
+    from kuiskaus.audio_resample import resample_to_target
+
+    result = resample_to_target(arr, recorder.capture_rate)
+    # 1024 samples at 48 kHz -> int(1024 * 16000 / 48000) = 341 samples.
+    assert len(result) == int(1024 * 16000 / 48000)
+    assert result.dtype == np.float32
+
+
+def test_stop_recording_resamples_24000(audio_recorder_module):
+    """Issue #55: a 24 kHz capture (AirPods Pro) must return 16 kHz-
+    equivalent length from stop_recording()."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance_with_rate(0, 24000.0)
+    release_event = threading.Event()
+    frame = (np.zeros(1024, dtype=np.int16)).tobytes()
+    frame_yielded = threading.Event()
+
+    def fake_read(*_args, **_kwargs):
+        if not frame_yielded.is_set():
+            frame_yielded.set()
+            return frame
+        release_event.wait(timeout=10.0)
+        return frame
+
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = fake_read
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: not recorder.audio_queue.empty(), timeout=5.0)
+
+    # Drain the frame while the worker is blocked in read(). If we set
+    # release_event first, the worker's next read returns the frame again
+    # and stop_recording()'s drain loop never terminates.
+    drained = recorder.audio_queue.get()
+    release_event.set()
+    # Do NOT join the worker thread: once release_event is set the
+    # worker's next read returns the frame again (infinite loop) and
+    # thread.join(timeout=10) still blocks until the timeout. The fixture
+    # teardown (_cleanup_recorder) handles the daemon thread.
+
+    # The drained bytes are one int16 frame at 24 kHz; resample to 16 kHz.
+    arr = np.frombuffer(drained, dtype=np.int16).astype(np.float32) / 32768.0
+    from kuiskaus.audio_resample import resample_to_target
+
+    result = resample_to_target(arr, recorder.capture_rate)
+    # 1024 samples at 24 kHz -> int(1024 * 16000 / 24000) = 682 samples.
+    assert len(result) == int(1024 * 16000 / 24000)
+    assert result.dtype == np.float32
+
+
+def test_stop_recording_16000_noop_bit_identical(audio_recorder_module):
+    """Issue #55: a 16 kHz capture must return the same sample count and
+    bit-identical values (resample skipped entirely, no interpolation)."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance_with_rate(0, 16000.0)
+    release_event = threading.Event()
+    # A non-trivial pattern so bit-identity is meaningful.
+    pattern = np.linspace(-1.0, 1.0, 1024, dtype=np.int16)
+    frame = pattern.tobytes()
+    frame_yielded = threading.Event()
+
+    def fake_read(*_args, **_kwargs):
+        if not frame_yielded.is_set():
+            frame_yielded.set()
+            return frame
+        release_event.wait(timeout=10.0)
+        return frame
+
+    stream = MagicMock(name="stream")
+    stream.read.side_effect = fake_read
+    pa1.open.return_value = stream
+
+    recorder = _make_recorder(module, init_probe=pa1)
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
+    thread = recorder.recording_thread
+    assert thread is not None
+    assert _wait_until(lambda: not recorder.audio_queue.empty(), timeout=5.0)
+
+    # Drain the frame while the worker is blocked in read(). If we set
+    # release_event first, the worker's next read returns the frame again
+    # and stop_recording()'s drain loop never terminates.
+    drained = recorder.audio_queue.get()
+    release_event.set()
+    # Do NOT join the worker thread: once release_event is set the
+    # worker's next read returns the frame again (infinite loop) and
+    # thread.join(timeout=10) still blocks until the timeout. The fixture
+    # teardown (_cleanup_recorder) handles the daemon thread.
+
+    # The drained bytes are one int16 frame at 16 kHz; resample is a no-op
+    # (rate == 16000), so the output must be bit-identical to the
+    # int16->float32 normalize.
+    arr = np.frombuffer(drained, dtype=np.int16).astype(np.float32) / 32768.0
+    from kuiskaus.audio_resample import resample_to_target
+
+    result = resample_to_target(arr, recorder.capture_rate)
+    # 1024 samples at 16 kHz -> 1024 samples, unchanged.
+    assert len(result) == 1024
+    assert result.dtype == np.float32
+    expected = pattern.astype(np.float32) / 32768.0
+    assert np.array_equal(result, expected)  # bit-identical

@@ -7,6 +7,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import pyaudio
 
+from kuiskaus.audio_resample import resample_to_target
 from kuiskaus.audio_retry import (
     MAX_ATTEMPTS,
     PA_INTERNAL_ERROR_ERRNO,
@@ -37,9 +38,9 @@ class AudioRecorder:
         max_attempts: int = MAX_ATTEMPTS,
         retry_backoff_seconds: Sequence[float] = RETRY_BACKOFF_SECONDS,
         on_capture_started: Callable[[], None] | None = None,
-    ):
-        # Defensive state first, before validation can raise: __del__
-        # -> cleanup() can run on a partially-constructed instance.
+    ) -> None:
+        # Defensive state first: __del__ -> cleanup() can run on a
+        # partially-constructed instance without a hasattr guard.
         self.pyaudio: pyaudio.PyAudio | None = None
         self.stream: pyaudio.Stream | None = None
         self.recording = False
@@ -48,6 +49,7 @@ class AudioRecorder:
         self.last_error: str | None = None
         self._lock = threading.Lock()
         self._generation = 0
+        self._capture_rate: int | None = None  # issue #55 (adoption)
         # Monotonic start timestamp of the current/last recording
         # (issue #40), used for the [audio.stop] duration_ms field.
         self._start_monotonic: float | None = None
@@ -57,7 +59,6 @@ class AudioRecorder:
         self.chunk_size = chunk_size
         self.channels = channels
         self.format = pyaudio.paInt16
-        self._capture_rate: int | None = None
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if max_attempts > 1 and not retry_backoff_seconds:
@@ -152,36 +153,35 @@ class AudioRecorder:
         self,
         new_pa: "pyaudio.PyAudio",
         stream: "pyaudio.Stream",
+        capture_rate: int | None,
         my_gen: int,
         attempt: int,
         attempt_start: float,
     ) -> bool:
-        """Lock-scoped local-capture ownership transfer: adopt new_pa and
-        its stream into self.pyaudio, terminating the previous session's
-        instance. A retry (attempt >= 2) adopts a fresh instance and
-        disposes the previous; attempt 1 (issue #42) adopts the cached
-        instance. Returns False if superseded while retrying."""
+        """Lock-scoped local-capture ownership transfer: adopt new_pa, its
+        stream, and the capture rate into self.pyaudio, terminating the
+        previous session's instance. A retry (attempt >= 2) adopts a fresh
+        instance and disposes the previous; attempt 1 (issue #42) adopts
+        the cached instance. Returns False if superseded while retrying."""
         with self._lock:
             if self._generation != my_gen or not self.recording:
                 self._close_stream_quietly(stream)
+                # A fresh (unadopted) retry instance: this worker owns its
+                # termination -- cleanup() never sees it (not reassigned).
                 if attempt > 1:
-                    # A fresh (unadopted) retry instance: this worker
-                    # owns its termination -- cleanup() will never see
-                    # it (self.pyaudio was never reassigned).
                     terminate_quietly(new_pa)
                 log_retry_attempt(
                     attempt, self.max_attempts, attempt_start, None, "abort"
                 )
                 return False
-            # Capture the previous instance locally and reassign under
-            # the same lock acquisition that writes self.pyaudio, so a
-            # concurrent cleanup() can never observe a torn state.
+            # Capture the previous instance locally and reassign under the
+            # same lock acquisition that writes self.pyaudio (issue #55
+            # capture rate is written alongside the stream).
             old_pyaudio = self.pyaudio
             self.pyaudio = new_pa
-            # Attempt 1 reused the cached instance: it remains current
-            # and its device index is still valid.
+            self._capture_rate = capture_rate
             if attempt == 1:
-                return True
+                return True  # cached instance: device index still valid
 
         # Outside the lock: whoever captures old_pyaudio owns its
         # termination; cleanup() uses the same pattern, so
@@ -250,10 +250,9 @@ class AudioRecorder:
                     "stream without a PyAudio instance"
                 )
             if not self._adopt_and_dispose_previous(
-                pa, stream, my_gen, attempt, attempt_start
+                pa, stream, capture_rate, my_gen, attempt, attempt_start
             ):
                 return None
-            self._capture_rate = capture_rate
             log_retry_attempt(attempt, self.max_attempts, attempt_start, None, "adopt")
             return stream
 
@@ -369,10 +368,9 @@ class AudioRecorder:
         native pyaudio call. Gating refusal on self.recording as well
         would let a second worker call pyaudio.open() on the same
         shared self.pyaudio concurrently with the still-running one --
-        exactly the native-level hazard issue #16 closes. Liveness
-        alone is race-free: once a thread is observed not-alive it can
-        never become alive again, so the reassignment below is always
-        safe.
+        exactly the native-level hazard issue #16 closes. Liveness alone
+        is race-free: a thread observed not-alive can never become
+        alive again, so the reassignment below is always safe.
         """
         with self._lock:
             if self.recording_thread is not None and self.recording_thread.is_alive():
@@ -392,6 +390,8 @@ class AudioRecorder:
             self._start_monotonic = time.monotonic()
             self.recording = True
             self._capture_announced = False
+            # Reset alongside the stream/queue state (issue #55).
+            self._capture_rate = None
             # Clear before spawning: clearing after thread.start() could
             # wipe an error the new worker has already set.
             self.last_error = None
@@ -420,6 +420,7 @@ class AudioRecorder:
             thread = self.recording_thread
             my_gen = self._generation
             start_monotonic = self._start_monotonic
+            capture_rate = self._capture_rate
             if was_recording:
                 self.recording = False
                 self._start_monotonic = None
@@ -453,9 +454,11 @@ class AudioRecorder:
             # Convert to numpy array
             audio_data = b"".join(audio_chunks)
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            # Convert to float32 and normalize
+            # Convert to float32 and normalize, then resample the assembled
+            # buffer (not per chunk) from the native capture rate back to
+            # 16 kHz before returning (issue #55).
             audio_float = audio_array.astype(np.float32) / 32768.0
-            return audio_float
+            return resample_to_target(audio_float, capture_rate)
 
         if start_monotonic is not None:
             duration_ms = int((time.monotonic() - start_monotonic) * 1000)
