@@ -97,6 +97,62 @@ def app(monkeypatch: pytest.MonkeyPatch):
     return instance
 
 
+class TestSingleAudioRecorderConstruction:
+    """Issue #54: KuiskausApp.__init__ constructs AudioRecorder exactly once,
+    wired with on_capture_started from the start, BEFORE the transcriber —
+    no probe/cleanup/reconstruct dance."""
+
+    def test_recorder_constructed_once_with_callback_before_transcriber(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """AudioRecorder is called exactly once with on_capture_started
+        wired, and is constructed before the transcriber (issue #54).
+        No cleanup() is called during __init__."""
+        _install_stubs(monkeypatch)
+        import kuiskaus.app as app_module
+        from kuiskaus.app import KuiskausApp
+
+        call_order: list[str] = []
+
+        class _TranscriberStub:
+            """Minimal Transcriber protocol stub (only constructibility matters)."""
+
+            def transcribe(self, audio, **kwargs):
+                return {"text": ""}
+
+            def cleanup(self):
+                pass
+
+        mock_recorder_instance = MagicMock()
+        recorder_cls = MagicMock(return_value=mock_recorder_instance)
+        recorder_cls.side_effect = lambda *args, **kwargs: (
+            call_order.append("recorder"),
+            mock_recorder_instance,
+        )[1]
+
+        with (
+            patch.object(app_module, "AudioRecorder", recorder_cls),
+            patch.object(
+                app_module,
+                "ParakeetTranscriber",
+                side_effect=lambda: (
+                    call_order.append("transcriber"),
+                    _TranscriberStub(),
+                )[1],
+            ),
+            patch.object(app_module, "TextInserter"),
+            patch.object(app_module, "HotkeyListener"),
+        ):
+            app = KuiskausApp()
+
+        # Exactly one construction, with on_capture_started wired.
+        recorder_cls.assert_called_once_with(on_capture_started=app._on_capture_started)
+        # No cleanup() called during __init__.
+        mock_recorder_instance.cleanup.assert_not_called()
+        # Recorder was constructed before the transcriber.
+        assert call_order == ["recorder", "transcriber"]
+
+
 class TestCLICgeventListenerSwap:
     """CLI must use the CGEventTap-based listener with the correct
     lifecycle order (issue #39): start() → run_loop() → stop()."""

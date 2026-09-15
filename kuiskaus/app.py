@@ -44,8 +44,10 @@ class KuiskausApp:
         """
         print("Initializing Kuiskaus...")
 
-        # Initialize components
-        self.audio_recorder = AudioRecorder()
+        # Initialize components (issue #54: single construction, before
+        # the transcriber — matching menubar.py's ordering; the callback
+        # only needs self.is_recording, which is safe to wire here).
+        self.audio_recorder = AudioRecorder(on_capture_started=self._on_capture_started)
         if model_name == "parakeet":
             self.transcriber: Transcriber = ParakeetTranscriber()
         elif model_name == "voxtral":
@@ -69,12 +71,6 @@ class KuiskausApp:
         # Stats
         self.total_transcriptions = 0
         self.total_recording_time = 0.0
-
-        # Re-open the recorder so capture-start announcements (#43) land
-        # after all components are initialised, then replace the probe
-        # instance with a callback-connected one.
-        self.audio_recorder.cleanup()
-        self.audio_recorder = AudioRecorder(on_capture_started=self._on_capture_started)
 
         # Initialize hotkey listener with callbacks
         self.hotkey_listener = HotkeyListener(
