@@ -9,11 +9,11 @@ from AppKit import NSPasteboard, NSPasteboardTypeString
 # System Events/TCC), so the timeout must comfortably exceed that.
 _OSASCRIPT_TIMEOUT_S = 15
 
-# TCC hint messages. AXIsProcessTrusted is a hint, NOT a detector: on
-# macOS 26 Tahoe with ad-hoc/uv-Python identities it can return True
-# while CGEventPost still fails, so the "trusted" message recommends
-# checking Input Injection specifically instead of assuming the grants
-# are fine.
+# TCC hint messages. AXIsProcessTrusted is a hint, not a detector: on
+# macOS 26 Tahoe, osascript keystrokes can fail even when the process is
+# marked trusted, because Input Injection and Accessibility are tracked
+# separately — so the trusted-case message steers the user to check
+# both grants rather than assume the grants are fine.
 _TCC_REVOKED_MESSAGE = (
     "Accessibility permission revoked — re-grant in System Settings > "
     "Privacy & Security > Accessibility (then restart the app)"
@@ -22,7 +22,7 @@ _TCC_TAHOE_MESSAGE = (
     "Text insertion failed — verify Input Injection AND Accessibility "
     "grants (macOS 26 tracks these separately in System Settings > "
     "Privacy & Security). If both are granted, this may be a Tahoe "
-    "silent-drop bug (issue TBD for verification-based detection)."
+    "silent-drop bug."
 )
 
 
@@ -65,19 +65,18 @@ class TextInserter:
         # and the check itself can prompt the TCC dialog.
         self._ax_trusted: bool | None = None
 
-    def insert_text_typing(self, text: str, delay: float = 0.001) -> bool:
+    def insert_text_typing(self, text: str) -> bool:
         """
         Insert text by simulating keyboard typing
 
-        Posts CGEvents for each character (their return value is void —
-        issue #58) AND types the whole string in exactly one osascript
-        call. osascript is the reliable path: on macOS 26 Tahoe,
-        ad-hoc/uv-Python CGEventPost is silently dropped, while
-        osascript (Apple-signed, stable TCC identity) is not.
+        Types the whole string in exactly one osascript keystroke call.
+        osascript is the sole insertion path (issue #58 removed the
+        CGEventPost path — PyObjC's CGEventPost is void, so its failure
+        cannot even be detected), and on macOS 26 Tahoe it is the
+        reliable one.
 
         Args:
             text: Text to insert
-            delay: Delay before typing (seconds)
 
         Returns:
             False if the osascript keystroke failed (see last_error),
@@ -146,9 +145,8 @@ class TextInserter:
             return True
 
     def _simulate_paste(self) -> bool:
-        """Simulate Cmd+V via a single osascript call (issue #58: the
-        4 per-post CGEventPost checks are void and were dead). Returns
-        False if the osascript Cmd+V failed (see last_error)."""
+        """Simulate Cmd+V via a single osascript call. Returns False if
+        the osascript Cmd+V failed (see last_error)."""
         ok, err = self._osascript_cmd_v()
         if ok:
             return True

@@ -1,14 +1,12 @@
 """Hardware-free unit tests for TextInserter (issue #41, reworked for
 #58).
 
-Quartz and AppKit are stubbed in sys.modules before the real
-kuiskaus.text_inserter module is imported, mirroring tests/test_app.py's
-_FakeAppKit pattern (text_inserter imports BOTH AppKit and Quartz at
-module scope). CGEventPost is a MagicMock returning None by default —
-matching real PyObjC, which declares CGEventPost void — so every test
-exercises the real shape where the return value is discarded (issue
-#58). osascript is the sole success path: exactly one osascript call per
-insertion.
+AppKit is stubbed in sys.modules before the real kuiskaus.text_inserter
+module is imported, mirroring tests/test_app.py's _FakeAppKit pattern.
+osascript is the sole insertion path: exactly one osascript call per
+insertion (issue #58 removed the CGEventPost path — PyObjC declares
+CGEventPost void — and osascript is the reliable one on macOS 26
+Tahoe).
 """
 
 import importlib
@@ -41,6 +39,11 @@ class _FakeAppKit(ModuleType):
 
 
 class _FakeQuartz(ModuleType):
+    """Quartz stub kept so the quartz fixture can install it into
+    sys.modules. kuiskaus.text_inserter no longer imports Quartz (issue
+    #58 removed the CGEventPost path) — this is a vestige of the earlier
+    CGEventPost-era stubs and is installed for fixture parity only."""
+
     CGEventCreateKeyboardEvent: MagicMock
     CGEventKeyboardSetUnicodeString: MagicMock
     CGEventSetFlags: MagicMock
@@ -69,8 +72,6 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     quartz.CGEventCreateKeyboardEvent = MagicMock(return_value=MagicMock())
     quartz.CGEventKeyboardSetUnicodeString = MagicMock()
     quartz.CGEventSetFlags = MagicMock()
-    # None by default: matches real PyObjC, where CGEventPost is declared
-    # void (issue #58).
     quartz.CGEventPost = MagicMock(return_value=None)
     quartz.kCGSessionEventTap = "kCGSessionEventTap"
     quartz.kCGEventFlagMaskCommand = 1 << 20
@@ -181,9 +182,8 @@ def test_paste_path_fires_exactly_one_osascript_cmdv_call(
 def test_typing_path_fires_exactly_one_osascript_keystroke_call(
     inserter, quartz, monkeypatch
 ):
-    """Typing path (≤10 chars) with real PyObjC shape: one osascript
-    keystroke call for the WHOLE string (no per-char spawning), CGEvents
-    still posted (2 per char, return value discarded)."""
+    """Typing path (≤10 chars): one osascript keystroke call for the
+    WHOLE string (no per-char spawning)."""
     fake_run = _ok_osascript()
     _patch_subprocess(monkeypatch, fake_run)
 
