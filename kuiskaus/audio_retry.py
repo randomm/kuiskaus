@@ -7,6 +7,7 @@ management and the call sites that invoke terminate_quietly remain in
 audio_recorder.py.
 """
 
+import threading
 import time
 from collections.abc import Callable
 from types import ModuleType
@@ -314,3 +315,26 @@ def refresh_pyaudio_session(
         terminate_quietly(displaced)
 
     return pyaudio_instance, new_idx
+
+
+def close_stream_quietly(stream: "pyaudio.Stream") -> None:
+    """Best-effort stream teardown; close failures must not propagate."""
+    try:
+        stream.stop_stream()
+        stream.close()
+    except OSError as e:
+        print(f"Error closing stream: {e}")
+
+
+# Upper bound on how long a new worker waits for an orphaned predecessor
+# stuck in a native open() (issue #60). CoreAudio opens have been observed
+# blocking ~24 s; past this the new worker proceeds rather than hang forever.
+PREVIOUS_WORKER_WAIT_SECONDS = 30.0
+
+
+def worker_alive(thread: "threading.Thread | None") -> bool:
+    """Lock-free worker-thread liveness predicate (issue #16). The
+    thread attribute is assigned once per generation (not mutated)
+    and is_alive() on a dead thread is idempotent, so this is safe
+    to call outside recorder._lock."""
+    return thread is not None and thread.is_alive()

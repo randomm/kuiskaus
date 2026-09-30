@@ -1116,66 +1116,103 @@ def test_stuck_open_sets_last_error_on_join_timeout(audio_recorder_module, capsy
     assert not thread.is_alive()
 
 
-def test_admission_refuses_orphaned_worker_still_alive_after_stuck_stop(
+def test_press_during_orphaned_slow_open_is_admitted_and_waits_for_it(
     audio_recorder_module,
 ):
-    """A stuck worker that outlives stop_recording()'s join(timeout=...)
-    clears self.recording to False (issue #16 regression review, round 1)
-    but must still block a second worker from calling pyaudio.open() on
-    the same shared self.pyaudio while it is physically still running --
-    otherwise two threads could race into a native open() call
-    concurrently. Liveness of recording_thread, not self.recording, is
-    the correct admission signal for this orphaned-but-alive case."""
+    """A worker that outlives stop_recording()'s join (slow CoreAudio
+    open, issue #60) must not wedge the recorder in 'microphone busy'.
+    The next press is admitted; its worker waits for the orphan to
+    return so two native open() calls never overlap on the shared
+    self.pyaudio, then records normally."""
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
-    never_release = threading.Event()
+    release_open = threading.Event()
+    open_calls: list[str] = []
+    in_flight = 0
+    max_in_flight = 0
+    guard = threading.Lock()
+    read_release = threading.Event()
 
-    def stuck_open(**_kwargs):
-        never_release.wait(timeout=10.0)
-        raise OSError("released late")
+    def slow_then_fast_open(**_kwargs):
+        nonlocal in_flight, max_in_flight
+        with guard:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            first = not open_calls
+            open_calls.append("open")
+        try:
+            if first:
+                release_open.wait(timeout=10.0)
+            return _blocking_stream(OSError("stop the loop"), read_release)
+        finally:
+            with guard:
+                in_flight -= 1
 
-    pa1.open.side_effect = stuck_open
-    pa_retry = _make_pyaudio_instance(1)
-    pa_retry.open.side_effect = OSError("retry fails too")
-
-    # pa1 is the __init__'s cached instance (issue #42); the retry
-    # attempt's fresh instance is pa_retry.
-    recorder = _make_recorder(module, pa_retry, init_probe=pa1)
+    pa1.open.side_effect = slow_then_fast_open
+    recorder = _make_recorder(module, init_probe=pa1)
     assert recorder.start_recording() is True
     stuck_thread = recorder.recording_thread
+    assert _wait_until(lambda: len(open_calls) == 1)
 
-    # stop_recording()'s join(timeout=...) expires; the worker is still
-    # alive, blocked inside pyaudio.open().
-    recorder.stop_recording()
-    assert recorder.recording is False  # release path already cleared this
+    recorder.stop_recording()  # join times out; worker still in open()
+    assert recorder.recording is False
     assert stuck_thread.is_alive()
 
-    # A second press must be refused -- the orphaned worker may still be
-    # about to call pyaudio.open() on self.pyaudio.
-    assert recorder.start_recording() is False
-    assert recorder.recording_thread is stuck_thread
+    # Second press: admitted, on a new worker that must NOT open yet.
+    assert recorder.start_recording() is True
+    new_thread = recorder.recording_thread
+    assert new_thread is not stuck_thread
+    time.sleep(0.2)
+    assert len(open_calls) == 1  # waiting behind the orphan
 
-    # Once the native call finally returns and the worker tears itself
-    # down, admission self-heals without needing a restart.
-    never_release.set()
+    release_open.set()
     stuck_thread.join(timeout=10.0)
     assert not stuck_thread.is_alive()
+    assert _wait_until(lambda: len(open_calls) == 2)
+    assert max_in_flight == 1  # opens never overlapped
+    assert _wait_until(lambda: recorder.stream is not None)
 
-    # Recovery is observable live: start with a blocking read so the new
-    # worker cannot tear itself down before we assert.
-    post_recovery_release = threading.Event()
-    pa1.open.side_effect = None
-    pa1.open.return_value = _blocking_stream(
-        OSError("stop the loop"), post_recovery_release
-    )
+    read_release.set()
+    new_thread.join(timeout=10.0)
+    assert not new_thread.is_alive()
+
+
+def test_press_while_actively_recording_is_still_refused(audio_recorder_module):
+    """Only an orphaned (recording=False) worker is chained behind; a
+    press during a live recording keeps being refused (#16)."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)
+    release = threading.Event()
+    pa1.open.return_value = _blocking_stream(OSError("stop the loop"), release)
+    recorder = _make_recorder(module, init_probe=pa1)
     assert recorder.start_recording() is True
-    post_recovery_thread = recorder.recording_thread
-    assert post_recovery_thread.is_alive()
-    assert post_recovery_thread is not stuck_thread
+    thread = recorder.recording_thread
+    assert recorder.start_recording() is False
+    assert recorder.recording_thread is thread
+    release.set()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive()
 
-    post_recovery_release.set()
-    post_recovery_thread.join(timeout=10.0)
-    assert not post_recovery_thread.is_alive()
+
+def test_refresh_does_not_hold_lock_during_native_calls(audio_recorder_module):
+    """stop_recording() (hotkey release) needs _lock; the device refresh
+    calls native PortAudio and can block for seconds (issue #60), so it
+    must run without holding the lock."""
+    module = audio_recorder_module
+    pa1 = _make_pyaudio_instance(0)
+    recorder = _make_recorder(module, init_probe=pa1)
+    lock_free_during_native_call: list[bool] = []
+
+    def fake_refresh(_module, pa, idx, _find):
+        acquired = recorder._lock.acquire(blocking=False)
+        lock_free_during_native_call.append(acquired)
+        if acquired:
+            recorder._lock.release()
+        return pa, idx
+
+    with mock.patch.object(module, "refresh_pyaudio_session", fake_refresh):
+        recorder._refresh_pyaudio_session()
+    assert lock_free_during_native_call == [True]
 
 
 # ---------------------------------------------------------------------------
