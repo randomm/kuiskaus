@@ -6,14 +6,13 @@ module is imported, mirroring tests/test_app.py's _FakeAppKit pattern.
 osascript is the sole insertion path: exactly one osascript call per
 insertion (issue #58 removed the CGEventPost path — PyObjC declares
 CGEventPost void — and osascript is the reliable one on macOS 26
-Tahoe).
+Tahoe). The production module does not import Quartz.
 """
 
 import importlib
 import subprocess
 import sys
 from types import ModuleType
-from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,26 +37,12 @@ class _FakeAppKit(ModuleType):
     NSRunAlertPanel: MagicMock
 
 
-class _FakeQuartz(ModuleType):
-    """Quartz stub kept so the quartz fixture can install it into
-    sys.modules. kuiskaus.text_inserter no longer imports Quartz (issue
-    #58 removed the CGEventPost path) — this is a vestige of the earlier
-    CGEventPost-era stubs and is installed for fixture parity only."""
-
-    CGEventCreateKeyboardEvent: MagicMock
-    CGEventKeyboardSetUnicodeString: MagicMock
-    CGEventSetFlags: MagicMock
-    CGEventPost: MagicMock
-    kCGSessionEventTap: str
-    kCGEventFlagMaskCommand: int
-
-
 class _FakeApplicationServices(ModuleType):
     AXIsProcessTrusted: MagicMock
 
 
 def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub AppKit and Quartz before importing the real text_inserter."""
+    """Stub AppKit before importing the real text_inserter."""
     appkit = _FakeAppKit("AppKit")
     appkit.NSEvent = MagicMock(name="NSEvent")
     appkit.NSPasteboard = MagicMock(name="NSPasteboard")
@@ -67,15 +52,6 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     appkit.NSApplicationMain = MagicMock(name="NSApplicationMain")
     appkit.NSRunAlertPanel = MagicMock(name="NSRunAlertPanel")
     monkeypatch.setitem(sys.modules, "AppKit", appkit)
-
-    quartz = _FakeQuartz("Quartz")
-    quartz.CGEventCreateKeyboardEvent = MagicMock(return_value=MagicMock())
-    quartz.CGEventKeyboardSetUnicodeString = MagicMock()
-    quartz.CGEventSetFlags = MagicMock()
-    quartz.CGEventPost = MagicMock(return_value=None)
-    quartz.kCGSessionEventTap = "kCGSessionEventTap"
-    quartz.kCGEventFlagMaskCommand = 1 << 20
-    monkeypatch.setitem(sys.modules, "Quartz", quartz)
 
     # ApplicationServices hosts AXIsProcessTrusted; text_inserter imports
     # it locally on the failure path, so the stub must carry the symbol.
@@ -87,7 +63,7 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def inserter(monkeypatch: pytest.MonkeyPatch):
     _install_stubs(monkeypatch)
-    # Re-import the module fresh so it binds THIS test's Quartz stub.
+    # Re-import the module fresh so it binds THIS test's AppKit stub.
     # (sys.modules["kuiskaus.text_inserter"] may hold a prior test's
     # module object whose globals point at a different stub.)
     import kuiskaus.text_inserter as ti
@@ -106,12 +82,6 @@ def inserter(monkeypatch: pytest.MonkeyPatch):
         ),
     )
     return ti.TextInserter()
-
-
-@pytest.fixture
-def quartz(monkeypatch: pytest.MonkeyPatch) -> _FakeQuartz:
-    """The Quartz stub installed in sys.modules for this test."""
-    return cast(_FakeQuartz, sys.modules["Quartz"])
 
 
 @pytest.fixture
@@ -153,9 +123,17 @@ def _ok_osascript() -> MagicMock:
 # --- happy paths (CGEventPost returns None, osascript is the success path) ---
 
 
-def test_insert_text_returns_true_on_success(inserter, quartz, pasteboard):
-    """Paste path with real PyObjC shape: CGEventPost returns None,
-    osascript succeeds, one osascript Cmd+V call, no error."""
+def test_module_does_not_import_quartz():
+    """Guards that the CGEventPost-era Quartz import stayed removed
+    (issue #58: osascript is the sole insertion path)."""
+    import kuiskaus.text_inserter
+
+    assert "Quartz" not in vars(kuiskaus.text_inserter)
+
+
+def test_insert_text_returns_true_on_success(inserter, pasteboard):
+    """Paste path with real PyObjC shape: osascript succeeds, one
+    osascript Cmd+V call, no error."""
     result = inserter.insert_text("hello world")
 
     assert result is True
@@ -163,13 +141,11 @@ def test_insert_text_returns_true_on_success(inserter, quartz, pasteboard):
     assert inserter.insert_lock.locked() is False  # lock released
 
 
-def test_paste_path_fires_exactly_one_osascript_cmdv_call(
-    inserter, quartz, monkeypatch
-):
-    """Core issue #58 reproduction: CGEventPost returns None (real
-    PyObjC), osascript succeeds, insert_text("hello world") (>10 chars →
-    paste path) returns True with EXACTLY ONE subprocess.run call, the
-    Cmd+V keystroke, and last_error stays None."""
+def test_paste_path_fires_exactly_one_osascript_cmdv_call(inserter, monkeypatch):
+    """Core issue #58 reproduction: osascript succeeds, insert_text(
+    "hello world") (>10 chars → paste path) returns True with EXACTLY
+    ONE subprocess.run call, the Cmd+V keystroke, and last_error stays
+    None."""
     fake_run = _ok_osascript()
     _patch_subprocess(monkeypatch, fake_run)
 
@@ -179,9 +155,7 @@ def test_paste_path_fires_exactly_one_osascript_cmdv_call(
     assert inserter.last_error is None
 
 
-def test_typing_path_fires_exactly_one_osascript_keystroke_call(
-    inserter, quartz, monkeypatch
-):
+def test_typing_path_fires_exactly_one_osascript_keystroke_call(inserter, monkeypatch):
     """Typing path (≤10 chars): one osascript keystroke call for the
     WHOLE string (no per-char spawning)."""
     fake_run = _ok_osascript()
@@ -207,16 +181,22 @@ def test_short_text_uses_typing_path(inserter, monkeypatch):
     assert all("command down" not in s for s in _osascript_scripts(fake_run))
 
 
-def test_insert_text_empty_text_returns_true_without_side_effects(inserter, quartz):
-    """Empty text: early return True, nothing typed, no error."""
+def test_insert_text_empty_text_returns_true_without_side_effects(
+    inserter, monkeypatch
+):
+    """Empty text: early return True, nothing typed (no osascript
+    call), no error."""
+    fake_run = _ok_osascript()
+    _patch_subprocess(monkeypatch, fake_run)
+
     result = inserter.insert_text("")
 
     assert result is True
     assert inserter.last_error is None
-    quartz.CGEventPost.assert_not_called()
+    assert fake_run.call_count == 0
 
 
-def test_osascript_keystroke_escapes_special_chars(inserter, quartz, monkeypatch):
+def test_osascript_keystroke_escapes_special_chars(inserter, monkeypatch):
     """Backslash-then-quote escaping of the AppleScript literal for the
     whole string (single osascript call on the typing path)."""
     fake_run = _ok_osascript()
@@ -230,18 +210,21 @@ def test_osascript_keystroke_escapes_special_chars(inserter, quartz, monkeypatch
     assert "\\\\" in script  # backslash escaped
 
 
-def test_osascript_keystroke_script_shape_escapes_shell_injection():
-    """The generated AppleScript literal escapes backslash first, then
-    quote, so a hostile payload cannot break out of the string context
-    (issue #51 lens SECURITY). No subprocess is invoked: build the
-    script the same way _osascript_keystroke does and assert on shape."""
-
-    def build(text: str) -> str:
-        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-        return f'tell application "System Events" to keystroke "{escaped}"'
+def test_osascript_keystroke_script_shape_escapes_shell_injection(
+    inserter, monkeypatch
+):
+    """The real _osascript_keystroke escaping (backslash first, then
+    quote) keeps a hostile payload inside the AppleScript string
+    literal, so it cannot break out and inject a command (issue #51
+    lens SECURITY). Exercises the production code path, not a
+    re-implementation of the escaping."""
+    fake_run = _ok_osascript()
+    _patch_subprocess(monkeypatch, fake_run)
 
     hostile = '")do shell script "rm x"--'
-    script = build(hostile)
+    inserter.insert_text_typing(hostile)
+
+    script = _osascript_scripts(fake_run)[0]
     # Extract the AppleScript string literal (the quoted segment at the
     # END of the script — the first " is the one around "System Events").
     tail = script.split('"System Events" to keystroke "')[1]
@@ -256,9 +239,8 @@ def test_osascript_keystroke_script_shape_escapes_shell_injection():
     # The payload's quotes are all escaped: `do shell script` appears
     # only in escaped form, never as a command.
     assert "do shell script" in script
-    # The hostile payload's closing quote is escaped, so it cannot
-    # terminate the AppleScript string literal and inject a command.
-    assert '\\"' in script
+    # The script ends with the unescaped literal closing quote.
+    assert script.endswith('"')
 
 
 # --- osascript timeout constant (issue #58) ---
@@ -266,7 +248,7 @@ def test_osascript_keystroke_script_shape_escapes_shell_injection():
 
 def test_run_osascript_passes_named_timeout_constant(inserter, monkeypatch):
     """_run_osascript passes _OSASCRIPT_TIMEOUT_S as the timeout kwarg to
-    subprocess.run; the constant is 15."""
+    subprocess.run."""
     import kuiskaus.text_inserter as ti
 
     fake_run = _ok_osascript()
@@ -274,17 +256,21 @@ def test_run_osascript_passes_named_timeout_constant(inserter, monkeypatch):
 
     ti._run_osascript('keystroke "a"')
 
-    assert ti._OSASCRIPT_TIMEOUT_S == 15
+    # Floor sanity check: a System Events cold start was measured at
+    # ~10s (issue #58), so the timeout must stay comfortably above it.
+    assert ti._OSASCRIPT_TIMEOUT_S >= 10
     assert fake_run.call_args.kwargs["timeout"] == ti._OSASCRIPT_TIMEOUT_S
 
 
 def test_run_osascript_timeout_message_derives_from_constant(inserter, monkeypatch):
     """TimeoutExpired message is built from the named constant (shows
-    15, not the old hardcoded "2s")."""
+    the constant's value, not a hardcoded string)."""
     import kuiskaus.text_inserter as ti
 
     fake_run = MagicMock(
-        side_effect=subprocess.TimeoutExpired(cmd=["osascript"], timeout=15)
+        side_effect=subprocess.TimeoutExpired(
+            cmd=["osascript"], timeout=ti._OSASCRIPT_TIMEOUT_S
+        )
     )
     _patch_subprocess(monkeypatch, fake_run)
 
@@ -292,15 +278,13 @@ def test_run_osascript_timeout_message_derives_from_constant(inserter, monkeypat
 
     assert ok is False
     assert "osascript timeout" in err
-    assert "15" in err
+    assert str(ti._OSASCRIPT_TIMEOUT_S) in err
 
 
 # --- failure paths: osascript fails, hint APPENDED (issue #58) ---
 
 
-def test_osascript_failure_returns_false_with_error_and_tcc_hint(
-    inserter, quartz, monkeypatch
-):
+def test_osascript_failure_returns_false_with_error_and_tcc_hint(inserter, monkeypatch):
     """Paste path, osascript non-zero exit: False + last_error contains
     BOTH the underlying osascript error AND the TCC hint (appended, not
     overwritten)."""
@@ -316,9 +300,7 @@ def test_osascript_failure_returns_false_with_error_and_tcc_hint(
     assert "Accessibility permission revoked" in inserter.last_error
 
 
-def test_osascript_1002_denial_records_error_and_tcc_hint(
-    inserter, quartz, monkeypatch
-):
+def test_osascript_1002_denial_records_error_and_tcc_hint(inserter, monkeypatch):
     """osascript exit 2 with '1002: not allowed to send keystrokes':
     False + last_error contains BOTH the underlying error and the TCC
     hint, with the underlying error appearing FIRST (append, not
@@ -339,24 +321,30 @@ def test_osascript_1002_denial_records_error_and_tcc_hint(
 
 def test_osascript_timeout_records_error_and_tcc_hint(inserter, monkeypatch):
     """TimeoutExpired: False + last_error contains BOTH the timeout
-    message (derived from the constant, "15s") AND the TCC hint, with
-    the underlying message first."""
+    message (derived from the constant) AND the TCC hint, with the
+    underlying message first."""
+    import kuiskaus.text_inserter as ti
+
     _patch_subprocess(
         monkeypatch,
-        MagicMock(side_effect=subprocess.TimeoutExpired(cmd=["osascript"], timeout=15)),
+        MagicMock(
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["osascript"], timeout=ti._OSASCRIPT_TIMEOUT_S
+            )
+        ),
     )
 
     result = inserter.insert_text("hello world")
 
     assert result is False
     assert "osascript timeout" in inserter.last_error
-    assert "15" in inserter.last_error
+    assert str(ti._OSASCRIPT_TIMEOUT_S) in inserter.last_error
     assert inserter.last_error.index("osascript timeout") < inserter.last_error.index(
         "Input Injection AND Accessibility"
     )
 
 
-def test_tcc_revoked_hint_appended_on_injection_failure(inserter, quartz, monkeypatch):
+def test_tcc_revoked_hint_appended_on_injection_failure(inserter, monkeypatch):
     """osascript fails AND AXIsProcessTrusted()==False: the revocation
     hint is appended after the underlying error; the AXIsProcessTrusted
     check ran."""
@@ -372,7 +360,7 @@ def test_tcc_revoked_hint_appended_on_injection_failure(inserter, quartz, monkey
     assert app_services.AXIsProcessTrusted.call_count >= 1
 
 
-def test_tahoe_hint_appended_when_axistrusted_true(inserter, quartz, monkeypatch):
+def test_tahoe_hint_appended_when_axistrusted_true(inserter, monkeypatch):
     """osascript fails but AXIsProcessTrusted()==True: Tahoe hint is
     appended after the underlying error."""
     _patch_subprocess(monkeypatch, _failing_osascript("denied"))
@@ -386,7 +374,7 @@ def test_tahoe_hint_appended_when_axistrusted_true(inserter, quartz, monkeypatch
     assert "Input Injection AND Accessibility" in inserter.last_error
 
 
-def test_axistrusted_checked_once_per_session(inserter, quartz, monkeypatch):
+def test_axistrusted_checked_once_per_session(inserter, monkeypatch):
     """Trust is cached after first failure; later failures reuse it."""
     _patch_subprocess(monkeypatch, _failing_osascript("denied"))
     app_services = sys.modules["ApplicationServices"]
@@ -398,7 +386,7 @@ def test_axistrusted_checked_once_per_session(inserter, quartz, monkeypatch):
     assert app_services.AXIsProcessTrusted.call_count == 1
 
 
-def test_last_error_cleared_at_start_of_each_insert_text(inserter, quartz, monkeypatch):
+def test_last_error_cleared_at_start_of_each_insert_text(inserter, monkeypatch):
     """A failure's last_error is cleared at the START of the next call,
     before the new call's own failure message is written."""
     _patch_subprocess(monkeypatch, _failing_osascript("denied"))
@@ -474,8 +462,13 @@ def test_simulate_paste_success_returns_true(inserter, monkeypatch):
 # --- clipboard semantics (unchanged by issue #58) ---
 
 
-def test_insert_text_returns_false_on_pasteboard_failure(inserter, quartz, pasteboard):
-    """NSPasteboard write False: no paste keystrokes, error recorded."""
+def test_insert_text_returns_false_on_pasteboard_failure(
+    inserter, monkeypatch, pasteboard
+):
+    """NSPasteboard write False: no paste keystrokes (no osascript
+    call), error recorded."""
+    fake_run = _ok_osascript()
+    _patch_subprocess(monkeypatch, fake_run)
     pasteboard.setString_forType_.return_value = False
 
     result = inserter.insert_text("hello world")
@@ -484,7 +477,7 @@ def test_insert_text_returns_false_on_pasteboard_failure(inserter, quartz, paste
     assert inserter.last_error is not None
     # The paste simulation (Cmd+V) must NOT run when the clipboard
     # write failed.
-    assert quartz.CGEventPost.call_count == 0
+    assert fake_run.call_count == 0
 
 
 def test_insert_text_paste_failure_leaves_transcribed_text_on_clipboard(
