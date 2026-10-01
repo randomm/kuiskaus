@@ -931,3 +931,48 @@ def test_init_installs_locks_and_transcriber_before_hotkey_listener(
     assert hasattr(app, "_reload_lock")
     assert app._reload_generation == 0
     assert isinstance(app.transcriber, Transcriber)
+
+
+# ---------------------------------------------------------------------------
+# Permissions status item (issue #64)
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_permissions_shows_missing_names(app):
+    app.permissions_item = rumps.MenuItem("Permissions", callback=None)
+    with patch(
+        "kuiskaus.menubar.permissions.missing_permissions",
+        return_value=["Microphone", "Accessibility"],
+    ):
+        app._refresh_permissions(None)
+    assert app.permissions_item.title == (
+        "⚠️ Grant: Microphone, Accessibility (click to open)"
+    )
+
+
+def test_refresh_permissions_all_granted(app):
+    app.permissions_item = rumps.MenuItem("Permissions", callback=None)
+    with patch("kuiskaus.menubar.permissions.missing_permissions", return_value=[]):
+        app._refresh_permissions(None)
+    assert app.permissions_item.title == "✅ Permissions granted"
+
+
+def test_permissions_click_opens_first_missing_pane(app):
+    with (
+        patch(
+            "kuiskaus.menubar.permissions.missing_permissions",
+            return_value=["Input Monitoring", "Accessibility"],
+        ),
+        patch("kuiskaus.menubar.permissions.open_settings") as open_settings,
+    ):
+        app.open_permission_settings(None)
+    open_settings.assert_called_once_with("Input Monitoring")
+
+
+def test_permissions_click_with_nothing_missing_is_noop(app):
+    with (
+        patch("kuiskaus.menubar.permissions.missing_permissions", return_value=[]),
+        patch("kuiskaus.menubar.permissions.open_settings") as open_settings,
+    ):
+        app.open_permission_settings(None)
+    open_settings.assert_not_called()
