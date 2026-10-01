@@ -931,3 +931,18 @@ def test_init_installs_locks_and_transcriber_before_hotkey_listener(
     assert hasattr(app, "_reload_lock")
     assert app._reload_generation == 0
     assert isinstance(app.transcriber, Transcriber)
+
+
+def test_toggle_keep_warm_flips_state_and_tells_recorder(app):
+    item = rumps.MenuItem("Keep mic warm", callback=None)
+    app.keep_warm = False
+
+    app.toggle_keep_warm(item)
+    assert app.keep_warm is True
+    assert item.state == 1
+    app.audio_recorder.set_keep_warm.assert_called_with(True)
+
+    app.toggle_keep_warm(item)
+    assert app.keep_warm is False
+    assert item.state == 0
+    app.audio_recorder.set_keep_warm.assert_called_with(False)

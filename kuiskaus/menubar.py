@@ -126,6 +126,13 @@ class KuiskausMenuBarApp(ModelReloadMixin, rumps.App):
         self.apfel_item.state = False
         self.menu.add(self.apfel_item)
 
+        # Opt-in: keeps the stream open so a slow mic open can't cost
+        # speech (issue #66); macOS shows the mic indicator while on.
+        self.keep_warm = False
+        self.warm_item = rumps.MenuItem("Keep mic warm", callback=self.toggle_keep_warm)
+        self.warm_item.state = False
+        self.menu.add(self.warm_item)
+
         # Hotkey info
         self.menu.add(rumps.MenuItem("Hotkey: ⌃⌥ (Control+Option)", callback=None))
         self.menu.add(rumps.separator)
@@ -193,6 +200,11 @@ class KuiskausMenuBarApp(ModelReloadMixin, rumps.App):
             self.title = "🔇"
             self.update_status("🔴 Disabled")
             print("🔴 Kuiskaus disabled")
+
+    def toggle_keep_warm(self, sender: "rumps.MenuItem") -> None:
+        self.keep_warm = not self.keep_warm
+        sender.state = self.keep_warm
+        self.audio_recorder.set_keep_warm(self.keep_warm)
 
     def toggle_apfel(self, sender: "rumps.MenuItem") -> None:
         """Toggle apfel LLM cleanup"""

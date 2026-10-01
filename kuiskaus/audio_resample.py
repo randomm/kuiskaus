@@ -48,3 +48,9 @@ def resample_to_target(audio: np.ndarray, capture_rate: int | None) -> np.ndarra
     frac = (idx - lo).astype(np.float32)
     result = audio[lo] * (1.0 - frac) + audio[hi] * frac
     return result.astype(np.float32)
+
+
+def assemble_audio(chunks: list[bytes], capture_rate: int | None) -> np.ndarray:
+    """Join int16 PCM chunks into normalised float32 at ``TARGET_RATE``."""
+    samples = np.frombuffer(b"".join(chunks), dtype=np.int16)
+    return resample_to_target(samples.astype(np.float32) / 32768.0, capture_rate)

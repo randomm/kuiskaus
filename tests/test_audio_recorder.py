@@ -2634,3 +2634,120 @@ def test_stop_recording_16000_noop_bit_identical(audio_recorder_module):
     assert result.dtype == np.float32
     expected = pattern.astype(np.float32) / 32768.0
     assert np.array_equal(result, expected)  # bit-identical
+
+
+# ---------------------------------------------------------------------------
+# Keep-mic-warm mode (issue #66)
+# ---------------------------------------------------------------------------
+
+
+def _streaming_stream(release: threading.Event) -> MagicMock:
+    """A stream whose read() returns an endless supply of 1024-frame int16
+    chunks (paced), until ``release`` is set."""
+    chunk = (np.ones(1024, dtype=np.int16) * 1000).tobytes()
+
+    def fake_read(*_args, **_kwargs):
+        if release.wait(timeout=0.002):
+            raise OSError("stream closed by test")
+        return chunk
+
+    stream = MagicMock(name="warm-stream")
+    stream.read.side_effect = fake_read
+    return stream
+
+
+def _warm_recorder(module, stream):
+    pa = _make_pyaudio_instance(0, rate=16000.0)
+    pa.open.return_value = stream
+    recorder = _make_recorder(module, init_probe=pa)
+    recorder.set_keep_warm(True)
+    return recorder, pa
+
+
+def test_warm_press_spawns_no_worker_and_returns_preroll_audio(audio_recorder_module):
+    module = audio_recorder_module
+    release = threading.Event()
+    recorder, pa = _warm_recorder(module, _streaming_stream(release))
+    assert _wait_until(lambda: recorder._warm.ready)
+    assert _wait_until(lambda: len(recorder._warm._ring) > 0)
+    opens_before = pa.open.call_count
+
+    announced = threading.Event()
+    recorder.on_capture_started = announced.set
+    assert recorder.start_recording() is True
+    assert recorder.recording_thread is None  # no per-press worker
+    assert announced.wait(timeout=2.0)
+
+    audio = recorder.stop_recording()
+    assert pa.open.call_count == opens_before  # nothing opened on the press path
+    assert audio.size > 0
+    assert audio.dtype == np.float32
+    assert recorder.recording is False
+    release.set()
+
+
+def test_warm_press_during_live_recording_is_refused(audio_recorder_module):
+    module = audio_recorder_module
+    release = threading.Event()
+    recorder, _pa = _warm_recorder(module, _streaming_stream(release))
+    assert _wait_until(lambda: recorder._warm.ready)
+    assert recorder.start_recording() is True
+    assert recorder.start_recording() is False
+    recorder.stop_recording()
+    release.set()
+
+
+def test_warm_press_before_ready_reports_error_and_next_press_works(
+    audio_recorder_module,
+):
+    module = audio_recorder_module
+    pa = _make_pyaudio_instance(0, rate=16000.0)
+    open_gate = threading.Event()
+    release = threading.Event()
+
+    def slow_open(**_kwargs):
+        open_gate.wait(timeout=10.0)
+        return _streaming_stream(release)
+
+    pa.open.side_effect = slow_open
+    recorder = _make_recorder(module, init_probe=pa)
+    recorder.set_keep_warm(True)
+
+    assert recorder.start_recording() is True  # admitted, never refused
+    audio = recorder.stop_recording()
+    assert audio.size == 0
+    assert recorder.last_error is not None
+    assert "busy" in recorder.last_error.lower()
+
+    open_gate.set()
+    assert _wait_until(lambda: recorder._warm.ready)
+    assert recorder.start_recording() is True
+    assert _wait_until(lambda: recorder.audio_queue.qsize() > 0)
+    assert recorder.stop_recording().size > 0
+    release.set()
+
+
+def test_disabling_keep_warm_stops_the_background_stream(audio_recorder_module):
+    module = audio_recorder_module
+    release = threading.Event()
+    stream = _streaming_stream(release)
+    recorder, _pa = _warm_recorder(module, stream)
+    assert _wait_until(lambda: recorder._warm.ready)
+    warm = recorder._warm
+
+    recorder.set_keep_warm(False)
+    assert recorder._warm is None
+    assert warm.ready is False
+    stream.close.assert_called()
+    release.set()
+
+
+def test_cleanup_stops_warm_stream(audio_recorder_module):
+    module = audio_recorder_module
+    release = threading.Event()
+    stream = _streaming_stream(release)
+    recorder, _pa = _warm_recorder(module, stream)
+    assert _wait_until(lambda: recorder._warm.ready)
+    recorder.cleanup()
+    stream.close.assert_called()
+    release.set()

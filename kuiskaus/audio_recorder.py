@@ -1,4 +1,3 @@
-import math
 import queue
 import threading
 import time
@@ -7,7 +6,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import pyaudio
 
-from kuiskaus.audio_resample import TARGET_RATE, resample_to_target
+from kuiskaus.audio_resample import TARGET_RATE, assemble_audio
 from kuiskaus.audio_retry import (
     MAX_ATTEMPTS,
     PA_INTERNAL_ERROR_ERRNO,
@@ -15,12 +14,18 @@ from kuiskaus.audio_retry import (
     RETRY_BACKOFF_SECONDS,
     attempt_open_once,
     close_stream_quietly,
+    find_default_input_device,
     format_microphone_error,
     log_retry_attempt,
+    log_stop,
+    open_cached_session,
+    open_warm_stream,
     refresh_pyaudio_session,
     terminate_quietly,
+    validate_retry_config,
     worker_alive,
 )
+from kuiskaus.audio_warm import WarmCapture
 
 # Re-exported so `import kuiskaus.audio_recorder` keeps exposing the
 # retry-policy constants (tests and docs reference them here).
@@ -49,6 +54,7 @@ class AudioRecorder:
         self.recording = False
         self.audio_queue: queue.Queue[bytes] = queue.Queue()
         self.recording_thread: threading.Thread | None = None
+        self._warm: WarmCapture | None = None  # issue #66
         self.last_error: str | None = None
         self._lock = threading.Lock()
         self._generation = 0
@@ -60,43 +66,12 @@ class AudioRecorder:
         self.chunk_size = chunk_size
         self.channels = channels
         self.format = pyaudio.paInt16
-        if max_attempts < 1:
-            raise ValueError("max_attempts must be >= 1")
-        if max_attempts > 1 and not retry_backoff_seconds:
-            raise ValueError(
-                "retry_backoff_seconds must be non-empty when "
-                "max_attempts > 1 (pass max_attempts=1 for no retries)"
-            )
-        if any(not math.isfinite(s) or s < 0 for s in retry_backoff_seconds):
-            raise ValueError(
-                "retry_backoff_seconds must contain only finite, non-negative values"
-            )
+        validate_retry_config(max_attempts, retry_backoff_seconds)
         self.max_attempts = max_attempts
         self.retry_backoff_seconds = retry_backoff_seconds
         self._stuck_open_timeout_seconds: float = sum(retry_backoff_seconds) + 0.5
         # Persistent cached PyAudio session (issue #42).
-        try:
-            self.pyaudio = pyaudio.PyAudio()
-        except Exception as construct_error:  # noqa: BLE001 - PyAudio()
-            # construction wraps PortAudio's Pa_Initialize(), whose
-            # failure modes aren't documented as a narrow exception set.
-            self.pyaudio = None
-            print(
-                "Warning: PyAudio construction failed at startup "
-                f"({construct_error}); will retry at first recording."
-            )
-        self.input_device_index: int | None = None
-        if self.pyaudio is not None:
-            try:
-                self.input_device_index = self._find_default_input_device(self.pyaudio)
-            except (OSError, RuntimeError):
-                # Transient (coreaudiod storm at startup) or no device at
-                # all -- the worker's poll + the retry loop re-resolve.
-                self.input_device_index = None
-                print(
-                    "Warning: microphone probe failed at startup; "
-                    "will re-resolve at first recording."
-                )
+        self.pyaudio, self.input_device_index = open_cached_session(pyaudio)
 
     @property
     def current_generation(self) -> int:
@@ -113,19 +88,6 @@ class AudioRecorder:
         """Native rate the stream was opened at (issue #55), or None
         before any open succeeds."""
         return self._capture_rate
-
-    def _find_default_input_device(self, pa: "pyaudio.PyAudio") -> int:
-        """Find the default system microphone for the given PyAudio instance."""
-        try:
-            info = pa.get_default_input_device_info()
-            return info["index"]
-        except (OSError, KeyError, TypeError):
-            # Fallback to first available input device
-            for i in range(pa.get_device_count()):
-                info = pa.get_device_info_by_index(i)
-                if info["maxInputChannels"] > 0:
-                    return i
-            raise RuntimeError("No input device found")
 
     def _check_superseded(
         self, my_gen: int, attempt: int, attempt_start: float
@@ -222,7 +184,7 @@ class AudioRecorder:
                 self.channels,
                 self.sample_rate,
                 self.chunk_size,
-                self._find_default_input_device,
+                find_default_input_device,
                 self.max_attempts,
                 attempt,
                 attempt_start,
@@ -276,10 +238,57 @@ class AudioRecorder:
         with self._lock:
             pa, device_index = self.pyaudio, self.input_device_index
         pa, device_index = refresh_pyaudio_session(
-            pyaudio, pa, device_index, self._find_default_input_device
+            pyaudio, pa, device_index, find_default_input_device
         )
         with self._lock:
             self.pyaudio, self.input_device_index = pa, device_index
+
+    def _announce_capture(self, my_gen: int) -> None:
+        """Fire on_capture_started at most once per start_recording() cycle
+        (issue #43); the generation/recording gate is the staleness defence."""
+        with self._lock:
+            if (
+                self._capture_announced
+                or self._generation != my_gen
+                or not self.recording
+            ):
+                return
+            self._capture_announced = True
+        callback = self.on_capture_started
+        if callback is not None:
+            try:
+                callback()
+            except Exception:  # noqa: BLE001 - callback boundary
+                # A raising callback must not stop the capture thread.
+                print("on_capture_started callback raised")
+
+    def set_keep_warm(self, enabled: bool) -> None:
+        """Keep the input stream open between recordings (issue #66)."""
+        if enabled and self._warm is None:
+            self._warm = WarmCapture(self._open_warm_stream, self.chunk_size)
+            self._warm.start()
+        elif not enabled and self._warm is not None:
+            warm, self._warm = self._warm, None
+            self._capture_rate = warm.capture_rate  # for an in-flight recording
+            warm.stop()
+
+    def _open_warm_stream(self) -> tuple["pyaudio.Stream", int]:
+        """One open for WarmCapture's thread. Never overlaps a per-press
+        worker's native open on the shared PyAudio (issue #16)."""
+        previous = self.recording_thread
+        if previous is not None and previous.is_alive():
+            previous.join(timeout=PREVIOUS_WORKER_WAIT_SECONDS)
+        self._refresh_pyaudio_session()
+        with self._lock:
+            pa, device_index = self.pyaudio, self.input_device_index
+        new_pa, stream, rate = open_warm_stream(
+            pyaudio, pa, device_index, self.format, self.channels,
+            self.sample_rate, self.chunk_size,
+        )  # fmt: skip
+        if new_pa is not pa:
+            with self._lock:
+                self.pyaudio = new_pa
+        return stream, rate
 
     def _recording_worker(
         self, my_gen: int, previous: "threading.Thread | None" = None
@@ -337,23 +346,7 @@ class AudioRecorder:
                 break
             self.audio_queue.put(data)
             if not capture_announced and len(data) > 0:
-                with self._lock:
-                    if (
-                        self._capture_announced
-                        or self._generation != my_gen
-                        or not self.recording
-                    ):
-                        continue
-                    self._capture_announced = True
-                callback = self.on_capture_started
-                if callback is not None:
-                    try:
-                        callback()
-                    except Exception:  # noqa: BLE001 - callback boundary
-                        # A raising callback must not stop the read loop;
-                        # the recording continues.
-                        print("on_capture_started callback raised")
-                        continue
+                self._announce_capture(my_gen)
 
         close_stream_quietly(stream)
 
@@ -373,10 +366,11 @@ class AudioRecorder:
         worker gets the orphan and joins it before opening.
         """
         with self._lock:
+            warm = self._warm
             previous = self.recording_thread
             if not worker_alive(previous):
                 previous = None
-            elif self.recording:
+            if self.recording and (warm is not None or previous is not None):
                 return False
 
             if self.recording:
@@ -399,14 +393,20 @@ class AudioRecorder:
             # wipe an error the new worker has already set.
             self.last_error = None
             self.audio_queue = queue.Queue()  # Clear any old data
-            self.recording_thread = threading.Thread(
-                target=self._recording_worker,
-                args=(my_gen, previous),
-                daemon=True,
-            )
-            thread = self.recording_thread
+            sink = self.audio_queue
+            if warm is None:
+                self.recording_thread = threading.Thread(
+                    target=self._recording_worker,
+                    args=(my_gen, previous),
+                    daemon=True,
+                )
+                thread = self.recording_thread
 
-        thread.start()
+        if warm is not None:
+            # Keep-warm (issue #66): no open, no worker; route the ring.
+            warm.begin(sink, lambda: self._announce_capture(my_gen))
+        else:
+            thread.start()
         return True
 
     def stop_recording(self) -> np.ndarray:
@@ -421,14 +421,15 @@ class AudioRecorder:
             thread = self.recording_thread
             my_gen = self._generation
             start_monotonic = self._start_monotonic
-            capture_rate = self._capture_rate
+            warm = self._warm
+            capture_rate = warm.capture_rate if warm else self._capture_rate
             if was_recording:
                 self.recording = False
                 self._start_monotonic = None
 
         if not was_recording:
             reason = "no-worker" if self.last_error is None else "retry-exhausted"
-            print(f"[audio.stop] chunks=0 duration_ms=0 reason={reason}")
+            log_stop(0, None, reason)
             return np.array([], dtype=np.float32)
 
         stuck_open = False
@@ -447,28 +448,23 @@ class AudioRecorder:
                 )
                 stuck_open = True
 
-        # Collect all audio data
+        if warm is not None:
+            warm.end()
         audio_chunks = []
         while not self.audio_queue.empty():
             audio_chunks.append(self.audio_queue.get())
 
         if audio_chunks:
-            audio_data = b"".join(audio_chunks)
-            audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            # Convert to float32, normalize, then resample the assembled
-            # buffer to 16 kHz (issue #55).
-            audio_float = audio_array.astype(np.float32) / 32768.0
-            return resample_to_target(audio_float, capture_rate)
+            return assemble_audio(audio_chunks, capture_rate)
 
-        if start_monotonic is not None:
-            duration_ms = int((time.monotonic() - start_monotonic) * 1000)
-        else:
-            duration_ms = 0
         reason = "stuck-open" if stuck_open else "race-lost"
-        print(
-            f"[audio.stop] chunks={len(audio_chunks)} "
-            f"duration_ms={duration_ms} reason={reason}"
-        )
+        if warm is not None:
+            # The warm stream was not delivering yet: report it (#66).
+            with self._lock:
+                if self._generation == my_gen:
+                    self.last_error = "microphone busy — recording did not start"
+            reason = "warm-not-ready"
+        log_stop(0, start_monotonic, reason)
         return np.array([], dtype=np.float32)
 
     def cleanup(self) -> None:
@@ -479,6 +475,11 @@ class AudioRecorder:
         """
         if self.recording:
             self.stop_recording()
+
+        warm, self._warm = self._warm, None
+        if warm is not None and not warm.stop():
+            print("Warm capture still active at cleanup; skipping PyAudio.terminate()")
+            return
 
         worker_thread = self.recording_thread
         with self._lock:
