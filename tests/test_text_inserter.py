@@ -1,128 +1,20 @@
-"""Hardware-free unit tests for TextInserter (issue #41, reworked for
-#58).
+"""test_text_inserter tests, part 1 of 2 (issue #70)."""
 
-AppKit is stubbed in sys.modules before the real kuiskaus.text_inserter
-module is imported, mirroring tests/test_app.py's _FakeAppKit pattern.
-osascript is the sole insertion path: exactly one osascript call per
-insertion (issue #58 removed the CGEventPost path — PyObjC declares
-CGEventPost void — and osascript is the reliable one on macOS 26
-Tahoe). The production module does not import Quartz.
-"""
-
-import importlib
 import subprocess
 import sys
-from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-# NSPasteboardTypeString must be a stable sentinel: the real code passes
-# it to setString_forType_ and the tests assert on those calls.
-_PASTEBOARD_TYPE = "public.utf8-plain-text"
-
-
-class _FakeAppKit(ModuleType):
-    """AppKit stub. NSApp et al. are needed because kuiskaus/__init__.py
-    imports hotkey_listener, which pulls in the REAL
-    PyObjCTools.AppHelper and its module-scope `from AppKit import NSApp,
-    ...` — none of these symbols are exercised here, placeholders only."""
-
-    NSEvent: MagicMock
-    NSPasteboard: MagicMock
-    NSPasteboardTypeString: str
-    NSApp: MagicMock
-    NSApplicationDidFinishLaunchingNotification: str
-    NSApplicationMain: MagicMock
-    NSRunAlertPanel: MagicMock
-
-
-class _FakeApplicationServices(ModuleType):
-    AXIsProcessTrusted: MagicMock
-
-
-def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub AppKit before importing the real text_inserter."""
-    appkit = _FakeAppKit("AppKit")
-    appkit.NSEvent = MagicMock(name="NSEvent")
-    appkit.NSPasteboard = MagicMock(name="NSPasteboard")
-    appkit.NSPasteboardTypeString = _PASTEBOARD_TYPE
-    appkit.NSApp = MagicMock(name="NSApp")
-    appkit.NSApplicationDidFinishLaunchingNotification = "didFinishLaunching"
-    appkit.NSApplicationMain = MagicMock(name="NSApplicationMain")
-    appkit.NSRunAlertPanel = MagicMock(name="NSRunAlertPanel")
-    monkeypatch.setitem(sys.modules, "AppKit", appkit)
-
-    # ApplicationServices hosts AXIsProcessTrusted; text_inserter imports
-    # it locally on the failure path, so the stub must carry the symbol.
-    app_services = _FakeApplicationServices("ApplicationServices")
-    app_services.AXIsProcessTrusted = MagicMock(return_value=True)
-    monkeypatch.setitem(sys.modules, "ApplicationServices", app_services)
-
-
-@pytest.fixture
-def inserter(monkeypatch: pytest.MonkeyPatch):
-    _install_stubs(monkeypatch)
-    # Re-import the module fresh so it binds THIS test's AppKit stub.
-    # (sys.modules["kuiskaus.text_inserter"] may hold a prior test's
-    # module object whose globals point at a different stub.)
-    import kuiskaus.text_inserter as ti
-
-    importlib.reload(ti)
-    # Default: subprocess.run is a benign success so the osascript call
-    # (issue #58: the sole insertion path) never shells out in the test
-    # environment. monkeypatch restores the real subprocess.run after
-    # each test; failure tests replace this mock per-test via
-    # _patch_subprocess.
-    monkeypatch.setattr(
-        ti.subprocess,
-        "run",
-        MagicMock(
-            return_value=MagicMock(returncode=0, stderr=""), name="subprocess.run"
-        ),
-    )
-    return ti.TextInserter()
-
-
-@pytest.fixture
-def pasteboard(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
-    """The NSPasteboard stub the current text_inserter module is bound to."""
-    import kuiskaus.text_inserter as ti
-
-    pb = MagicMock(name="pasteboard")
-    ti.NSPasteboard.generalPasteboard.return_value = pb
-    return pb
-
-
-def _set_strings_called(pasteboard: MagicMock) -> list:
-    return [c.args[0] for c in pasteboard.setString_forType_.call_args_list]
-
-
-def _osascript_scripts(fake_run: MagicMock) -> list[str]:
-    """The AppleScript payload passed to osascript for each call."""
-    return [c.args[0][2] for c in fake_run.call_args_list]
-
-
-def _patch_subprocess(monkeypatch: pytest.MonkeyPatch, fake_run: MagicMock) -> None:
-    """Point the bound text_inserter module's subprocess.run at fake_run."""
-    import kuiskaus.text_inserter as ti
-
-    monkeypatch.setattr(ti.subprocess, "run", fake_run)
-
-
-def _failing_osascript(stderr: str = "denied") -> MagicMock:
-    """MagicMock for subprocess.run returning a failed osascript invocation."""
-    return MagicMock(return_value=MagicMock(returncode=1, stderr=stderr))
-
-
-def _ok_osascript() -> MagicMock:
-    """MagicMock for subprocess.run returning a successful osascript run."""
-    return MagicMock(return_value=MagicMock(returncode=0, stderr=""))
+from tests.support_text_inserter import (
+    _failing_osascript,
+    _ok_osascript,
+    _osascript_scripts,
+    _patch_subprocess,
+)
 
 
 # --- happy paths (CGEventPost returns None, osascript is the success path) ---
-
-
 def test_module_does_not_import_quartz():
     """Guards that the CGEventPost-era Quartz import stayed removed
     (issue #58: osascript is the sole insertion path)."""
@@ -244,8 +136,6 @@ def test_osascript_keystroke_script_shape_escapes_shell_injection(
 
 
 # --- osascript timeout constant (issue #58) ---
-
-
 def test_run_osascript_passes_named_timeout_constant(inserter, monkeypatch):
     """_run_osascript passes _OSASCRIPT_TIMEOUT_S as the timeout kwarg to
     subprocess.run."""
@@ -282,8 +172,6 @@ def test_run_osascript_timeout_message_derives_from_constant(inserter, monkeypat
 
 
 # --- failure paths: osascript fails, hint APPENDED (issue #58) ---
-
-
 def test_osascript_failure_returns_false_with_error_and_tcc_hint(inserter, monkeypatch):
     """Paste path, osascript non-zero exit: False + last_error contains
     BOTH the underlying osascript error AND the TCC hint (appended, not
@@ -460,8 +348,6 @@ def test_simulate_paste_success_returns_true(inserter, monkeypatch):
 
 
 # --- clipboard semantics (unchanged by issue #58) ---
-
-
 def test_insert_text_returns_false_on_pasteboard_failure(
     inserter, monkeypatch, pasteboard
 ):
@@ -478,39 +364,3 @@ def test_insert_text_returns_false_on_pasteboard_failure(
     # The paste simulation (Cmd+V) must NOT run when the clipboard
     # write failed.
     assert fake_run.call_count == 0
-
-
-def test_insert_text_paste_failure_leaves_transcribed_text_on_clipboard(
-    inserter, pasteboard
-):
-    """Simulated paste fails: prior clipboard is NOT restored, so the
-    transcribed text stays for a manual Cmd+V."""
-    pasteboard.stringForType_.return_value = "original"
-    with patch.object(inserter, "_simulate_paste", return_value=False):
-        result = inserter.insert_text_paste("transcribed text")
-
-    assert result is False
-    assert inserter.last_error is not None
-    # The only clearContents + setString calls are the initial write of
-    # the transcribed text -- no restore pair for "original".
-    assert _set_strings_called(pasteboard) == ["transcribed text"]
-
-
-def test_insert_text_paste_success_restores_prior_clipboard(inserter, pasteboard):
-    """Happy path: prior clipboard restored after the paste."""
-    pasteboard.stringForType_.return_value = "original"
-
-    result = inserter.insert_text_paste("transcribed text")
-
-    assert result is True
-    assert _set_strings_called(pasteboard) == ["transcribed text", "original"]
-
-
-def test_insert_text_paste_without_prior_content_restores_nothing(inserter, pasteboard):
-    """Empty prior clipboard: no restore write on success."""
-    pasteboard.stringForType_.return_value = None
-
-    result = inserter.insert_text_paste("transcribed text")
-
-    assert result is True
-    assert _set_strings_called(pasteboard) == ["transcribed text"]
