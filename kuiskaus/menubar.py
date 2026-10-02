@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 import numpy as np
 import rumps
 
+from . import permissions
 from .audio_recorder import AudioRecorder
 from .hotkey_listener_cgevent import HotkeyListenerCGEvent
 from .model_reload import ModelReloadMixin
@@ -81,6 +82,10 @@ class KuiskausMenuBarApp(ModelReloadMixin, rumps.App):
         self._pending_capture_started_events: queue.Queue[int] = queue.Queue()
         self._ui_tick_timer = rumps.Timer(self._drain_ui_events, 0.05)
         self._ui_tick_timer.start()
+        # Permission grants can change while running (issue #64).
+        permissions.request_microphone()
+        self._permissions_timer = rumps.Timer(self._refresh_permissions, 5)
+        self._permissions_timer.start()
 
         # Initialize hotkey listener with CGEventTap
         self.hotkey_listener = HotkeyListenerCGEvent(
@@ -103,6 +108,11 @@ class KuiskausMenuBarApp(ModelReloadMixin, rumps.App):
         # Status item (will be updated dynamically)
         self.status_item = rumps.MenuItem("🟢 Ready", callback=None)
         self.menu.add(self.status_item)
+        self.permissions_item = rumps.MenuItem(
+            "Permissions", callback=permissions.open_first_missing
+        )
+        self.menu.add(self.permissions_item)
+        self._refresh_permissions(None)
         self.menu.add(rumps.separator)
 
         # Enable/Disable toggle
@@ -139,6 +149,9 @@ class KuiskausMenuBarApp(ModelReloadMixin, rumps.App):
 
         # Quit
         self.menu.add(rumps.MenuItem("Quit", callback=self.quit_app))
+
+    def _refresh_permissions(self, _sender) -> None:
+        self.permissions_item.title = permissions.status_title()
 
     def start_hotkey_listener(self):
         """Start the hotkey listener in a background thread"""
