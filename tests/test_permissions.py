@@ -78,3 +78,39 @@ def test_request_microphone_prompts_only_when_undetermined():
     with p_av as av, p_q, p_ax:
         permissions.request_microphone()
     av.AVCaptureDevice.requestAccessForMediaType_completionHandler_.assert_not_called()
+
+
+def test_status_title_lists_missing_names():
+    with patch.object(
+        permissions, "missing_permissions", return_value=["Microphone", "Accessibility"]
+    ):
+        assert permissions.status_title() == (
+            "⚠️ Grant: Microphone, Accessibility (click to open)"
+        )
+
+
+def test_status_title_all_granted():
+    with patch.object(permissions, "missing_permissions", return_value=[]):
+        assert permissions.status_title() == "✅ Permissions granted"
+
+
+def test_click_opens_first_missing_pane():
+    with (
+        patch.object(
+            permissions,
+            "missing_permissions",
+            return_value=["Input Monitoring", "Accessibility"],
+        ),
+        patch.object(permissions, "open_settings") as open_settings,
+    ):
+        permissions.open_first_missing(None)
+    open_settings.assert_called_once_with("Input Monitoring")
+
+
+def test_click_with_nothing_missing_is_noop():
+    with (
+        patch.object(permissions, "missing_permissions", return_value=[]),
+        patch.object(permissions, "open_settings") as open_settings,
+    ):
+        permissions.open_first_missing(None)
+    open_settings.assert_not_called()

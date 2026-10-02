@@ -109,7 +109,7 @@ class KuiskausMenuBarApp(ModelReloadMixin, rumps.App):
         self.status_item = rumps.MenuItem("🟢 Ready", callback=None)
         self.menu.add(self.status_item)
         self.permissions_item = rumps.MenuItem(
-            "Permissions", callback=self.open_permission_settings
+            "Permissions", callback=permissions.open_first_missing
         )
         self.menu.add(self.permissions_item)
         self._refresh_permissions(None)
@@ -151,19 +151,7 @@ class KuiskausMenuBarApp(ModelReloadMixin, rumps.App):
         self.menu.add(rumps.MenuItem("Quit", callback=self.quit_app))
 
     def _refresh_permissions(self, _sender) -> None:
-        """Show which permissions are missing; clicking opens the pane."""
-        missing = permissions.missing_permissions()
-        if missing:
-            self.permissions_item.title = (
-                f"⚠️ Grant: {', '.join(missing)} (click to open)"
-            )
-        else:
-            self.permissions_item.title = "✅ Permissions granted"
-
-    def open_permission_settings(self, _sender) -> None:
-        missing = permissions.missing_permissions()
-        if missing:
-            permissions.open_settings(missing[0])
+        self.permissions_item.title = permissions.status_title()
 
     def start_hotkey_listener(self):
         """Start the hotkey listener in a background thread"""

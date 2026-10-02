@@ -57,3 +57,18 @@ def open_settings(name: str) -> None:
     pane = _PANES.get(name)
     if pane is not None:
         subprocess.run(["open", _SETTINGS_URL.format(pane=pane)], check=False)
+
+
+def status_title() -> str:
+    """Menu text: which permissions are missing, or that all are granted."""
+    missing = missing_permissions()
+    if not missing:
+        return "✅ Permissions granted"
+    return f"⚠️ Grant: {', '.join(missing)} (click to open)"
+
+
+def open_first_missing(_sender=None) -> None:
+    """Menu click: open the Settings pane of the first missing permission."""
+    missing = missing_permissions()
+    if missing:
+        open_settings(missing[0])
