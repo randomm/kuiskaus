@@ -150,9 +150,10 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_whisper.WhisperTranscriber = whisper_cls
 
     try:
-        import kuiskaus.menubar as _menubar
+        import kuiskaus.model_reload as _reload
 
-        monkeypatch.setattr(_menubar, "WhisperTranscriber", whisper_cls)
+        monkeypatch.setattr(_reload, "WhisperTranscriber", whisper_cls)
+        monkeypatch.setattr(_reload, "ParakeetTranscriber", parakeet_cls)
     except ImportError:
         pass  # menubar not imported yet; the sys.modules stub covers it
 
@@ -523,7 +524,7 @@ def test_reload_model_success_preserves_banner_when_last_error_set(app):
     app.audio_recorder.last_error = "microphone busy — recording did not start"
     app.status_item.title = f"🔴 {app.audio_recorder.last_error}"
 
-    with patch("kuiskaus.menubar.ParakeetTranscriber") as mock_ctor:
+    with patch("kuiskaus.model_reload.ParakeetTranscriber") as mock_ctor:
         mock_ctor.return_value = app.transcriber
         app._reload_model("parakeet")
 
@@ -537,7 +538,7 @@ def test_reload_model_success_clears_ready_without_last_error(app):
     app.transcriber = MagicMock(spec=Transcriber)
     app.audio_recorder.last_error = None
 
-    with patch("kuiskaus.menubar.ParakeetTranscriber") as mock_ctor:
+    with patch("kuiskaus.model_reload.ParakeetTranscriber") as mock_ctor:
         mock_ctor.return_value = app.transcriber
         app._reload_model("parakeet")
 
@@ -576,9 +577,9 @@ def test_reload_model_unusable_model_reports_failure(app):
     failed.model = None  # simulate a failed background load
     app.transcriber = original
 
-    import kuiskaus.menubar as menubar_module
+    import kuiskaus.model_reload as reload_module
 
-    with patch.object(menubar_module, "ParakeetTranscriber", return_value=failed):
+    with patch.object(reload_module, "ParakeetTranscriber", return_value=failed):
         app._reload_model("parakeet")
 
     # The unusable transcriber was never committed and the live one was
@@ -670,7 +671,7 @@ def test_transcriber_snapshot_survives_reload_cleanup(app):
     old.cleanup.side_effect = gated_cleanup
     new.transcribe.return_value = {"text": "you should never see me"}
 
-    with patch("kuiskaus.menubar.ParakeetTranscriber", return_value=new):
+    with patch("kuiskaus.model_reload.ParakeetTranscriber", return_value=new):
         scaffold["worker"].start()
         # Deterministically parked inside old.transcribe() while holding
         # the transcriber lock (fixed source), or just parked inside
@@ -745,7 +746,9 @@ def test_reload_model_serializes_concurrent_reloads(app):
 
     def a_reload():
         a_started.set()
-        with patch("kuiskaus.menubar.ParakeetTranscriber", side_effect=a_constructor):
+        with patch(
+            "kuiskaus.model_reload.ParakeetTranscriber", side_effect=a_constructor
+        ):
             app._reload_model("parakeet")
 
     a_thread = threading.Thread(target=a_reload)
@@ -753,7 +756,7 @@ def test_reload_model_serializes_concurrent_reloads(app):
     # Wait until A is inside its (blocking) constructor, then start B.
     assert a_started.wait(timeout=5.0), "reload A never started"
     assert a2_built.wait(timeout=5.0)
-    with patch("kuiskaus.menubar.ParakeetTranscriber", return_value=b):
+    with patch("kuiskaus.model_reload.ParakeetTranscriber", return_value=b):
         b_thread = threading.Thread(target=lambda: app._reload_model("parakeet"))
         b_thread.start()
         b_thread.join(timeout=10.0)
