@@ -21,6 +21,17 @@ from .silicon_check import check_apple_silicon
 from .text_inserter import TextInserter
 from .transcriber import Transcriber
 
+# (menu label, model key accepted by change_model)
+MODEL_CHOICES = (
+    ("Parakeet TDT 0.6B v3 (Default)", "parakeet"),
+    ("Voxtral Realtime", "voxtral"),
+    ("Whisper Turbo", "turbo"),
+    ("Base", "base"),
+    ("Small", "small"),
+    ("Medium", "medium"),
+    ("Large", "large"),
+)
+
 
 def _utcnow() -> datetime:
     """Single source of aware-UTC now(); prevents naive-datetime subtraction errors."""
@@ -111,35 +122,10 @@ class KuiskausMenuBarApp(ModelReloadMixin, rumps.App):
 
         # Model selection submenu
         model_menu = rumps.MenuItem("Model")
-        model_menu.add(
-            rumps.MenuItem(
-                "Parakeet TDT 0.6B v3 (Default)",
-                callback=lambda _: self.change_model("parakeet"),
+        for label, key in MODEL_CHOICES:
+            model_menu.add(
+                rumps.MenuItem(label, callback=lambda _, k=key: self.change_model(k))
             )
-        )
-        model_menu.add(
-            rumps.MenuItem(
-                "Voxtral Realtime",
-                callback=lambda _: self.change_model("voxtral"),
-            )
-        )
-        model_menu.add(
-            rumps.MenuItem(
-                "Whisper Turbo", callback=lambda _: self.change_model("turbo")
-            )
-        )
-        model_menu.add(
-            rumps.MenuItem("Base", callback=lambda _: self.change_model("base"))
-        )
-        model_menu.add(
-            rumps.MenuItem("Small", callback=lambda _: self.change_model("small"))
-        )
-        model_menu.add(
-            rumps.MenuItem("Medium", callback=lambda _: self.change_model("medium"))
-        )
-        model_menu.add(
-            rumps.MenuItem("Large", callback=lambda _: self.change_model("large"))
-        )
         self.menu.add(model_menu)
 
         # Stats
