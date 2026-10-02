@@ -150,8 +150,6 @@ def _install_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_whisper.WhisperTranscriber = whisper_cls
 
     try:
-        import kuiskaus.menubar as _menubar
-
         import kuiskaus.model_reload as _reload
 
         monkeypatch.setattr(_reload, "WhisperTranscriber", whisper_cls)
