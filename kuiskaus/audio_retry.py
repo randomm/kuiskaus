@@ -7,9 +7,10 @@ management and the call sites that invoke terminate_quietly remain in
 audio_recorder.py.
 """
 
+import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from types import ModuleType
 from typing import Literal
 
@@ -338,3 +339,103 @@ def worker_alive(thread: "threading.Thread | None") -> bool:
     and is_alive() on a dead thread is idempotent, so this is safe
     to call outside recorder._lock."""
     return thread is not None and thread.is_alive()
+
+
+def find_default_input_device(pa: "pyaudio.PyAudio") -> int:
+    """Find the default system microphone for the given PyAudio instance."""
+    try:
+        info = pa.get_default_input_device_info()
+        return info["index"]
+    except (OSError, KeyError, TypeError):
+        # Fallback to first available input device
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if info["maxInputChannels"] > 0:
+                return i
+        raise RuntimeError("No input device found")
+
+
+def open_warm_stream(
+    pa_module: ModuleType,
+    pa: "pyaudio.PyAudio | None",
+    device_index: int | None,
+    format: int,
+    channels: int,
+    sample_rate: int,
+    chunk_size: int,
+) -> tuple["pyaudio.PyAudio", "pyaudio.Stream", int]:
+    """One attempt for the keep-warm stream (issue #66); raises on failure.
+
+    Returns the PyAudio instance used (a fresh one if ``pa`` was None) so
+    the caller can adopt it, the stream, and the rate it was opened at.
+    """
+    new_pa, stream, error, rate = attempt_open_once(
+        pa_module,
+        format,
+        channels,
+        sample_rate,
+        chunk_size,
+        find_default_input_device,
+        1,
+        1,
+        time.monotonic(),
+        existing_pa=pa,
+        existing_device_index=device_index,
+    )
+    if stream is None or new_pa is None or rate is None:
+        raise error or OSError("warm open failed")
+    return new_pa, stream, rate
+
+
+def validate_retry_config(
+    max_attempts: int, retry_backoff_seconds: Sequence[float]
+) -> None:
+    """Reject retry settings the open loop cannot honour."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    if max_attempts > 1 and not retry_backoff_seconds:
+        raise ValueError(
+            "retry_backoff_seconds must be non-empty when "
+            "max_attempts > 1 (pass max_attempts=1 for no retries)"
+        )
+    if any(not math.isfinite(s) or s < 0 for s in retry_backoff_seconds):
+        raise ValueError(
+            "retry_backoff_seconds must contain only finite, non-negative values"
+        )
+
+
+def open_cached_session(
+    pa_module: ModuleType,
+) -> tuple["pyaudio.PyAudio | None", int | None]:
+    """Construct the persistent PyAudio session and resolve the default
+    input device (issue #42). Either part may come back None: the worker's
+    poll and the retry loop re-resolve at first recording."""
+    try:
+        pa = pa_module.PyAudio()
+    except Exception as construct_error:  # noqa: BLE001 - PyAudio()
+        # construction wraps PortAudio's Pa_Initialize(), whose
+        # failure modes aren't documented as a narrow exception set.
+        print(
+            "Warning: PyAudio construction failed at startup "
+            f"({construct_error}); will retry at first recording."
+        )
+        return None, None
+    try:
+        return pa, find_default_input_device(pa)
+    except (OSError, RuntimeError):
+        # Transient (coreaudiod storm at startup) or no device at all.
+        print(
+            "Warning: microphone probe failed at startup; "
+            "will re-resolve at first recording."
+        )
+        return pa, None
+
+
+def log_stop(chunks: int, start_monotonic: float | None, reason: str) -> None:
+    """Emit the structured ``[audio.stop]`` line (issue #40)."""
+    duration_ms = (
+        int((time.monotonic() - start_monotonic) * 1000)
+        if start_monotonic is not None
+        else 0
+    )
+    print(f"[audio.stop] chunks={chunks} duration_ms={duration_ms} reason={reason}")
