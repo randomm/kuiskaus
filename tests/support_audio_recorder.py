@@ -94,7 +94,7 @@ def _live_default_input(stub: MagicMock, device_id: int, is_alive: bool = True) 
     that never calls this before construction gets ``device_id`` None --
     and any live read then counts as a change.
     """
-    from kuiskaus.audio_device import (
+    from kuiskaus.audio_coreaudio import (
         kAudioDevicePropertyDeviceIsAlive,
         kAudioHardwarePropertyDefaultInputDevice,
     )

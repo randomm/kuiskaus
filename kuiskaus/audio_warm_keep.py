@@ -83,6 +83,19 @@ class WarmKeep:
         if enabled:
             self._recover_pending = False
 
+    def need_recovery(self) -> None:
+        """Ask for keep-warm to be brought back later (issue #72 review).
+
+        ``drop()`` sets the recovery flag only when ``stop()`` FAILS, so a
+        reset that stopped its capture cleanly and then bailed (the
+        ``terminate_all()`` refusal) left keep-warm off for the life of the
+        process with the menu still showing the checkmark: nothing had set
+        the flag, so ``recover()`` never fired. This is the explicit ask for
+        exactly that case, and the worker path's ``recover()`` picks it up
+        the same way it picks up a stuck read.
+        """
+        self._recover_pending = True
+
     def recover(self, rearm_warm: Callable[[bool], None] | None) -> None:
         """Bring keep-warm back after a stuck-read drop (issue #72 review).
 

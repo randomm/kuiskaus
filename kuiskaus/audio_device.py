@@ -1,31 +1,20 @@
-"""The input device the recorder's session is bound to (issue #72).
+"""The session's PyAudio registry and its device-reset (issue #72).
 
-Two halves of one question -- which device am I on, and what has to be
-rebuilt when it moves:
+The "what has to be rebuilt when the device moves" half of the input
+device question; ``kuiskaus.audio_coreaudio`` answers "which device am I
+on right now" (one-shot CoreAudio reads, no listeners, no runloop) and
+its ``session_needs_reset`` decides when that answer has changed.
 
-* ``read_live_default_input`` asks CoreAudio what the system default
-  input is RIGHT NOW. PortAudio snapshots the hardware once at
-  ``Pa_Initialize`` and never refreshes it, so a default switch
-  mid-session leaves a cached ``PyAudio`` listing a device the system no
-  longer uses -- the stale "Built-in Microphone" behind issue #72.
-  One-shot ``AudioObjectGetPropertyData`` reads only: no property
-  listeners and no runloop, because on this machine
-  ``AudioObjectAddPropertyListener`` blocks forever, so a listener-based
-  design would reintroduce the issue #60 hang with an unbounded thread.
-* ``PyAudioRegistry`` owns every ``PyAudio`` instance the recorder ever
-  built, and ``refresh_session`` rebuilds them. PortAudio's teardown is
-  reference-counted: one unregistered or unterminated instance keeps
-  ``Pa_Terminate`` from releasing the engine, so a "reset" that
-  terminates only the instance it can see replays the same frozen
-  snapshot. The count reaching zero is the only definition of clean.
-
-The CoreAudio constants are four-char codes and their names are the only
-documentation of what a bare integer means, so they are named here.
+``PyAudioRegistry`` owns every ``PyAudio`` instance the recorder ever
+built, and ``refresh()`` rebuilds them. PortAudio's teardown is
+reference-counted: one unregistered or unterminated instance keeps
+``Pa_Terminate`` from releasing the engine, so a "reset" that terminates
+only the instance it can see replays the same frozen snapshot. The count
+reaching zero is the only definition of clean.
 """
 
 from __future__ import annotations
 
-import sys
 import threading
 from collections.abc import Callable
 from types import ModuleType
@@ -33,6 +22,11 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import pyaudio
 
+from kuiskaus.audio_coreaudio import (
+    LiveDefaultInput,
+    read_live_default_input,
+    session_needs_reset,
+)
 from kuiskaus.audio_retry import (
     close_stream_quietly,
     log_retry_attempt,
@@ -44,104 +38,6 @@ from kuiskaus.audio_warm_keep import WarmKeep
 
 if TYPE_CHECKING:
     from kuiskaus.audio_warm import WarmCapture
-
-kAudioObjectSystemObject = 1
-# The codes below are the PyObjC bridge's own values -- verified against
-# kAudioHardwarePropertyDefaultInputDevice / kAudioDevicePropertyDeviceIsAlive
-# on a real CoreAudio install. The four-char decodings are 'dIn ' and 'livn'
-# (they are NOT 'defi'/'aliv'); the tests mirror the same integers, so a
-# comment-following "fix" that retypes one of these numbers breaks live
-# detection while the suite stays green.
-kAudioHardwarePropertyDefaultInputDevice = 1682533920  # 'dIn '
-kAudioDevicePropertyDeviceIsAlive = 1818850926  # 'livn'
-kAudioObjectPropertyScopeGlobal = 1735159650  # 'glob'
-kAudioObjectPropertyElementMain = 0
-kAudioObjectUnknown = 0
-
-# AudioObjectGetPropertyData's last argument is an in/out buffer whose
-# address PyObjC must pin; passing None (rather than a preallocated
-# bytearray) makes the bridge allocate it and hand the bytes back.
-_OUT_BUFFER = None
-_SIZE_BYTES = 4
-_NO_QUALIFIER = b""
-
-
-class LiveDefaultInput(NamedTuple):
-    """The system default input device as CoreAudio sees it right now."""
-
-    device_id: int
-    is_alive: bool
-
-
-def _read_uint32(object_id: int, selector: int, scope: int, element: int) -> int | None:
-    """One UInt32 property read, or None if CoreAudio refused it.
-
-    CoreAudio reports failure as a nonzero OSStatus rather than raising,
-    so a None here means "no evidence" -- never "absent". But the PyObjC
-    bridge around those calls CAN raise (marshalling under a coreaudiod
-    storm, a first-call import failure), and this read runs on the
-    AudioRecorder.__init__ and press paths, where an escaping exception
-    is an app that never launches. Both failure shapes collapse to None."""
-    try:
-        import CoreAudio
-
-        address = CoreAudio.AudioObjectPropertyAddress(selector, scope, element)
-        status, _size, raw = CoreAudio.AudioObjectGetPropertyData(
-            object_id, address, 0, _NO_QUALIFIER, _SIZE_BYTES, _OUT_BUFFER
-        )  # fmt: skip
-    except Exception as e:  # noqa: BLE001 - PyObjC/CoreAudio boundary, logged
-        print(f"CoreAudio property read failed ({e}); treating as no evidence.")
-        return None
-    if status != 0 or not isinstance(raw, (bytes, bytearray)):
-        return None
-    return int.from_bytes(raw, sys.byteorder)
-
-
-def read_live_default_input() -> LiveDefaultInput | None:
-    """The live default input device, or None when CoreAudio gave no
-    evidence at all (transient failure: a caller must NOT treat that as
-    "unchanged" and skip a needed rebuild -- but neither is it proof of
-    change, so session_needs_reset() stays quiet on it)."""
-    device_id = _read_uint32(
-        kAudioObjectSystemObject,
-        kAudioHardwarePropertyDefaultInputDevice,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain,
-    )
-    if device_id is None or device_id == kAudioObjectUnknown:
-        # kAudioObjectUnknown is CoreAudio's "there is no default input
-        # device", not a device: as a live read it would make every press
-        # rebuild the session on a machine with no microphone, with nothing
-        # ever settling. Absence of a device is reported like the absence of
-        # an answer -- no evidence, no reset.
-        return None
-    alive = _read_uint32(
-        device_id,
-        kAudioDevicePropertyDeviceIsAlive,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain,
-    )
-    # Doubt about liveness falls to "not alive": the safe response to an
-    # unproven device is a fresh session, not a stream opened on it.
-    return LiveDefaultInput(device_id=device_id, is_alive=alive == 1)
-
-
-def session_needs_reset(
-    live: LiveDefaultInput | None, session_device_id: int | None
-) -> bool:
-    """Whether the cached session was built against another device.
-
-    A session with no recorded baseline (``session_device_id`` None) has
-    never been bound, so any evidence of a live device resets it; no
-    evidence at all (``live`` None) resets nothing -- the next press asks
-    again."""
-    if live is None:
-        return False
-    return (
-        session_device_id is None
-        or live.device_id != session_device_id
-        or not live.is_alive
-    )
 
 
 class SessionRefresh(NamedTuple):
@@ -166,9 +62,17 @@ class PyAudioRegistry:
     so the next construction re-enumerates the hardware.
 
     Threading: one thread runs the session's lifecycle at a time (a new
-    worker joins its predecessor before touching anything) and every
-    field here is written under the recorder's ``_lock``, the same
-    arbiter as ``_capture_rate`` / ``_stream`` (issue #55).
+    worker joins its predecessor before touching anything), but the lock
+    discipline is narrower than "everything under ``_lock``":
+    ``open()``, ``bind_index()`` and ``refresh()`` deliberately run their
+    native calls OUTSIDE the recorder's ``_lock`` (they can block for
+    seconds and stop_recording() needs that lock, issue #60), and so
+    write ``pyaudio`` / ``input_device_index`` / ``device_id`` there.
+    What ``_lock`` does arbitrate is the composite state ``adopt()``
+    publishes (``_capture_rate`` / ``_stream``, issue #55); the registry
+    fields above are single-word writes from whichever thread owns the
+    lifecycle, and the instance list is mutated under its own small
+    ``_instances_lock`` so a register can never double-append.
     """
 
     def __init__(self, pa_module: ModuleType) -> None:
@@ -176,12 +80,21 @@ class PyAudioRegistry:
         self.pyaudio: pyaudio.PyAudio | None = None
         self.input_device_index: int | None = None
         self.device_id: int | None = None
+        # The (device_id, is_alive) pair the last FULLY SUCCESSFUL reset
+        # was performed against (issue #72 review): a default that stays
+        # reported not-alive must cost one rebuild, not one per press --
+        # see the dedupe check in refresh(). Only written after open()
+        # came back, so failed resets stay retryable.
+        self._last_reset: LiveDefaultInput | None = None
         # The keep-warm request, plus any capture this session dropped while
         # its thread was parked in a native read: the recorder clears its own
         # ``_warm`` at that same moment, so this is the only handle left that
         # can name those threads (see WarmKeep).
         self.warm = WarmKeep()
         self._instances: list[pyaudio.PyAudio] = []
+        # Guards only the _instances list mutations -- never held across a
+        # native call, so it cannot be the lock a blocking terminate waits on.
+        self._instances_lock = threading.Lock()
 
     def register(self, pa: pyaudio.PyAudio) -> pyaudio.PyAudio:
         """Track an instance built by this session (the retry loop opens
@@ -189,15 +102,18 @@ class PyAudioRegistry:
         stamp it with its owner, so a caller holding only the instance can
         still find the registry that must terminate it (issue #72)."""
         if pa not in self._instances:
-            self._instances.append(pa)
+            with self._instances_lock:
+                if pa not in self._instances:
+                    self._instances.append(pa)
         stamp_owner(pa, self)
         return pa
 
     def forget(self, pa: pyaudio.PyAudio) -> None:
         """Stop tracking an instance (it stays live -- the caller keeps
         using it, e.g. the instance a new stream is opened on)."""
-        if pa in self._instances:
-            self._instances.remove(pa)
+        with self._instances_lock:
+            if pa in self._instances:
+                self._instances.remove(pa)
 
     def terminate(self, pa: pyaudio.PyAudio) -> None:
         """Terminate and unregister one instance (its stream must be
@@ -229,7 +145,9 @@ class PyAudioRegistry:
             print("Keep-warm capture may still be reading; not terminating PyAudio.")
             return False
         incomplete = False
-        for pa in list(self._instances):
+        with self._instances_lock:
+            pending = list(self._instances)
+        for pa in pending:
             if terminate_quietly(pa):
                 self.forget(pa)
             else:
@@ -393,6 +311,17 @@ class PyAudioRegistry:
         live = read_live_default_input()
         if not session_needs_reset(live, self.device_id):
             return SessionRefresh(self.pyaudio, self.input_device_index, False)
+        if self.device_id is not None and live == self._last_reset:
+            # A fully successful reset already ran against this exact live
+            # read. refresh() re-records device_id but never the liveness it
+            # reset against, so the "doubt falls to not-alive" fail-safe
+            # would otherwise pay a full terminate-all + Pa_Initialize +
+            # re-enumeration on EVERY press forever -- on the keep-warm
+            # path, synchronously in the hotkey press callback (issue #72
+            # review). A moved or revived default is a different pair and
+            # resets; failed resets recorded nothing (``_last_reset`` is
+            # written only after a successful open), so they retry.
+            return SessionRefresh(self.pyaudio, self.input_device_index, False)
 
         # Never drive PortAudio's init count to zero while another thread
         # may be inside a native open() or stream.read() on a registered
@@ -429,6 +358,20 @@ class PyAudioRegistry:
             return SessionRefresh(self.pyaudio, self.input_device_index, True)
 
         if not self.terminate_all():
+            # Busy: the session stays dirty and the next press retries.
+            # But the warm capture was already stopped cleanly above, and
+            # a stopped capture is dead for presses either way -- mirror
+            # the sibling branch and hand it back, or the next press that
+            # needs no reset (the default settled back, or one transient
+            # no-evidence read) is admitted and records the stale pre-roll
+            # into a dead sink with no error surfaced (issue #72 review,
+            # round 4). And ask for recovery explicitly: stop() SUCCEEDED,
+            # so drop() never set _recover_pending and keep-warm would
+            # stay off -- menu checkmark and all -- for the life of the
+            # process.
+            if warm_stopped and warm is not None and rearm_warm is not None:
+                rearm_warm(False)
+            self.warm.need_recovery()
             return SessionRefresh(self.pyaudio, self.input_device_index, True)
         self.pyaudio = None
         self.input_device_index = None
@@ -440,6 +383,9 @@ class PyAudioRegistry:
             # next press re-reads the live device and retries, with
             # nothing left holding PortAudio open.
             return SessionRefresh(None, None, False)
+        # Dedupe baseline: this exact live read now has a session built
+        # against it (see the dedupe check above).
+        self._last_reset = live
         return SessionRefresh(self.pyaudio, self.input_device_index, False)
 
     def press_check_if_admissible(

@@ -8,20 +8,9 @@ never leak into these assertions.
 import threading
 from unittest.mock import MagicMock
 
-from kuiskaus.audio_device import (
-    LiveDefaultInput,
-    PyAudioRegistry,
-    check_superseded,
-    read_live_default_input,
-    session_needs_reset,
-)
+from kuiskaus.audio_device import PyAudioRegistry, check_superseded
 from kuiskaus.audio_retry import registry_for
 from tests.support_audio_recorder import _live_default_input
-
-# 'dIn ' / 'livn' as the stubbed bridge reports them (same ints the module
-# uses -- a test that retypes them here would catch a constant typo).
-DEFAULT_INPUT_SELECTOR = 1682533920
-ALIVE_SELECTOR = 1818850926
 
 
 def _registry(pa_module=None, pa=None):
@@ -38,80 +27,6 @@ def _find_device(_pa):
     return 3
 
 
-# ---------------------------------------------------------------------------
-# Live CoreAudio read
-# ---------------------------------------------------------------------------
-
-
-def test_no_evidence_from_coreaudio_reads_as_none(coreaudio_stub):
-    # The stub's default is "every read fails" -- a nonzero OSStatus is
-    # CoreAudio's way of saying "no answer", which must not become
-    # "the device did not change".
-    assert read_live_default_input() is None
-
-
-def test_live_read_returns_default_id_and_liveness(coreaudio_stub):
-    _live_default_input(coreaudio_stub, 96)
-    assert read_live_default_input() == LiveDefaultInput(device_id=96, is_alive=True)
-
-
-def test_live_read_reports_dead_device(coreaudio_stub):
-    _live_default_input(coreaudio_stub, 96, is_alive=False)
-    assert read_live_default_input() == LiveDefaultInput(device_id=96, is_alive=False)
-
-
-def test_failed_liveness_read_doubts_the_device(coreaudio_stub):
-    """A device whose liveness cannot be proven is treated as NOT alive:
-    the safe response to an unproven device is a rebuild, not a stream."""
-    from kuiskaus import audio_device
-
-    def _read(object_id, address, _qs, _q, _s, _out):
-        if address.mSelector == DEFAULT_INPUT_SELECTOR:
-            return 0, 4, (96).to_bytes(4, audio_device.sys.byteorder)
-        return 1852797029, 0, None  # '!sta' -- read failed
-
-    coreaudio_stub.AudioObjectGetPropertyData.side_effect = _read
-    assert read_live_default_input() == LiveDefaultInput(device_id=96, is_alive=False)
-
-
-def test_non_bytes_property_data_is_no_evidence(coreaudio_stub):
-    """A successful status with a non-bytes out-buffer is not a value."""
-    from kuiskaus import audio_device
-
-    coreaudio_stub.AudioObjectGetPropertyData.return_value = (0, 4, None)
-    assert audio_device._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) is None
-
-
-def test_no_default_device_at_all_is_no_evidence(coreaudio_stub):
-    """kAudioObjectUnknown (0) is CoreAudio's "there is no default input
-    device", not a device. As a live read it would rebuild the session on
-    every press of a machine with no microphone, and nothing would ever
-    settle -- so absence of a device answers like absence of a value."""
-    _live_default_input(coreaudio_stub, 0)
-    live = read_live_default_input()
-    assert live is None
-    assert session_needs_reset(live, None) is False
-
-
-def test_a_raising_bridge_read_is_no_evidence(coreaudio_stub, capsys):
-    """The PyObjC bridge itself can raise (marshalling under a coreaudiod
-    storm, a first-call import failure). The reader's contract is None --
-    'no evidence' -- never an exception: this read runs on the
-    AudioRecorder.__init__ path (menubar/app construct it unguarded) and
-    on the press path, so an escape there is an app that will not launch
-    or a hotkey handler that dies mid-press (#72 review)."""
-    coreaudio_stub.AudioObjectGetPropertyData.side_effect = OSError("coreaudiod storm")
-    assert read_live_default_input() is None
-    assert "CoreAudio property read failed" in capsys.readouterr().out
-
-
-def test_a_raising_address_constructor_is_no_evidence(coreaudio_stub):
-    coreaudio_stub.AudioObjectPropertyAddress.side_effect = RuntimeError(
-        "bridge marshalling"
-    )
-    assert read_live_default_input() is None
-
-
 def test_open_survives_a_hostile_bridge(coreaudio_stub):
     """__init__'s session open binds the instance even when every CoreAudio
     call raises: no baseline, no crash (the retry loop re-binds later)."""
@@ -121,29 +36,6 @@ def test_open_survives_a_hostile_bridge(coreaudio_stub):
     assert registry.open(_find_device) is True
     assert registry.pyaudio is pa
     assert registry.device_id is None
-
-
-# ---------------------------------------------------------------------------
-# The change predicate
-# ---------------------------------------------------------------------------
-
-
-def test_no_evidence_never_resets():
-    assert session_needs_reset(None, 42) is False
-    assert session_needs_reset(None, None) is False
-
-
-def test_unbound_session_binds_on_first_evidence():
-    assert session_needs_reset(LiveDefaultInput(7, True), None) is True
-
-
-def test_same_alive_device_needs_no_reset():
-    assert session_needs_reset(LiveDefaultInput(7, True), 7) is False
-
-
-def test_moved_default_or_dead_device_resets():
-    assert session_needs_reset(LiveDefaultInput(8, True), 7) is True
-    assert session_needs_reset(LiveDefaultInput(7, False), 7) is True
 
 
 # ---------------------------------------------------------------------------

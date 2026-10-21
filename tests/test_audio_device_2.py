@@ -9,7 +9,7 @@ drive PortAudio's init count to zero has to ask it first.
 """
 
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 from kuiskaus.audio_device import PyAudioRegistry
 from tests.support_audio_recorder import _live_default_input
@@ -238,3 +238,139 @@ def test_terminate_single_keeps_an_instance_it_could_not_terminate(
 
     assert pa in registry._instances
     pa.terminate.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# The reset that fails at terminate_all() still hands the capture back
+# ---------------------------------------------------------------------------
+
+
+def _terminate_refusing_registry(coreaudio_stub):
+    """A bound registry over device 77 whose one instance refuses to
+    terminate -- the coreaudiod-storm state terminate_quietly() and the
+    terminate_all() docstring explicitly design for ("the next attempt
+    gets another shot", issue #37/#60 class)."""
+    registry, pa, module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    pa.terminate.side_effect = OSError("Pa_Terminate failed")
+    registry.warm.want(True)  # the menu asked for keep-warm
+    _live_default_input(coreaudio_stub, 88)  # and the default has moved
+    return registry, pa, module
+
+
+def test_busy_reset_after_a_stopped_capture_hands_it_back_and_asks_recovery(
+    coreaudio_stub,
+):
+    """CRITICAL (issue #72 review round 4): the terminate_all()-failure
+    branch stopped the warm capture and then returned busy WITHOUT the
+    hand-back its sibling branch does. Observed consequence: press 1
+    refused, press 2 (default settled back, or one transient no-evidence
+    read) admitted, and stop_recording returned the stale 7-chunk
+    pre-roll as the user's speech with last_error None -- while keep-warm
+    stayed off for the rest of the session with the menu still on, because
+    stop() SUCCEEDED so drop() never set the recovery flag."""
+    registry, pa, module = _terminate_refusing_registry(coreaudio_stub)
+    warm = MagicMock(name="warm")
+    warm.stop.return_value = True  # the capture stopped cleanly...
+    rearm = MagicMock(name="rearm-warm")
+
+    result = registry.refresh(_find_device, warm, rearm, None)
+
+    assert result.busy is True
+    rearm.assert_called_once_with(False)  # ...but is dead: handed back
+    pa.terminate.assert_called_once()  # the refusal came from terminate
+    assert module.PyAudio.call_count == 1  # busy: nothing rebuilt
+
+
+def test_recovery_flag_from_a_bailed_reset_brings_keep_warm_back(
+    coreaudio_stub,
+):
+    """The recovery half of the same finding: with only the rearm(False)
+    hand-back, _recover_pending was still False (drop() sets it only on a
+    FAILED stop), so WarmKeep.recover() -- reachable from the worker path
+    -- never fired and keep-warm never returned. The bailed reset must
+    leave the recorder able to come back via recover()."""
+    registry, _pa, _module = _terminate_refusing_registry(coreaudio_stub)
+    warm = MagicMock(name="warm")
+    warm.stop.return_value = True
+    rearm = MagicMock(name="rearm-warm")
+
+    registry.refresh(_find_device, warm, rearm, None)
+    registry.warm.recover(rearm)  # the worker path's recovery call
+
+    assert rearm.call_args_list == [call(False), call(True)]
+    # A second recover() with nothing pending must not re-arm again.
+    registry.warm.recover(rearm)
+    assert rearm.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# A persistently not-alive default costs one rebuild, not one per press
+# ---------------------------------------------------------------------------
+
+
+def test_persistent_dead_default_rebuilds_once_not_every_press(
+    coreaudio_stub,
+):
+    """ISSUE (issue #72 review): refresh() re-records device_id but not
+    the liveness it reset against, so a stable default the alive-read
+    reports dead (or fails to read) re-triggered a full teardown + rebuild
+    on EVERY press forever -- measured at one PyAudio() construction per
+    refresh, each one Pa_Terminate-to-zero + Pa_Initialize + enumerate,
+    on the hotkey callback thread in the keep-warm path. A second read of
+    the same (device, dead) pair after a successful reset is nothing new.
+    """
+    registry, _pa, module = _registry()
+    _live_default_input(coreaudio_stub, 77)  # bound while alive
+    registry.open(_find_device)
+    _live_default_input(coreaudio_stub, 77, is_alive=False)  # then it died
+    fresh = MagicMock(name="PyAudioInstance-fresh")
+    module.PyAudio.side_effect = [fresh]  # tripwire: a second build fails
+
+    first = registry.refresh(_find_device)
+    second = registry.refresh(_find_device)
+
+    assert first.busy is False
+    assert module.PyAudio.call_count == 2  # open() + exactly ONE rebuild
+    assert second.busy is False
+    assert second.pyaudio is fresh  # the rebuilt session is the answer
+    fresh.terminate.assert_not_called()  # ... and it is not torn down again
+
+
+def test_a_moved_default_after_a_dead_reset_still_resets(coreaudio_stub):
+    """The dedupe must pin only the pair already reset against: a moved
+    default is a different pair, even at the same liveness."""
+    registry, _pa, module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    _live_default_input(coreaudio_stub, 77, is_alive=False)
+    registry.refresh(_find_device)
+    assert module.PyAudio.call_count == 2
+
+    _live_default_input(coreaudio_stub, 88, is_alive=False)
+    result = registry.refresh(_find_device)
+
+    assert result.busy is False
+    assert module.PyAudio.call_count == 3  # pair changed: reset ran
+
+
+def test_a_failed_reset_is_retried_next_press_not_deduped(coreaudio_stub):
+    """The dedupe records only FULLY successful resets -- a rebuild whose
+    construction failed leaves nothing recorded, and the next press must
+    take another shot rather than be told the session is already fresh."""
+    registry, _pa, module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    _live_default_input(coreaudio_stub, 77, is_alive=False)
+    module.PyAudio = MagicMock(side_effect=OSError("Pa_Initialize failed"))
+
+    failed = registry.refresh(_find_device)
+    assert failed.pyaudio is None  # session left unbound
+
+    good = MagicMock(name="PyAudioInstance-good")
+    module.PyAudio = MagicMock(return_value=good)
+    retried = registry.refresh(_find_device)
+
+    assert retried.pyaudio is good  # retried, not deduped
+    assert retried.busy is False
