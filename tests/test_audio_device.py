@@ -259,6 +259,32 @@ def test_moved_default_rebuilds_exactly_one_instance(coreaudio_stub):
     assert module.PyAudio.call_count == 2
 
 
+def test_reset_resolves_the_device_index_on_the_fresh_instance(coreaudio_stub):
+    """Issue #72 AC: index resolved on the fresh instance ONLY. The
+    pre-#72 refresh resolved against the stale cached instance (whose
+    PortAudio snapshot was the bug) -- so the resolver must be handed the
+    newly constructed PyAudio, never the displaced one."""
+    registry, stale, module = _registry()
+    registry.open(_find_device)
+    fresh = MagicMock(name="PyAudioInstance-fresh")
+    module.PyAudio.side_effect = [fresh]
+    _live_default_input(coreaudio_stub, 77)
+    seen: list[object] = []
+
+    def find(pa):
+        seen.append(pa)
+        return 3
+
+    result = registry.refresh(find)
+
+    assert result.busy is False
+    # First call binds the ORIGINAL open; the reset's resolution is the
+    # last one and must name the fresh instance, not the stale one.
+    assert seen[-1] is fresh
+    assert stale not in seen[1:]
+    assert result.input_device_index == 3
+
+
 def test_reset_when_engine_never_comes_back_leaves_session_unbound(coreaudio_stub):
     registry, _, module = _registry()
     registry.open(_find_device)
