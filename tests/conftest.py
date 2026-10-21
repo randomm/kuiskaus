@@ -88,8 +88,8 @@ def coreaudio_stub(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     stub.kAudioObjectSystemObject = 1
     stub.kAudioObjectPropertyScopeGlobal = 1735159650  # 'glob'
     stub.kAudioObjectPropertyElementMain = 0
-    stub.kAudioHardwarePropertyDefaultInputDevice = 1682533920  # 'defi'
-    stub.kAudioDevicePropertyDeviceIsAlive = 1818850926  # 'aliv'
+    stub.kAudioHardwarePropertyDefaultInputDevice = 1682533920  # 'dIn '
+    stub.kAudioDevicePropertyDeviceIsAlive = 1818850926  # 'livn'
     # A real AudioObjectPropertyAddress carries the selector the reader
     # asked for, so a stub that answers per-selector can tell the two
     # reads apart -- which is what makes "device moved" and "device not

@@ -14,7 +14,9 @@ from tests.support_audio_recorder import (
     _live_default_input,
     _make_pyaudio_instance,
     _make_recorder,
+    _streaming_stream,
     _wait_until,
+    _warm_recorder,
 )
 
 
@@ -194,7 +196,7 @@ def test_refresh_does_not_hold_lock_during_native_calls(audio_recorder_module):
     recorder = _make_recorder(module, init_probe=pa1)
     lock_free_during_native_call: list[bool] = []
 
-    def fake_refresh(_module, pa, idx, _find):
+    def fake_refresh(_module, pa, idx, _find, _blocked=None):
         acquired = recorder._lock.acquire(blocking=False)
         lock_free_during_native_call.append(acquired)
         if acquired:
@@ -204,6 +206,33 @@ def test_refresh_does_not_hold_lock_during_native_calls(audio_recorder_module):
     with mock.patch.object(module, "refresh_pyaudio_session", fake_refresh):
         recorder._refresh_pyaudio_session()
     assert lock_free_during_native_call == [True]
+
+
+def test_refused_warm_press_does_not_reset_the_live_session(
+    audio_recorder_module, coreaudio_stub
+):
+    """With keep-warm on, the press itself runs the live-default check -- so
+    a press that is about to be refused must not reach it (issue #72
+    review): refresh() stops the warm capture that is delivering chunks to
+    the recording in progress and terminates the session underneath it."""
+    module = audio_recorder_module
+    release = threading.Event()
+    recorder, pa = _warm_recorder(module, _streaming_stream(release))
+    assert _wait_until(lambda: recorder._warm.ready)
+    assert recorder.start_recording() is True
+    _live_default_input(coreaudio_stub, 77)  # the default moved mid-capture
+
+    assert recorder.start_recording() is False  # refused: a capture is live
+    assert recorder.recording is True  # the first recording survived it
+    pa.terminate.assert_not_called()  # nothing terminated under it
+    assert module.pyaudio.PyAudio.call_count == 1  # ... and nothing rebuilt
+
+    # Still delivering after the refused press (the warm read loop is paced
+    # at ~2ms/chunk, so give it one chunk before draining).
+    assert _wait_until(lambda: not recorder.audio_queue.empty())
+    audio = recorder.stop_recording()
+    release.set()
+    assert audio.size > 0  # the capture was still delivering when refused
 
 
 # ---------------------------------------------------------------------------

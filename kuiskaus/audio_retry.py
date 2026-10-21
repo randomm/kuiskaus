@@ -316,6 +316,7 @@ def refresh_pyaudio_session(
     pyaudio_instance: "pyaudio.PyAudio | None",
     input_device_index: int | None,
     find_default_input_device: Callable[["pyaudio.PyAudio"], int],
+    blocked_worker: "threading.Thread | None" = None,
 ) -> tuple["pyaudio.PyAudio | None", int | None]:
     """Device-change reset (issue #72), called at the top of the recording
     worker before the retry loop.
@@ -338,11 +339,17 @@ def refresh_pyaudio_session(
 
     Returns (pyaudio_instance, input_device_index) -- possibly both
     replaced. The caller is responsible for any lock scoping.
+
+    ``blocked_worker`` names the thread whose native PortAudio call this
+    reset must not run under (issue #72 review): the worker the caller
+    joined and timed out on. Busy is reported by leaving the session
+    exactly as it is, so the next press reads the live device again rather
+    than PortAudio going away under a thread inside pa.open().
     """
     registry = registry_for(pyaudio_instance)
     if registry is None:
         return pyaudio_instance, input_device_index
-    result = registry.refresh(find_default_input_device)
+    result = registry.refresh(find_default_input_device, blocked_worker=blocked_worker)
     return result.pyaudio, result.input_device_index
 
 

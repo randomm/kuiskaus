@@ -210,15 +210,16 @@ class AudioRecorder:
                 self.recording_thread = None
         return None
 
-    def _refresh_pyaudio_session(self) -> None:
+    def _refresh_pyaudio_session(self, blocked: threading.Thread | None = None) -> None:
         """Live-default device reset (issue #72) at the top of the worker.
         Native calls run OUTSIDE _lock (issue #60): they can block and
-        stop_recording() needs the lock. One worker runs this at a time.
+        stop_recording() needs the lock. One worker runs this at a time;
+        ``blocked`` is the worker just joined -- still alive means busy.
         """
         with self._lock:
             pa, device_index = self.pyaudio, self.input_device_index
         pa, device_index = refresh_pyaudio_session(
-            pyaudio, pa, device_index, find_default_input_device
+            pyaudio, pa, device_index, find_default_input_device, blocked
         )
         with self._lock:
             self.pyaudio, self.input_device_index = pa, device_index
@@ -263,7 +264,7 @@ class AudioRecorder:
         previous = self.recording_thread
         if previous is not None and previous.is_alive():
             previous.join(timeout=PREVIOUS_WORKER_WAIT_SECONDS)
-        self._refresh_pyaudio_session()
+        self._refresh_pyaudio_session(previous)
         with self._lock:
             pa, device_index = self.pyaudio, self.input_device_index
         new_pa, stream, rate = open_warm_stream(
@@ -296,7 +297,7 @@ class AudioRecorder:
             with self._lock:
                 if self._generation != my_gen or not self.recording:
                     return  # released again while waiting
-        self._refresh_pyaudio_session()
+        self._refresh_pyaudio_session(previous)
         stream = self._open_stream_with_retry(my_gen)
         if stream is None:
             return  # last_error already set (or generation superseded)
@@ -354,8 +355,17 @@ class AudioRecorder:
         the live-default check (issue #72).
         """
         warm = self._warm
-        if warm is not None and not self._session.press_check(
-            find_default_input_device, warm, self._restart_warm
+        # Refused below, so it must not reach the reset either: refresh()
+        # would stop the warm capture feeding the live recording (#72).
+        if (
+            warm is not None
+            and not self.recording
+            and not self._session.press_check(
+                find_default_input_device,
+                warm,
+                self._restart_warm,
+                self.recording_thread,
+            )
         ):
             self.last_error = "microphone busy — recording did not start"
             return False

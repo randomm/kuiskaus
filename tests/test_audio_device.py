@@ -18,7 +18,7 @@ from kuiskaus.audio_device import (
 from kuiskaus.audio_retry import registry_for
 from tests.support_audio_recorder import _live_default_input
 
-# 'duid' / 'lvly' as the stubbed bridge reports them (same ints the module
+# 'dIn ' / 'livn' as the stubbed bridge reports them (same ints the module
 # uses -- a test that retypes them here would catch a constant typo).
 DEFAULT_INPUT_SELECTOR = 1682533920
 ALIVE_SELECTOR = 1818850926
@@ -80,6 +80,17 @@ def test_non_bytes_property_data_is_no_evidence(coreaudio_stub):
 
     coreaudio_stub.AudioObjectGetPropertyData.return_value = (0, 4, None)
     assert audio_device._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) is None
+
+
+def test_no_default_device_at_all_is_no_evidence(coreaudio_stub):
+    """kAudioObjectUnknown (0) is CoreAudio's "there is no default input
+    device", not a device. As a live read it would rebuild the session on
+    every press of a machine with no microphone, and nothing would ever
+    settle -- so absence of a device answers like absence of a value."""
+    _live_default_input(coreaudio_stub, 0)
+    live = read_live_default_input()
+    assert live is None
+    assert session_needs_reset(live, None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +281,47 @@ def test_warm_capture_is_stopped_then_restarted(coreaudio_stub):
     assert result.pyaudio is not pa
 
 
+def test_reset_reports_busy_rather_than_terminating_under_a_live_worker(
+    coreaudio_stub,
+):
+    """terminate_all() under a thread that may be inside pa.open() or
+    stream.read() is the state cleanup() refuses to touch (issue #37
+    task-c), and the pre-#72 poll never reached it because the reset never
+    ran. Busy, and the session stays whole and dirty (issue #72 review)."""
+    registry, pa, module = _registry()
+    registry.open(_find_device)
+    _live_default_input(coreaudio_stub, 77)
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait, daemon=True)
+    worker.start()
+    try:
+        result = registry.refresh(_find_device, None, None, worker)
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert result.busy is True
+    assert result.pyaudio is pa  # nothing torn down
+    pa.terminate.assert_not_called()
+    assert module.PyAudio.call_count == 1  # ... and nothing rebuilt
+
+
+def test_the_worker_running_a_reset_is_never_its_own_blocker(coreaudio_stub):
+    """A worker joins its predecessor and then resets: naming its own
+    thread must not turn every worker-side reset into a busy report."""
+    registry, stale, module = _registry()
+    registry.open(_find_device)
+    _live_default_input(coreaudio_stub, 77)
+    fresh = MagicMock(name="PyAudioInstance-fresh")
+    module.PyAudio = MagicMock(return_value=fresh)
+
+    result = registry.refresh(_find_device, None, None, threading.current_thread())
+
+    assert result.busy is False
+    stale.terminate.assert_called_once()
+    assert result.pyaudio is fresh
+
+
 # ---------------------------------------------------------------------------
 # Adoption and the supersede check
 # ---------------------------------------------------------------------------
@@ -343,6 +395,25 @@ def test_superseded_adopt_disposes_an_untracked_fresh_instance():
 
     assert ok is False
     orphan.terminate.assert_called_once()
+
+
+def test_superseded_adopt_disposes_the_registered_instance_the_worker_built():
+    """The flow that actually happens (issue #72 review): attempt_open_once
+    registers the instance it constructs, so an abandoned instance is IN the
+    registry while the session stays unbound -- registry_for(None) is None
+    for the next press and refresh() can never reach it. Left alone it
+    holds PortAudio's init count above zero for the life of the process:
+    the frozen device list this module exists to clear."""
+    registry, worker_pa, _ = _registry()
+    registry.register(worker_pa)  # what attempt_open_once did
+    assert registry.pyaudio is None  # the session was never bound
+
+    ok, _ = _adopt(registry, worker_pa, MagicMock(name="stream"), [True], [False])
+
+    assert ok is False
+    worker_pa.terminate.assert_called_once()
+    registry.terminate_all()  # forgotten: cleanup must not terminate twice
+    worker_pa.terminate.assert_called_once()
 
 
 def test_check_superseded_reports_and_logs(capsys):
