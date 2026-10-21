@@ -224,10 +224,15 @@ class AudioRecorder:
         with self._lock:
             self.pyaudio, self.input_device_index = pa, device_index
 
-    def _restart_warm(self) -> None:
-        """Re-arm the keep-warm capture after a reset replaced its session."""
+    def _rearm_warm(self, usable: bool) -> None:
+        """Re-arm the keep-warm capture after a reset replaced its session.
+        usable=False is the busy path: a capture that would not stop is
+        dead (its stop event is set, so it can never re-open) -- drop it
+        and later presses take the worker path, not a dead sink.
+        """
         self._warm = None
-        self.set_keep_warm(True)
+        if usable:
+            self.set_keep_warm(True)
 
     def _announce_capture(self, my_gen: int) -> None:
         """Fire on_capture_started at most once per start_recording() cycle
@@ -349,24 +354,13 @@ class AudioRecorder:
         stop_recording()'s stuck-open path (recording=False, still in a
         native open) must not wedge later presses (issue #60), yet two
         opens must not overlap on the shared PyAudio (issue #16): the new
-        worker gets the orphan and joins it before opening.
-
-        With keep-warm on there is no worker, so the press itself runs
-        the live-default check (issue #72).
+        worker gets the orphan and joins it before opening; the session
+        gate runs a keep-warm press's live-default check (#72).
         """
-        warm = self._warm
-        # Refused below, so it must not reach the reset either: refresh()
-        # would stop the warm capture feeding the live recording (#72).
-        if (
-            warm is not None
-            and not self.recording
-            and not self._session.press_check(
-                find_default_input_device,
-                warm,
-                self._restart_warm,
-                self.recording_thread,
-            )
-        ):
+        if not self._session.press_check_if_admissible(
+            self.recording, self._warm, self.recording_thread,
+            find_default_input_device, self._rearm_warm,
+        ):  # fmt: skip
             self.last_error = "microphone busy — recording did not start"
             return False
 
@@ -498,8 +492,7 @@ class AudioRecorder:
             self.input_device_index = None
 
         # Issue #72: every registered instance goes -- a single instance
-        # anywhere keeps PortAudio's init count above zero and its device
-        # list frozen.
+        # anywhere keeps PortAudio's init count above zero and frozen.
         self._session.terminate_all()
 
     def __del__(self):

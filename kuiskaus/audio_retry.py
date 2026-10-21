@@ -350,6 +350,15 @@ def refresh_pyaudio_session(
     if registry is None:
         return pyaudio_instance, input_device_index
     result = registry.refresh(find_default_input_device, blocked_worker=blocked_worker)
+    if result.busy:
+        # The press proceeds against the stale session (the only safe
+        # move while a thread may be inside a native call), but the
+        # deferral must be observable in the same log stream as the
+        # open attempts themselves (#72 review).
+        print(
+            "[audio.retry] device reset deferred: a worker may still hold "
+            "PortAudio; session stays dirty for the next press."
+        )
     return result.pyaudio, result.input_device_index
 
 

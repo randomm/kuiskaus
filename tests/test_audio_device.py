@@ -93,6 +93,36 @@ def test_no_default_device_at_all_is_no_evidence(coreaudio_stub):
     assert session_needs_reset(live, None) is False
 
 
+def test_a_raising_bridge_read_is_no_evidence(coreaudio_stub, capsys):
+    """The PyObjC bridge itself can raise (marshalling under a coreaudiod
+    storm, a first-call import failure). The reader's contract is None --
+    'no evidence' -- never an exception: this read runs on the
+    AudioRecorder.__init__ path (menubar/app construct it unguarded) and
+    on the press path, so an escape there is an app that will not launch
+    or a hotkey handler that dies mid-press (#72 review)."""
+    coreaudio_stub.AudioObjectGetPropertyData.side_effect = OSError("coreaudiod storm")
+    assert read_live_default_input() is None
+    assert "CoreAudio property read failed" in capsys.readouterr().out
+
+
+def test_a_raising_address_constructor_is_no_evidence(coreaudio_stub):
+    coreaudio_stub.AudioObjectPropertyAddress.side_effect = RuntimeError(
+        "bridge marshalling"
+    )
+    assert read_live_default_input() is None
+
+
+def test_open_survives_a_hostile_bridge(coreaudio_stub):
+    """__init__'s session open binds the instance even when every CoreAudio
+    call raises: no baseline, no crash (the retry loop re-binds later)."""
+    coreaudio_stub.AudioObjectGetPropertyData.side_effect = OSError("storm")
+    registry, pa, _ = _registry()
+
+    assert registry.open(_find_device) is True
+    assert registry.pyaudio is pa
+    assert registry.device_id is None
+
+
 # ---------------------------------------------------------------------------
 # The change predicate
 # ---------------------------------------------------------------------------
@@ -304,6 +334,86 @@ def test_reset_reports_busy_rather_than_terminating_under_a_live_worker(
     assert result.pyaudio is pa  # nothing torn down
     pa.terminate.assert_not_called()
     assert module.PyAudio.call_count == 1  # ... and nothing rebuilt
+
+
+# ---------------------------------------------------------------------------
+# The keep-warm press gate
+# ---------------------------------------------------------------------------
+
+
+def test_refused_press_is_admitted_without_touching_the_session(
+    coreaudio_stub,
+):
+    """The recorder refuses a press while a recording is live, so the gate
+    must not reach refresh() first: that would stop the warm capture
+    feeding the in-progress recording and rebuild under it (#72 review)."""
+    registry, pa, module = _registry()
+    registry.open(_find_device)
+    _live_default_input(coreaudio_stub, 77)  # the default moved mid-capture
+    warm = MagicMock(name="warm")
+    rearm = MagicMock(name="rearm-warm")
+
+    assert registry.press_check_if_admissible(True, warm, None, _find_device, rearm)
+    warm.stop.assert_not_called()  # the live capture keeps delivering
+    pa.terminate.assert_not_called()
+    assert module.PyAudio.call_count == 1  # nothing rebuilt
+    rearm.assert_not_called()
+
+
+def test_press_without_a_warm_capture_never_runs_a_press_side_reset(
+    coreaudio_stub,
+):
+    """With no keep-warm capture there is no press-side reset: the worker
+    refreshes at the top of its own loop (issue #72)."""
+    registry, pa, module = _registry()
+    registry.open(_find_device)
+    _live_default_input(coreaudio_stub, 77)
+    rearm = MagicMock(name="rearm-warm")
+
+    assert registry.press_check_if_admissible(False, None, None, _find_device, rearm)
+    pa.terminate.assert_not_called()
+    assert module.PyAudio.call_count == 1
+    rearm.assert_not_called()
+
+
+def test_busy_warm_reset_drops_the_capture_it_could_not_stop(coreaudio_stub):
+    """A capture whose stop() timed out is dead: its stop event is set, so
+    when the stuck read returns the thread exits and it can never
+    re-open. The busy return must hand it back as rearm(False) so the
+    recorder clears _warm -- otherwise the next press that needs no reset
+    records silently into that dead sink (#72 review)."""
+    registry, pa, module = _registry()
+    registry.open(_find_device)
+    _live_default_input(coreaudio_stub, 77)
+    warm = MagicMock(name="warm")
+    warm.stop.return_value = False
+    rearm = MagicMock(name="rearm-warm")
+
+    admissible = registry.press_check_if_admissible(
+        False, warm, None, _find_device, rearm
+    )
+
+    assert admissible is False  # the press fails "microphone busy"
+    rearm.assert_called_once_with(False)  # recorder-side drop, logged
+    warm.stop.assert_called_once()
+    pa.terminate.assert_not_called()  # the engine is still up -- untouched
+    assert module.PyAudio.call_count == 1  # ... and nothing was rebuilt
+
+
+def test_successful_warm_reset_rearms_the_capture(coreaudio_stub):
+    registry, pa, module = _registry()
+    registry.open(_find_device)
+    _live_default_input(coreaudio_stub, 77)
+    fresh = MagicMock(name="PyAudioInstance-fresh")
+    module.PyAudio.side_effect = [fresh]
+    warm = MagicMock(name="warm")
+    warm.stop.return_value = True
+    rearm = MagicMock(name="rearm-warm")
+
+    assert registry.press_check_if_admissible(False, warm, None, _find_device, rearm)
+    warm.stop.assert_called_once()
+    pa.terminate.assert_called_once()
+    rearm.assert_called_once_with(True)
 
 
 def test_the_worker_running_a_reset_is_never_its_own_blocker(coreaudio_stub):

@@ -76,15 +76,21 @@ def _read_uint32(object_id: int, selector: int, scope: int, element: int) -> int
     """One UInt32 property read, or None if CoreAudio refused it.
 
     CoreAudio reports failure as a nonzero OSStatus rather than raising,
-    so a None here means "no evidence" -- never "absent"."""
-    import CoreAudio
+    so a None here means "no evidence" -- never "absent". But the PyObjC
+    bridge around those calls CAN raise (marshalling under a coreaudiod
+    storm, a first-call import failure), and this read runs on the
+    AudioRecorder.__init__ and press paths, where an escaping exception
+    is an app that never launches. Both failure shapes collapse to None."""
+    try:
+        import CoreAudio
 
-    address = CoreAudio.AudioObjectPropertyAddress(
-        selector, scope, element
-    )  # fmt: skip
-    status, _size, raw = CoreAudio.AudioObjectGetPropertyData(
-        object_id, address, 0, _NO_QUALIFIER, _SIZE_BYTES, _OUT_BUFFER
-    )  # fmt: skip
+        address = CoreAudio.AudioObjectPropertyAddress(selector, scope, element)
+        status, _size, raw = CoreAudio.AudioObjectGetPropertyData(
+            object_id, address, 0, _NO_QUALIFIER, _SIZE_BYTES, _OUT_BUFFER
+        )  # fmt: skip
+    except Exception as e:  # noqa: BLE001 - PyObjC/CoreAudio boundary, logged
+        print(f"CoreAudio property read failed ({e}); treating as no evidence.")
+        return None
     if status != 0 or not isinstance(raw, (bytes, bytearray)):
         return None
     return int.from_bytes(raw, sys.byteorder)
@@ -292,8 +298,11 @@ class PyAudioRegistry:
                 # device list this module exists to clear. The recorder's
                 # own live session is never touched here -- a later press
                 # still needs it, and the retry loop opens on that instance.
-                # Untracking happens under the lock, the terminate() does
-                # not: no native call runs under the recorder lock.
+                # Untracking happens under the lock; the terminate() runs
+                # outside it. close_stream_quietly() just above is the one
+                # native call that still runs under the lock: it closes
+                # THIS worker's own abandoned stream (pre-existing shape,
+                # never another thread's in-flight I/O).
                 if new_pa is not self.pyaudio:
                     orphan = new_pa
                     self.forget(new_pa)
@@ -332,7 +341,7 @@ class PyAudioRegistry:
         self,
         find_default_input_device: Callable[[pyaudio.PyAudio], int],
         warm: WarmCapture | None = None,
-        restart_warm: Callable[[], None] | None = None,
+        rearm_warm: Callable[[bool], None] | None = None,
         blocked_worker: threading.Thread | None = None,
     ) -> SessionRefresh:
         """Reset the session when the live default moved (issue #72).
@@ -373,14 +382,23 @@ class PyAudioRegistry:
 
         warm_stopped = warm is None or warm.stop()
         if not warm_stopped:
+            # The stuck read owns a capture whose stop event is already
+            # set: when the read returns the thread exits and THIS capture
+            # can never re-open. Left installed, the next press that needs
+            # no reset would be admitted and record silently into a dead
+            # sink, so rearm_warm(False) tells the recorder to drop it --
+            # later presses take the worker path (issue #72 review).
+            print("Keep-warm capture would not stop; dropping it.")
+            if rearm_warm is not None:
+                rearm_warm(False)
             return SessionRefresh(self.pyaudio, self.input_device_index, True)
 
         self.terminate_all()
         self.pyaudio = None
         self.input_device_index = None
         rebuilt = self.open(find_default_input_device)
-        if warm_stopped and warm is not None and restart_warm is not None:
-            restart_warm()
+        if warm_stopped and warm is not None and rearm_warm is not None:
+            rearm_warm(True)
         if not rebuilt:
             # The engine never came back. Leave the session unbound -- the
             # next press re-reads the live device and retries, with
@@ -388,18 +406,30 @@ class PyAudioRegistry:
             return SessionRefresh(None, None, False)
         return SessionRefresh(self.pyaudio, self.input_device_index, False)
 
-    def press_check(
+    def press_check_if_admissible(
         self,
+        recording: bool,
+        warm: WarmCapture | None,
+        worker: threading.Thread | None,
         find_default_input_device: Callable[[pyaudio.PyAudio], int],
-        warm: WarmCapture,
-        restart_warm: Callable[[], None],
-        blocked_worker: threading.Thread | None = None,
+        rearm_warm: Callable[[bool], None],
     ) -> bool:
-        """A keep-warm press runs the live-default check itself (there is
-        no worker to run it). False = fail this press "microphone busy".
+        """The keep-warm press gate (issue #72): run the live-default
+        check, or say why this press must not run it.
+
+        The gate lives here, next to the reset it protects: a press the
+        recorder is about to refuse (``recording``) must NOT reach
+        refresh() -- it would stop the warm capture feeding that live
+        recording and rebuild the session underneath it -- and a press
+        with no warm capture has no press-side reset to run at all (its
+        worker refreshes at the top of its own loop). Both are admitted
+        (True). An admitted keep-warm press runs the reset itself; False
+        = fail this press "microphone busy".
         """
+        if recording or warm is None:
+            return True
         return not self.refresh(
-            find_default_input_device, warm, restart_warm, blocked_worker
+            find_default_input_device, warm, rearm_warm, worker
         ).busy
 
 
