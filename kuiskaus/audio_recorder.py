@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import pyaudio
 
+from kuiskaus.audio_device import PyAudioRegistry, check_superseded
 from kuiskaus.audio_resample import TARGET_RATE, assemble_audio
 from kuiskaus.audio_retry import (
     MAX_ATTEMPTS,
@@ -18,14 +19,17 @@ from kuiskaus.audio_retry import (
     format_microphone_error,
     log_retry_attempt,
     log_stop,
-    open_cached_session,
     open_warm_stream,
     refresh_pyaudio_session,
-    terminate_quietly,
     validate_retry_config,
     worker_alive,
 )
 from kuiskaus.audio_warm import WarmCapture
+
+# Aliases for annotations written inside the class body, where the
+# ``pyaudio`` property (issue #72) otherwise shadows the module name.
+_PyAudio = pyaudio.PyAudio
+_Stream = pyaudio.Stream
 
 # Re-exported so `import kuiskaus.audio_recorder` keeps exposing the
 # retry-policy constants (tests and docs reference them here).
@@ -47,9 +51,11 @@ class AudioRecorder:
         retry_backoff_seconds: Sequence[float] = RETRY_BACKOFF_SECONDS,
         on_capture_started: Callable[[], None] | None = None,
     ) -> None:
-        # Defensive state first: __del__ -> cleanup() can run on a
-        # partially-constructed instance without a hasattr guard.
-        self.pyaudio: pyaudio.PyAudio | None = None
+        # The device session exists before anything else: __del__ ->
+        # cleanup() runs on a partially-constructed instance, and the
+        # pyaudio attributes resolve through it.
+        self._session = PyAudioRegistry(pyaudio)
+        # Defensive state next: cleanup() reads it without a hasattr guard.
         self.stream: pyaudio.Stream | None = None
         self.recording = False
         self.audio_queue: queue.Queue[bytes] = queue.Queue()
@@ -70,8 +76,29 @@ class AudioRecorder:
         self.max_attempts = max_attempts
         self.retry_backoff_seconds = retry_backoff_seconds
         self._stuck_open_timeout_seconds: float = sum(retry_backoff_seconds) + 0.5
-        # Persistent cached PyAudio session (issue #42).
-        self.pyaudio, self.input_device_index = open_cached_session(pyaudio)
+        # Persistent cached session (issue #42), tracked by the device
+        # session's registry so terminate_all() can drive PortAudio's init
+        # count to zero for a device refresh (issue #72).
+        self._session.open(find_default_input_device)
+
+    @property
+    def pyaudio(self) -> "_PyAudio | None":
+        """The live cached session (issue #42), owned by the device
+        session's registry so terminate_all() reaches every instance."""
+        return self._session.pyaudio
+
+    @pyaudio.setter
+    def pyaudio(self, pa: "_PyAudio | None") -> None:
+        self._session.pyaudio = pa
+
+    @property
+    def input_device_index(self) -> int | None:
+        """Device index resolved against ``pyaudio`` (issue #42)."""
+        return self._session.input_device_index
+
+    @input_device_index.setter
+    def input_device_index(self, index: int | None) -> None:
+        self._session.input_device_index = index
 
     @property
     def current_generation(self) -> int:
@@ -89,75 +116,33 @@ class AudioRecorder:
         before any open succeeds."""
         return self._capture_rate
 
-    def _check_superseded(
-        self, my_gen: int, attempt: int, attempt_start: float
-    ) -> bool:
-        """Return True (and log the abort) if this retry sequence has
-        been superseded: a newer generation took over, or recording
-        was released. Shared by the pre-sleep and post-sleep abort
-        sites (issue #37 lens review MEDIUM #7: previously duplicated)."""
-        with self._lock:
-            if self._generation != my_gen or not self.recording:
-                log_retry_attempt(
-                    attempt, self.max_attempts, attempt_start, None, "abort"
-                )
-                return True
-            return False
+    def _check_superseded(self, my_gen: int, attempt: int, attempt_start: float) -> bool:  # fmt: skip
+        """True (and logged) if this retry sequence lost its race."""
+        return check_superseded(
+            self._lock,
+            lambda: self._generation != my_gen or not self.recording,
+            attempt, self.max_attempts, attempt_start,
+        )  # fmt: skip
 
-    def _adopt_and_dispose_previous(
-        self,
-        new_pa: "pyaudio.PyAudio",
-        stream: "pyaudio.Stream",
-        capture_rate: int | None,
-        my_gen: int,
-        attempt: int,
-        attempt_start: float,
-    ) -> bool:
-        """Lock-scoped ownership transfer: adopt new_pa, its stream, and
-        the capture rate into self.pyaudio, terminating the previous
-        session's instance. A retry (attempt >= 2) adopts a fresh instance
-        and disposes the previous; attempt 1 (issue #42) adopts the cached
-        instance. Returns False if superseded while retrying."""
-        with self._lock:
-            if self._generation != my_gen or not self.recording:
-                close_stream_quietly(stream)
-                # A fresh (unadopted) retry instance: this worker owns its
-                # termination -- cleanup() never sees it (not reassigned).
-                if attempt > 1:
-                    terminate_quietly(new_pa)
-                log_retry_attempt(
-                    attempt, self.max_attempts, attempt_start, None, "abort"
-                )
-                return False
-            # Capture the previous instance locally and reassign under
-            # the same lock acquisition that writes self.pyaudio
-            # (issue #55: the capture rate is written alongside the
-            # stream so stop_recording() sees an atomic rate + stream).
-            old_pyaudio = self.pyaudio
-            self.pyaudio = new_pa
-            self._capture_rate = capture_rate
-            if attempt == 1:
-                return True  # cached instance: device index still valid
+    def _adopt_and_dispose_previous(self, new_pa, stream, capture_rate, my_gen, attempt, attempt_start) -> bool:  # fmt: skip
+        """Lock-scoped ownership transfer into the device session, which
+        owns the live instance (issue #72). False = superseded."""
+        return self._session.adopt(
+            self._lock,
+            lambda: self._generation != my_gen or not self.recording,
+            lambda rate: setattr(self, "_capture_rate", rate),
+            lambda: self.stream is not None,
+            new_pa, stream, capture_rate, attempt, attempt_start, self.max_attempts,
+        )  # fmt: skip
 
-        # Outside the lock: whoever captures old_pyaudio owns its
-        # termination (cleanup() uses the same pattern, so double-
-        # terminate is impossible by construction).
-        #
-        # Invariant (lens review HIGH #3): self.stream is ALWAYS None
-        # here -- only _recording_worker writes it, AFTER
-        # _open_stream_with_retry returns, so the post-lock read is a
-        # defensive guard, not a racy gate.
-        if old_pyaudio is not None and self.stream is None:
-            terminate_quietly(old_pyaudio)
-        return True
-
-    def _open_stream_with_retry(self, my_gen: int) -> "pyaudio.Stream | None":
+    def _open_stream_with_retry(self, my_gen: int) -> "_Stream | None":
         """Open the input stream, retrying with backoff up to
-        ``self.max_attempts``. Attempt 1 reuses the cached ``self.pyaudio``
-        and ``self.input_device_index`` (issue #42); retries 2..N
-        construct a fresh PyAudio() and re-resolve the device (issue #37).
-        Returns the opened stream, or None if all attempts failed or the
-        generation was superseded mid-retry."""
+        ``self.max_attempts``. Every attempt reuses the single live
+        ``self.pyaudio`` and the index resolved against it (issue #72):
+        constructing one per attempt kept PortAudio's init count above
+        zero, so no retry ever re-enumerated devices. Returns the opened
+        stream, or None if all attempts failed or the generation was
+        superseded."""
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_attempts + 1):
@@ -188,14 +173,12 @@ class AudioRecorder:
                 self.max_attempts,
                 attempt,
                 attempt_start,
-                # Issue #42: attempt 1 reuses the cached session; its
-                # device was already resolved against the cache at
-                # construction/poll time (issue #38's per-attempt
-                # re-resolution stays on retries 2..N).
-                existing_pa=self.pyaudio if attempt == 1 else None,
-                existing_device_index=(
-                    self.input_device_index if attempt == 1 else None
-                ),
+                # Issue #72: reuse the live instance and the index resolved
+                # against it (a None index re-resolves on that same
+                # instance) -- never a second live instance alongside one.
+                existing_pa=self.pyaudio,
+                existing_device_index=self.input_device_index,
+                registry=self._session,
             )
             if stream is None:
                 last_error = error
@@ -228,12 +211,9 @@ class AudioRecorder:
         return None
 
     def _refresh_pyaudio_session(self) -> None:
-        """Device-change poll + on-demand construction (issue #42), run at
-        the top of _recording_worker; delegates to audio_retry.
-
-        Native calls run OUTSIDE _lock (issue #60): they can block for
-        seconds and stop_recording() needs the lock. One worker runs this
-        at a time (a new worker waits for its predecessor).
+        """Live-default device reset (issue #72) at the top of the worker.
+        Native calls run OUTSIDE _lock (issue #60): they can block and
+        stop_recording() needs the lock. One worker runs this at a time.
         """
         with self._lock:
             pa, device_index = self.pyaudio, self.input_device_index
@@ -242,6 +222,11 @@ class AudioRecorder:
         )
         with self._lock:
             self.pyaudio, self.input_device_index = pa, device_index
+
+    def _restart_warm(self) -> None:
+        """Re-arm the keep-warm capture after a reset replaced its session."""
+        self._warm = None
+        self.set_keep_warm(True)
 
     def _announce_capture(self, my_gen: int) -> None:
         """Fire on_capture_started at most once per start_recording() cycle
@@ -272,7 +257,7 @@ class AudioRecorder:
             self._capture_rate = warm.capture_rate  # for an in-flight recording
             warm.stop()
 
-    def _open_warm_stream(self) -> tuple["pyaudio.Stream", int]:
+    def _open_warm_stream(self) -> tuple["_Stream", int]:
         """One open for WarmCapture's thread. Never overlaps a per-press
         worker's native open on the shared PyAudio (issue #16)."""
         previous = self.recording_thread
@@ -283,7 +268,7 @@ class AudioRecorder:
             pa, device_index = self.pyaudio, self.input_device_index
         new_pa, stream, rate = open_warm_stream(
             pyaudio, pa, device_index, self.format, self.channels,
-            self.sample_rate, self.chunk_size,
+            self.sample_rate, self.chunk_size, self._session,
         )  # fmt: skip
         if new_pa is not pa:
             with self._lock:
@@ -364,7 +349,17 @@ class AudioRecorder:
         native open) must not wedge later presses (issue #60), yet two
         opens must not overlap on the shared PyAudio (issue #16): the new
         worker gets the orphan and joins it before opening.
+
+        With keep-warm on there is no worker, so the press itself runs
+        the live-default check (issue #72).
         """
+        warm = self._warm
+        if warm is not None and not self._session.press_check(
+            find_default_input_device, warm, self._restart_warm
+        ):
+            self.last_error = "microphone busy — recording did not start"
+            return False
+
         with self._lock:
             warm = self._warm
             previous = self.recording_thread
@@ -489,11 +484,13 @@ class AudioRecorder:
                     "PyAudio.terminate()"
                 )
                 return
-            old_pyaudio = self.pyaudio
             self.pyaudio = None
+            self.input_device_index = None
 
-        if old_pyaudio is not None:
-            terminate_quietly(old_pyaudio)
+        # Issue #72: every registered instance goes -- a single instance
+        # anywhere keeps PortAudio's init count above zero and its device
+        # list frozen.
+        self._session.terminate_all()
 
     def __del__(self):
         self.cleanup()

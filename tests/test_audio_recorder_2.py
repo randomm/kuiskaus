@@ -17,26 +17,25 @@ from tests.support_audio_recorder import (
 # ---------------------------------------------------------------------------
 # Retry: inline, best-effort, exactly one
 # ---------------------------------------------------------------------------
-def test_retry_succeeds_constructs_fresh_pyaudio_and_reresolves_device(
+def test_retry_reuses_the_live_session_and_constructs_nothing(
     audio_recorder_module,
 ):
-    """Issue #42: attempt 1 reuses the cached self.pyaudio (pa1) and
-    its cached device index; a failed attempt-1 open costs no
-    construction. The retry (attempt 2) constructs a fresh PyAudio()
-    and re-resolves the device against it -- PR #38's retry behaviour,
-    unchanged. Success lands on exactly attempt 2: 1 cached
-    construction (__init__) + 1 fresh retry = 2 total."""
+    """Issue #72 replaces issue #42's per-retry construction: every
+    attempt opens on the single live PyAudio instance. Constructing a
+    fresh one per attempt left PortAudio's init count above zero, so the
+    retry replayed the same frozen device snapshot -- re-enumerating is
+    the device reset's job, not the retry's. Success lands on attempt 2
+    with exactly ONE construction (the __init__ cache)."""
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
-    pa1.open.side_effect = OSError("first attempt failed")
-    pa_retry = _make_pyaudio_instance(7)
     release_event = threading.Event()
     retry_stream = _blocking_stream(
         OSError("stop the loop after adoption"), release_event
     )
-    pa_retry.open.return_value = retry_stream
+    # A transient storm: the first open fails, the retry's succeeds.
+    pa1.open.side_effect = [OSError("first attempt failed"), retry_stream]
 
-    recorder = _make_recorder(module, pa_retry, init_probe=pa1)
+    recorder = _make_recorder(module, init_probe=pa1)
     # 1: __init__'s cached construction only -- no attempt has run yet.
     assert module.pyaudio.PyAudio.call_count == 1
 
@@ -44,16 +43,14 @@ def test_retry_succeeds_constructs_fresh_pyaudio_and_reresolves_device(
     thread = recorder.recording_thread
     assert thread is not None
 
-    # Bounded wait for adoption: recorder.pyaudio only becomes pa_retry
-    # once the retry's open() has succeeded and been adopted.
-    assert _wait_until(lambda: recorder.pyaudio is pa_retry)
-
-    # Exactly one fresh construction (retry attempt 2): 1 (__init__) + 1.
-    assert module.pyaudio.PyAudio.call_count == 2
-    # Cached attempt 1 resolved at __init__ (device -1); the retry
-    # re-resolves against its fresh instance (device 7). The rate query
-    # (issue #55) makes a second call on the same instance.
-    assert pa_retry.get_default_input_device_info.call_count >= 1
+    # Bounded wait for the retry's open: the stream is open on the cached
+    # instance, which the retry never replaced.
+    assert _wait_until(lambda: pa1.open.call_count >= 2)
+    # No second live instance alongside the first (issue #72).
+    assert module.pyaudio.PyAudio.call_count == 1
+    assert recorder.pyaudio is pa1
+    # The retry re-resolved the device on that same instance.
+    assert pa1.get_default_input_device_info.call_count >= 1
     assert thread.is_alive()  # still blocked in read()
 
     release_event.set()

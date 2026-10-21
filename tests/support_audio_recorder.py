@@ -22,6 +22,7 @@ timeout. No wait in this file is unbounded.
 """
 
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -75,6 +76,37 @@ def _assert_stop_log_line(
         assert match is not None
         assert int(match.group(2)) >= duration_ms_min
     assert f"reason={reason}" in log_lines[0]
+
+
+def _live_default_input(stub: MagicMock, device_id: int, is_alive: bool = True) -> None:
+    """Make the stubbed CoreAudio bridge report ``device_id`` as the live
+    system default input (issue #72).
+
+    The autouse stub's default is "every read fails" -- no evidence, so
+    ``read_live_default_input()`` returns None and the recorder takes the
+    no-reset fast path, which is what the pre-#72 recorder tests were
+    written against. A test that exercises the device-change reset has to
+    say what the system default actually is; call this again with a
+    different id to move it.
+
+    Pass the ``coreaudio_stub`` fixture's mock. The baseline the session
+    compares against is captured when the session is built, so a test
+    that never calls this before construction gets ``device_id`` None --
+    and any live read then counts as a change.
+    """
+    from kuiskaus.audio_device import (
+        kAudioDevicePropertyDeviceIsAlive,
+        kAudioHardwarePropertyDefaultInputDevice,
+    )
+
+    def _read(_object_id, address, _qualifier_size, _qualifier, _size, _out):
+        if address.mSelector == kAudioHardwarePropertyDefaultInputDevice:
+            return 0, 4, device_id.to_bytes(4, sys.byteorder)
+        if address.mSelector == kAudioDevicePropertyDeviceIsAlive:
+            return 0, 4, int(is_alive).to_bytes(4, sys.byteorder)
+        return 1852797079, 0, None  # 'who?' -- unknown property
+
+    stub.AudioObjectGetPropertyData.side_effect = _read
 
 
 def _make_pyaudio_instance(

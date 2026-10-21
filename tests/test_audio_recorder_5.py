@@ -235,32 +235,32 @@ def test_on_capture_started_default_none_is_backwards_compatible(
 
 def test_on_capture_started_fires_after_retry_adoption(audio_recorder_module):
     """The callback fires on the FIRST successful non-empty read ACROSS
-    ALL attempts, i.e. after retry adoption lands and the adopted stream
+    ALL attempts, i.e. after the retried open lands and its stream
     delivers its first bytes -- not once per retry attempt. Attempt 1
     never reaches a read() (open() fails), so no callback fires from it.
     A non-empty read on the adopted (attempt-2) stream fires it exactly
-    once."""
+    once. Issue #72: the retry opens on the same live instance."""
     module = audio_recorder_module
     callback = MagicMock()
     pa1 = _make_pyaudio_instance(0)
-    pa1.open.side_effect = OSError("attempt 1 failed")
-    pa_retry = _make_pyaudio_instance(1)
     release_event = threading.Event()
-    pa_retry.open.return_value = _blocking_read_stream(b"\x00" * 2048, release_event)
+    pa1.open.side_effect = [
+        OSError("attempt 1 failed"),
+        _blocking_read_stream(b"\x00" * 2048, release_event),
+    ]
 
     recorder = _make_recorder(
         module,
-        pa_retry,
         init_probe=pa1,
         max_attempts=2,
         on_capture_started=callback,
     )
     assert recorder.start_recording() is True
-    # Wait for the retry adoption, then for the callback to fire on the
+    # Wait for the retry's open, then for the callback to fire on the
     # adopted stream's first non-empty read; by then the worker is
     # blocked on release_event inside read(), so the capture is
     # race-free (post-adoption idiom).
-    assert _wait_until(lambda: recorder.pyaudio is pa_retry, timeout=5.0)
+    assert _wait_until(lambda: recorder.stream is not None, timeout=5.0)
     assert _wait_until(lambda: callback.call_count == 1, timeout=5.0)
     thread = recorder.recording_thread
     assert thread is not None
@@ -441,28 +441,29 @@ def test_capture_rate_accessible_via_property(audio_recorder_module):
         recorder.capture_rate = 99999
 
 
-def test_native_rate_requeried_on_retry_with_fresh_instance(audio_recorder_module):
-    """Issue #55: the native rate is re-queried per attempt against
-    whichever pa instance performs the open. A retry on a fresh instance
-    with a different native rate uses that instance's rate."""
+def test_native_rate_queried_against_the_instance_that_opens(audio_recorder_module):
+    """Issue #55: the native rate is queried per attempt against the pa
+    instance performing the open (issue #72: the retry loop reuses the one
+    live instance, so its rate is the one used)."""
     module = audio_recorder_module
-    pa1 = _make_pyaudio_instance(0, 48000.0)
-    pa1.open.side_effect = OSError("attempt 1 failed")
-    pa_retry = _make_pyaudio_instance(1, 24000.0)
+    pa1 = _make_pyaudio_instance(0, 24000.0)
     release_event = threading.Event()
-    retry_stream = _blocking_stream(OSError("stop the loop"), release_event)
-    pa_retry.open.return_value = retry_stream
+    pa1.open.side_effect = [
+        OSError("attempt 1 failed"),
+        _blocking_stream(OSError("stop the loop"), release_event),
+    ]
 
     recorder = _make_recorder(
-        module, pa_retry, init_probe=pa1, max_attempts=2, retry_backoff_seconds=(0.01,)
+        module, init_probe=pa1, max_attempts=2, retry_backoff_seconds=(0.01,)
     )
     assert recorder.start_recording() is True
-    assert _wait_until(lambda: recorder.pyaudio is pa_retry, timeout=5.0)
+    assert _wait_until(lambda: recorder.stream is not None, timeout=5.0)
     thread = recorder.recording_thread
     assert thread is not None
 
-    # The retry's fresh instance reported 24000; that's the rate used.
+    # The instance that opened reported 24000; that's the rate used.
     assert recorder.capture_rate == 24000
+    assert module.pyaudio.PyAudio.call_count == 1
 
     release_event.set()
     thread.join(timeout=10.0)

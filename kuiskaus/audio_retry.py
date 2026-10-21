@@ -12,9 +12,12 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from types import ModuleType
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import pyaudio
+
+if TYPE_CHECKING:
+    from kuiskaus.audio_device import PyAudioRegistry
 
 # Bounded attempt count for the microphone-open backoff-and-re-enumerate
 # loop (issue #37). Attempt 1 runs immediately; attempts 2..MAX_ATTEMPTS
@@ -68,13 +71,18 @@ def attempt_open_once(
     attempt_start: float,
     existing_pa: "pyaudio.PyAudio | None" = None,
     existing_device_index: int | None = None,
+    registry: "PyAudioRegistry | None" = None,
 ) -> tuple[
     "pyaudio.PyAudio | None", "pyaudio.Stream | None", "Exception | None", int | None
 ]:
     """One attempt: construct a fresh PyAudio() (or reuse ``existing_pa``
-    when provided -- issue #42's attempt 1 reuses the cached instance
-    and its cached device index, skipping re-resolution) and open the
-    stream at the device's native sample rate (issue #55).
+    when provided -- issue #72's retry loop always provides it, so the
+    loop never leaves a second live instance behind) and open the stream
+    at the device's native sample rate (issue #55).
+
+    A constructed instance is registered with ``registry`` immediately --
+    PortAudio's init count is reference-counted, so an instance nobody
+    tracks is an instance terminate_all() can never reach.
 
     The native rate is queried from ``pa.get_device_info_by_index(
     device_index)["defaultSampleRate"]``. If the query fails or the
@@ -113,6 +121,8 @@ def attempt_open_once(
             # for persistent device-lookup failures -- stays unambiguous.
             log_retry_attempt(attempt, max_attempts, attempt_start, None, "open")
             return None, None, OSError(construct_error), None
+        if registry is not None:
+            registry.register(pa)
     else:
         # Issue #42 attempt 1: reuse the recorder's cached instance; the
         # call site owns it and keeps it on failure.
@@ -120,9 +130,9 @@ def attempt_open_once(
     assert pa is not None
 
     if existing_device_index is not None:
-        # Issue #42 attempt 1: the device was already resolved against
-        # the cached instance (at construction or by the worker's
-        # poll); skip the re-resolution.
+        # Issue #72: the loop reuses the live instance, whose device was
+        # already resolved (at construction or by an earlier attempt);
+        # skip the re-resolution.
         device_index = existing_device_index
     else:
         try:
@@ -135,15 +145,20 @@ def attempt_open_once(
                 attempt, max_attempts, attempt_start, device_error.errno, "open"
             )
             if owns_pa:
-                terminate_quietly(pa)
+                _dispose_attempt_instance(pa, registry)
             return None, None, device_error, None
         except RuntimeError as device_error:
             # find_default_input_device's own documented failure (no
             # input device found at all) -- persistent state.
             log_retry_attempt(attempt, max_attempts, attempt_start, None, "abort")
             if owns_pa:
-                terminate_quietly(pa)
+                _dispose_attempt_instance(pa, registry)
             return None, None, device_error, None
+        if registry is not None:
+            # The session was unbound: hand the resolved index back, or it
+            # dies with this attempt and every later press pays a fresh
+            # enumeration (issue #72).
+            registry.bind_index(device_index)
 
     # Issue #55: query the device's native sample rate so the stream
     # is opened at the rate CoreAudio actually uses, avoiding the
@@ -208,7 +223,7 @@ def attempt_open_once(
             attempt, max_attempts, attempt_start, open_error.errno, "open"
         )
         if owns_pa:
-            terminate_quietly(pa)
+            _dispose_attempt_instance(pa, registry)
         return None, None, open_error, None
 
     # 4-tuple (widened from 3-tuple in issue #55): the successful rate
@@ -225,6 +240,51 @@ def terminate_quietly(pa: "pyaudio.PyAudio") -> None:
         pa.terminate()
     except OSError as e:
         print(f"Error terminating PyAudio instance: {e}")
+
+
+# PortAudio's init count is reference-counted (issue #72): an instance is
+# only reachable by terminate_all() through the registry that built it, so
+# every registered instance carries a back-reference to its owning
+# session. Stamped by PyAudioRegistry.register(), read here so the worker's
+# device reset can find the session from the instance it was handed.
+_OWNER_ATTRIBUTE = "_kuiskaus_registry"
+
+
+def stamp_owner(pa: "pyaudio.PyAudio", registry: "PyAudioRegistry") -> None:
+    """Record which session registry built ``pa`` (see _OWNER_ATTRIBUTE)."""
+    try:
+        setattr(pa, _OWNER_ATTRIBUTE, registry)
+    except (AttributeError, TypeError):  # pragma: no cover - frozen instance
+        pass
+
+
+def registry_for(pa: "pyaudio.PyAudio | None") -> "PyAudioRegistry | None":
+    """The session registry that built ``pa`` (issue #72), or None.
+
+    None means no registry tracked this instance -- there is no tracked
+    set to drive to zero, so the caller leaves the session alone instead
+    of half-resetting it. The _instances check is what tells a stamped
+    registry apart from a mock object's auto-created attribute.
+    """
+    if pa is None:
+        return None
+    owner = getattr(pa, _OWNER_ATTRIBUTE, None)
+    if isinstance(getattr(owner, "_instances", None), list):
+        return owner
+    return None
+
+
+def _dispose_attempt_instance(
+    pa: "pyaudio.PyAudio", registry: "PyAudioRegistry | None"
+) -> None:
+    """Terminate an instance the attempt itself constructed, and untrack
+    it (issue #72): a terminated instance left in the registry would be
+    terminated twice, and an *untracked* live one is what keeps
+    PortAudio's init count above zero."""  # fmt: skip
+    if registry is None:
+        terminate_quietly(pa)
+    else:
+        registry.terminate(pa)
 
 
 def log_retry_attempt(
@@ -257,65 +317,33 @@ def refresh_pyaudio_session(
     input_device_index: int | None,
     find_default_input_device: Callable[["pyaudio.PyAudio"], int],
 ) -> tuple["pyaudio.PyAudio | None", int | None]:
-    """Device-change poll + on-demand construction (issue #42), called at
-    the top of the recording worker before the retry loop.
+    """Device-change reset (issue #72), called at the top of the recording
+    worker before the retry loop.
 
-    If ``pyaudio_instance`` is None (construction failed in __init__),
-    construct now. Then poll the default input device against the cached
-    instance: if the device moved (e.g. AirPods disconnected between
-    recordings) or the index was never resolved, terminate the stale
-    session and rebuild. A poll failure (enumeration OSError) is
-    swallowed -- the retry loop still handles genuinely stale state,
-    which is its original job (issue #37).
+    Replaces the issue #42 poll. That poll asked the CACHED instance what
+    its default input device was -- but PortAudio snapshots the hardware
+    once at Pa_Initialize and never refreshes it, so the comparison could
+    not observe a switch and the stale device survived every press. The
+    trigger is now a live CoreAudio read (kuiskaus.audio_device), and a
+    reset drives PortAudio's init count to zero through the session's
+    registry before rebuilding: a single untracked live instance is enough
+    to make the next construction replay the frozen device list.
+
+    ``pa_module`` is kept for call-site symmetry; the owning registry
+    holds the module it constructs from. An instance with no owning
+    registry is left untouched -- either the session was never bound (the
+    retry loop builds and registers it) or the instance came from outside
+    this session, and in neither case is there a tracked set to drive to
+    zero.
 
     Returns (pyaudio_instance, input_device_index) -- possibly both
     replaced. The caller is responsible for any lock scoping.
     """
-    if pyaudio_instance is None:
-        try:
-            pyaudio_instance = pa_module.PyAudio()
-        except Exception as e:  # noqa: BLE001 - PyAudio construction guard
-            print(f"PyAudio construction failed at worker start: {e}")
-        if pyaudio_instance is None:
-            return None, None
-
-    try:
-        current_idx = pyaudio_instance.get_default_input_device_info()["index"]
-    except (OSError, KeyError, TypeError):
+    registry = registry_for(pyaudio_instance)
+    if registry is None:
         return pyaudio_instance, input_device_index
-
-    if input_device_index is not None and current_idx == input_device_index:
-        return pyaudio_instance, input_device_index  # device stable
-
-    # Device moved (or index never resolved): rebuild the session against
-    # the new default. A poll failure here (enumeration OSError, no input
-    # device) falls through to the retry loop, which re-resolves fresh on
-    # its own instances (issue #37).
-    try:
-        new_idx = find_default_input_device(pyaudio_instance)
-    except (OSError, RuntimeError) as e:
-        print(
-            f"Default device poll failed at worker start: {e}; "
-            "retry loop will re-resolve."
-        )
-        return pyaudio_instance, input_device_index
-
-    if input_device_index is not None:
-        # A prior device index exists: the stale session must go.
-        # (Re-running the poll on a fresh instance could still show the
-        # old default -- coreaudiod can lag a device switch -- in which
-        # case the retry loop picks up the new device on its fresh
-        # instances.)
-        displaced = pyaudio_instance
-        try:
-            pyaudio_instance = pa_module.PyAudio()
-        except Exception as e:  # noqa: BLE001 - PyAudio construction guard
-            print(f"PyAudio construction failed at worker start: {e}")
-            pyaudio_instance = displaced
-            return pyaudio_instance, input_device_index
-        terminate_quietly(displaced)
-
-    return pyaudio_instance, new_idx
+    result = registry.refresh(find_default_input_device)
+    return result.pyaudio, result.input_device_index
 
 
 def close_stream_quietly(stream: "pyaudio.Stream") -> None:
@@ -363,11 +391,14 @@ def open_warm_stream(
     channels: int,
     sample_rate: int,
     chunk_size: int,
+    registry: "PyAudioRegistry | None" = None,
 ) -> tuple["pyaudio.PyAudio", "pyaudio.Stream", int]:
     """One attempt for the keep-warm stream (issue #66); raises on failure.
 
     Returns the PyAudio instance used (a fresh one if ``pa`` was None) so
     the caller can adopt it, the stream, and the rate it was opened at.
+    The instance is tracked in ``registry`` either way, so a warm session
+    is never the one live instance terminate_all() cannot see (issue #72).
     """
     new_pa, stream, error, rate = attempt_open_once(
         pa_module,
@@ -381,6 +412,7 @@ def open_warm_stream(
         time.monotonic(),
         existing_pa=pa,
         existing_device_index=device_index,
+        registry=registry,
     )
     if stream is None or new_pa is None or rate is None:
         raise error or OSError("warm open failed")
@@ -402,33 +434,6 @@ def validate_retry_config(
         raise ValueError(
             "retry_backoff_seconds must contain only finite, non-negative values"
         )
-
-
-def open_cached_session(
-    pa_module: ModuleType,
-) -> tuple["pyaudio.PyAudio | None", int | None]:
-    """Construct the persistent PyAudio session and resolve the default
-    input device (issue #42). Either part may come back None: the worker's
-    poll and the retry loop re-resolve at first recording."""
-    try:
-        pa = pa_module.PyAudio()
-    except Exception as construct_error:  # noqa: BLE001 - PyAudio()
-        # construction wraps PortAudio's Pa_Initialize(), whose
-        # failure modes aren't documented as a narrow exception set.
-        print(
-            "Warning: PyAudio construction failed at startup "
-            f"({construct_error}); will retry at first recording."
-        )
-        return None, None
-    try:
-        return pa, find_default_input_device(pa)
-    except (OSError, RuntimeError):
-        # Transient (coreaudiod storm at startup) or no device at all.
-        print(
-            "Warning: microphone probe failed at startup; "
-            "will re-resolve at first recording."
-        )
-        return pa, None
 
 
 def log_stop(chunks: int, start_monotonic: float | None, reason: str) -> None:

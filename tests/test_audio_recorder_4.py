@@ -9,6 +9,7 @@ import pytest
 from tests.support_audio_recorder import (
     _blocking_stream,
     _capture_callback_recorder,
+    _live_default_input,
     _make_pyaudio_instance,
     _make_recorder,
     _wait_until,
@@ -51,39 +52,39 @@ def test_no_reconstruction_when_device_stable(audio_recorder_module):
     assert _wait_until(lambda: recorder.recording is False, timeout=10.0)
 
 
-def test_poll_failure_falls_through_to_retry_loop(audio_recorder_module):
-    """Issue #42 DoD: a device-change poll that raises OSError (a
-    coreaudiod storm at worker start) must not wedge -- the cached state
-    is kept as-is and the retry loop handles the genuinely stale state:
-    attempt 1 fails on the cache, the retry re-resolves fresh on its own
-    instance and succeeds."""
+def test_enumeration_failure_falls_through_to_retry_loop(audio_recorder_module):
+    """Issue #42 DoD, rewritten for issue #72: a device resolution that
+    raises OSError at worker start (a coreaudiod storm) must not wedge --
+    the cached state is kept as-is and the retry loop handles the
+    genuinely stale state on the SAME live instance, which succeeds once
+    the storm passes."""
     module = audio_recorder_module
     pa_cached = _make_pyaudio_instance(0)
-    # The poll's get_default_input_device_info() raises OSError, and the
-    # fallback enumeration path does too -- _find_default_input_device
-    # therefore raises RuntimeError (no input device found) for attempt 1,
-    # so attempt 1 must cost a retry. open() on the cache is also set to
-    # fail defensively in case a device resolution ever succeeds.
-    pa_cached.get_default_input_device_info.side_effect = OSError("poll storm")
+    # __init__'s resolution and attempt 1's both raise through the
+    # fallback enumeration path, so attempt 1 must cost a retry; open() on
+    # the cache fails too in case a resolution ever succeeds too early.
+    pa_cached.get_default_input_device_info.side_effect = [
+        OSError("poll storm"),
+        OSError("poll storm"),
+        {"index": 0},
+    ]
     pa_cached.get_device_count.side_effect = OSError("enumeration storm")
-    pa_cached.open.side_effect = OSError("stale session")
-
-    pa_retry = _make_pyaudio_instance(1)
     release_event = threading.Event()
-    pa_retry.open.return_value = _blocking_stream(
-        OSError("stop the loop"), release_event
-    )
+    pa_cached.open.side_effect = [
+        OSError("stale session"),
+        _blocking_stream(OSError("stop the loop"), release_event),
+    ]
 
-    recorder = _make_recorder(module, pa_retry, init_probe=pa_cached)
-    # __init__'s own _find_default_input_device hits the same OSError
-    # fallback path and raises RuntimeError, which __init__ swallows
-    # (input_device_index stays None) -- construction survives.
+    recorder = _make_recorder(module, init_probe=pa_cached)
+    # __init__'s own resolution hits the same OSError fallback and is
+    # swallowed (input_device_index stays None) -- construction survives.
     assert recorder.input_device_index is None
     assert recorder.pyaudio is pa_cached
 
     assert recorder.start_recording() is True
-    # The retry (fresh instance) succeeds despite the poll failure.
-    assert _wait_until(lambda: recorder.pyaudio is pa_retry, timeout=5.0)
+    # The retry succeeded on the cached instance, not a fresh one (#72).
+    assert _wait_until(lambda: recorder.stream is not None, timeout=5.0)
+    assert module.pyaudio.PyAudio.call_count == 1
     thread = recorder.recording_thread
     assert thread is not None
     assert thread.is_alive()
@@ -94,12 +95,12 @@ def test_poll_failure_falls_through_to_retry_loop(audio_recorder_module):
 
 
 def test_previous_pyaudio_terminated_when_stream_none_before_next_recording(
-    audio_recorder_module,
+    audio_recorder_module, coreaudio_stub
 ):
-    """Issue #42: the only remaining disposal path between recordings is
-    the device-change poll -- a genuinely moved default device disposes
-    the previous session's PyAudio() (the happy-path retry adoption no
-    longer disposes anything, since attempt 1 reuses the cache)."""
+    """Issue #72: the only remaining disposal path between recordings is
+    the live-default reset -- a genuinely moved system default disposes
+    the previous session's PyAudio() (a retry never disposes anything,
+    since every attempt reuses the live instance)."""
     module = audio_recorder_module
     pa_first = _make_pyaudio_instance(0)
     first_release = threading.Event()
@@ -121,8 +122,10 @@ def test_previous_pyaudio_terminated_when_stream_none_before_next_recording(
     assert _wait_until(lambda: recorder.recording is False, timeout=10.0)
     assert recorder.stream is None  # teardown invariant
 
-    # Default device moved; the poll rebuilds and disposes pa_first.
-    pa_first.get_default_input_device_info.return_value = {"index": 1}
+    # The live default moved (issue #72): CoreAudio now reports a device
+    # other than the one the session was bound to, so the press rebuilds
+    # and disposes pa_first.
+    _live_default_input(coreaudio_stub, 1)
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.pyaudio is pa_new)
 
@@ -261,20 +264,21 @@ def test_per_attempt_log_line_emitted_with_expected_fields(
     pa1 = _make_pyaudio_instance(0)
     err = OSError("Internal PortAudio error")
     err.errno = module.PA_INTERNAL_ERROR_ERRNO
-    pa1.open.side_effect = err
-    pa_retry = _make_pyaudio_instance(1)
     release_event = threading.Event()
-    pa_retry.open.return_value = _blocking_stream(
-        OSError("stop the loop"), release_event
-    )
+    # Issue #72: the retry opens on the same live instance, so the storm
+    # clears on attempt 2 rather than a second instance succeeding.
+    pa1.open.side_effect = [
+        err,
+        _blocking_stream(OSError("stop the loop"), release_event),
+    ]
 
     recorder = _make_recorder(
-        module, pa_retry, init_probe=pa1, max_attempts=2, retry_backoff_seconds=(0.01,)
+        module, init_probe=pa1, max_attempts=2, retry_backoff_seconds=(0.01,)
     )
     assert recorder.start_recording() is True
     # Post-adoption capture idiom: the worker is blocked in read() after
     # adoption, so it cannot have torn down recording_thread.
-    assert _wait_until(lambda: recorder.pyaudio is pa_retry, timeout=5.0)
+    assert _wait_until(lambda: recorder.stream is not None, timeout=5.0)
     thread = recorder.recording_thread
     assert thread is not None
 
