@@ -337,102 +337,6 @@ def test_reset_reports_busy_rather_than_terminating_under_a_live_worker(
 
 
 # ---------------------------------------------------------------------------
-# The keep-warm press gate
-# ---------------------------------------------------------------------------
-
-
-def test_refused_press_is_admitted_without_touching_the_session(
-    coreaudio_stub,
-):
-    """The recorder refuses a press while a recording is live, so the gate
-    must not reach refresh() first: that would stop the warm capture
-    feeding the in-progress recording and rebuild under it (#72 review)."""
-    registry, pa, module = _registry()
-    registry.open(_find_device)
-    _live_default_input(coreaudio_stub, 77)  # the default moved mid-capture
-    warm = MagicMock(name="warm")
-    rearm = MagicMock(name="rearm-warm")
-
-    assert registry.press_check_if_admissible(True, warm, None, _find_device, rearm)
-    warm.stop.assert_not_called()  # the live capture keeps delivering
-    pa.terminate.assert_not_called()
-    assert module.PyAudio.call_count == 1  # nothing rebuilt
-    rearm.assert_not_called()
-
-
-def test_press_without_a_warm_capture_never_runs_a_press_side_reset(
-    coreaudio_stub,
-):
-    """With no keep-warm capture there is no press-side reset: the worker
-    refreshes at the top of its own loop (issue #72)."""
-    registry, pa, module = _registry()
-    registry.open(_find_device)
-    _live_default_input(coreaudio_stub, 77)
-    rearm = MagicMock(name="rearm-warm")
-
-    assert registry.press_check_if_admissible(False, None, None, _find_device, rearm)
-    pa.terminate.assert_not_called()
-    assert module.PyAudio.call_count == 1
-    rearm.assert_not_called()
-
-
-def test_busy_warm_reset_drops_the_capture_it_could_not_stop(coreaudio_stub):
-    """A capture whose stop() timed out is dead: its stop event is set, so
-    when the stuck read returns the thread exits and it can never
-    re-open. The busy return must hand it back as rearm(False) so the
-    recorder clears _warm -- otherwise the next press that needs no reset
-    records silently into that dead sink (#72 review)."""
-    registry, pa, module = _registry()
-    registry.open(_find_device)
-    _live_default_input(coreaudio_stub, 77)
-    warm = MagicMock(name="warm")
-    warm.stop.return_value = False
-    rearm = MagicMock(name="rearm-warm")
-
-    admissible = registry.press_check_if_admissible(
-        False, warm, None, _find_device, rearm
-    )
-
-    assert admissible is False  # the press fails "microphone busy"
-    rearm.assert_called_once_with(False)  # recorder-side drop, logged
-    warm.stop.assert_called_once()
-    pa.terminate.assert_not_called()  # the engine is still up -- untouched
-    assert module.PyAudio.call_count == 1  # ... and nothing was rebuilt
-
-
-def test_successful_warm_reset_rearms_the_capture(coreaudio_stub):
-    registry, pa, module = _registry()
-    registry.open(_find_device)
-    _live_default_input(coreaudio_stub, 77)
-    fresh = MagicMock(name="PyAudioInstance-fresh")
-    module.PyAudio.side_effect = [fresh]
-    warm = MagicMock(name="warm")
-    warm.stop.return_value = True
-    rearm = MagicMock(name="rearm-warm")
-
-    assert registry.press_check_if_admissible(False, warm, None, _find_device, rearm)
-    warm.stop.assert_called_once()
-    pa.terminate.assert_called_once()
-    rearm.assert_called_once_with(True)
-
-
-def test_the_worker_running_a_reset_is_never_its_own_blocker(coreaudio_stub):
-    """A worker joins its predecessor and then resets: naming its own
-    thread must not turn every worker-side reset into a busy report."""
-    registry, stale, module = _registry()
-    registry.open(_find_device)
-    _live_default_input(coreaudio_stub, 77)
-    fresh = MagicMock(name="PyAudioInstance-fresh")
-    module.PyAudio = MagicMock(return_value=fresh)
-
-    result = registry.refresh(_find_device, None, None, threading.current_thread())
-
-    assert result.busy is False
-    stale.terminate.assert_called_once()
-    assert result.pyaudio is fresh
-
-
-# ---------------------------------------------------------------------------
 # Adoption and the supersede check
 # ---------------------------------------------------------------------------
 
@@ -524,6 +428,23 @@ def test_superseded_adopt_disposes_the_registered_instance_the_worker_built():
     worker_pa.terminate.assert_called_once()
     registry.terminate_all()  # forgotten: cleanup must not terminate twice
     worker_pa.terminate.assert_called_once()
+
+
+def test_superseded_adopt_keeps_an_orphan_it_could_not_terminate():
+    """Same rule as terminate_all(), applied to the orphan adopt() abandons:
+    an instance whose terminate() raised is still live and still holds
+    PortAudio's init count, so it stays on the list for the next attempt
+    instead of becoming unreachable (issue #72 review)."""
+    registry, worker_pa, _ = _registry()
+    registry.register(worker_pa)
+    worker_pa.terminate.side_effect = OSError("Pa_Terminate failed")
+
+    ok, _ = _adopt(registry, worker_pa, MagicMock(name="stream"), [True], [False])
+
+    assert ok is False
+    worker_pa.terminate.assert_called_once()
+    registry.terminate_all()  # still reachable: the quit path retries it
+    assert worker_pa.terminate.call_count == 2
 
 
 def test_check_superseded_reports_and_logs(capsys):

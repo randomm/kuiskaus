@@ -59,6 +59,20 @@ def format_microphone_error(error: BaseException) -> str:
     return f"Microphone unavailable: {error}"
 
 
+def microphone_unavailable(last_error: BaseException | None) -> str:
+    """What an exhausted retry loop leaves in ``recorder.last_error``.
+
+    The None case is the common one on a device PortAudio still lists but
+    cannot open: every attempt returned no stream without raising, so there
+    is no error to name. It lives with the retry policy that produced
+    ``last_error`` rather than in the recorder, which has no part in
+    deciding what the failure is called.
+    """
+    if last_error is None:
+        return "Microphone unavailable: unknown error"
+    return format_microphone_error(last_error)
+
+
 def attempt_open_once(
     pa_module: ModuleType,
     format: int,
@@ -233,13 +247,20 @@ def attempt_open_once(
     return pa, stream, None, effective_rate
 
 
-def terminate_quietly(pa: "pyaudio.PyAudio") -> None:
+def terminate_quietly(pa: "pyaudio.PyAudio") -> bool:
     """Best-effort PyAudio() teardown; a terminate() failure must not
-    propagate."""
+    propagate.
+
+    The verdict is the point (issue #72): an instance whose ``terminate()``
+    raised is still live and still holds PortAudio's init count, so the
+    caller must keep it reachable rather than treat it as gone.
+    """
     try:
         pa.terminate()
     except OSError as e:
         print(f"Error terminating PyAudio instance: {e}")
+        return False
+    return True
 
 
 # PortAudio's init count is reference-counted (issue #72): an instance is

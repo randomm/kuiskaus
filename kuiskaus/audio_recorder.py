@@ -16,9 +16,9 @@ from kuiskaus.audio_retry import (
     attempt_open_once,
     close_stream_quietly,
     find_default_input_device,
-    format_microphone_error,
     log_retry_attempt,
     log_stop,
+    microphone_unavailable,
     open_warm_stream,
     refresh_pyaudio_session,
     validate_retry_config,
@@ -199,12 +199,7 @@ class AudioRecorder:
 
         with self._lock:
             if self._generation == my_gen:
-                error_text = (
-                    format_microphone_error(last_error)
-                    if last_error is not None
-                    else "Microphone unavailable: unknown error"
-                )
-                self.last_error = error_text
+                self.last_error = microphone_unavailable(last_error)
                 self.recording = False
                 self.stream = None
                 self.recording_thread = None
@@ -227,10 +222,12 @@ class AudioRecorder:
     def _rearm_warm(self, usable: bool) -> None:
         """Re-arm the keep-warm capture after a reset replaced its session.
         usable=False is the busy path: a capture that would not stop is
-        dead (its stop event is set, so it can never re-open) -- drop it
-        and later presses take the worker path, not a dead sink.
+        dead for presses (its stop event is set, so it can never re-open)
+        -- drop it and later presses take the worker path, not a dead sink.
+        The session keeps the handle on its live thread: see WarmKeep.drop().
         """
-        self._warm = None
+        dead, self._warm = self._warm, None
+        self._session.warm.drop(dead)
         if usable:
             self.set_keep_warm(True)
 
@@ -255,13 +252,14 @@ class AudioRecorder:
 
     def set_keep_warm(self, enabled: bool) -> None:
         """Keep the input stream open between recordings (issue #66)."""
+        self._session.warm.want(enabled)
         if enabled and self._warm is None:
             self._warm = WarmCapture(self._open_warm_stream, self.chunk_size)
             self._warm.start()
         elif not enabled and self._warm is not None:
             warm, self._warm = self._warm, None
             self._capture_rate = warm.capture_rate  # for an in-flight recording
-            warm.stop()
+            self._session.warm.drop(warm)
 
     def _open_warm_stream(self) -> tuple["_Stream", int]:
         """One open for WarmCapture's thread. Never overlaps a per-press
@@ -303,6 +301,8 @@ class AudioRecorder:
                 if self._generation != my_gen or not self.recording:
                     return  # released again while waiting
         self._refresh_pyaudio_session(previous)
+        # Keep-warm does not re-arm itself after a stuck-read drop (issue #72).
+        self._session.warm.recover(self._rearm_warm)
         stream = self._open_stream_with_retry(my_gen)
         if stream is None:
             return  # last_error already set (or generation superseded)
@@ -476,7 +476,7 @@ class AudioRecorder:
             self.stop_recording()
 
         warm, self._warm = self._warm, None
-        if warm is not None and not warm.stop():
+        if not self._session.warm.drop(warm) or not self._session.warm.clear():
             print("Warm capture still active at cleanup; skipping PyAudio.terminate()")
             return
 

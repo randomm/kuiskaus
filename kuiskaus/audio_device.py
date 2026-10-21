@@ -40,6 +40,7 @@ from kuiskaus.audio_retry import (
     terminate_quietly,
     worker_alive,
 )
+from kuiskaus.audio_warm_keep import WarmKeep
 
 if TYPE_CHECKING:
     from kuiskaus.audio_warm import WarmCapture
@@ -175,6 +176,11 @@ class PyAudioRegistry:
         self.pyaudio: pyaudio.PyAudio | None = None
         self.input_device_index: int | None = None
         self.device_id: int | None = None
+        # The keep-warm request, plus any capture this session dropped while
+        # its thread was parked in a native read: the recorder clears its own
+        # ``_warm`` at that same moment, so this is the only handle left that
+        # can name those threads (see WarmKeep).
+        self.warm = WarmKeep()
         self._instances: list[pyaudio.PyAudio] = []
 
     def register(self, pa: pyaudio.PyAudio) -> pyaudio.PyAudio:
@@ -196,22 +202,39 @@ class PyAudioRegistry:
     def terminate(self, pa: pyaudio.PyAudio) -> None:
         """Terminate and unregister one instance (its stream must be
         closed first: closing the last stream is what releases the
-        per-stream init reference)."""
-        terminate_quietly(pa)
-        self.forget(pa)
+        per-stream init reference). One that would not terminate stays
+        registered: an untracked live instance is exactly what this class
+        exists to reach.
+        """
+        if terminate_quietly(pa):
+            self.forget(pa)
 
-    def terminate_all(self) -> None:
-        """Terminate every instance this session ever built.
+    def terminate_all(self) -> bool:
+        """Terminate every instance this session ever built. True = all gone.
 
         PortAudio's init count is reference-counted, so a single missed
         instance -- an unregistered one, or one whose terminate() raised
         -- keeps the engine up and the next construction reuses the
         frozen device list. terminate_quietly() swallows per-instance
-        failures so one broken instance cannot strand the rest.
+        failures so one broken instance cannot strand the rest, but it
+        reports them: an instance that would not terminate STAYS
+        registered, because forgetting a live instance is how it becomes
+        permanently unreachable -- the next attempt gets another shot.
+
+        False also means refused: a keep-warm capture this session dropped
+        whose thread may still be reading on one of these instances. Callers
+        treat False as busy rather than as a clean session.
         """
+        if not self.warm.clear():
+            print("Keep-warm capture may still be reading; not terminating PyAudio.")
+            return False
+        incomplete = False
         for pa in list(self._instances):
-            terminate_quietly(pa)
-        self._instances.clear()
+            if terminate_quietly(pa):
+                self.forget(pa)
+            else:
+                incomplete = True
+        return not incomplete
 
     def open(self, find_default_input_device: Callable[[pyaudio.PyAudio], int]) -> bool:
         """Construct the persistent cached session (issue #42) and record
@@ -316,8 +339,11 @@ class PyAudioRegistry:
                 self.register(new_pa)
                 self.pyaudio = new_pa
                 publish_capture_rate(capture_rate)
-        if orphan is not None:
-            terminate_quietly(orphan)
+        if orphan is not None and not terminate_quietly(orphan):
+            # An orphan that would not terminate goes back on the list: it is
+            # still live, still holding PortAudio's init count, and the next
+            # terminate_all() has to be able to find it.
+            self.register(orphan)
         if superseded:
             log_retry_attempt(attempt, max_attempts, attempt_start, None, "abort")
             return False
@@ -358,7 +384,11 @@ class PyAudioRegistry:
         closing the last open stream is what releases PortAudio's per
         -stream init reference. A warm capture that would not stop means
         the engine is still up, so this returns busy and the session
-        stays dirty for the next press rather than being half-reset.
+        stays dirty for the next press rather than being half-reset -- and
+        the dropped capture stays named in self.warm, which holds every
+        later terminate back until its thread has left the native read
+        (issue #72 review: dropping it from the recorder alone orphaned the
+        thread and let the next press terminate underneath it).
         """
         live = read_live_default_input()
         if not session_needs_reset(live, self.device_id):
@@ -377,10 +407,10 @@ class PyAudioRegistry:
         if (
             worker_alive(blocked_worker)
             and blocked_worker is not threading.current_thread()
-        ):
+        ) or not self.warm.clear():
             return SessionRefresh(self.pyaudio, self.input_device_index, True)
 
-        warm_stopped = warm is None or warm.stop()
+        warm_stopped = self.warm.drop(warm)
         if not warm_stopped:
             # The stuck read owns a capture whose stop event is already
             # set: when the read returns the thread exits and THIS capture
@@ -388,12 +418,18 @@ class PyAudioRegistry:
             # no reset would be admitted and record silently into a dead
             # sink, so rearm_warm(False) tells the recorder to drop it --
             # later presses take the worker path (issue #72 review).
+            #
+            # Dropped for presses, NOT gone for PortAudio: WarmKeep kept
+            # the only remaining handle on that thread, and that handle is
+            # what gates every later terminate_all() until the thread has
+            # actually exited.
             print("Keep-warm capture would not stop; dropping it.")
             if rearm_warm is not None:
                 rearm_warm(False)
             return SessionRefresh(self.pyaudio, self.input_device_index, True)
 
-        self.terminate_all()
+        if not self.terminate_all():
+            return SessionRefresh(self.pyaudio, self.input_device_index, True)
         self.pyaudio = None
         self.input_device_index = None
         rebuilt = self.open(find_default_input_device)
