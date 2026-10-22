@@ -202,6 +202,45 @@ def test_a_persistently_dead_default_rebuilds_once_not_once_per_press(
     assert module.PyAudio.call_count == 1  # only the open() above
 
 
+def test_an_engine_verdict_holds_the_window_even_when_the_device_changed(
+    coreaudio_stub, monkeypatch
+):
+    """The exemption the manual switch gets is for the verdict that is ABOUT
+    a device. ``rebuild_device`` records the device the rebuild streak counts,
+    and a later teardown verdict -- PortAudio refusing an instance -- says
+    something about the ENGINE, which no new device excuses. Honouring the
+    stale ``rebuild_device`` there would spend the full futile teardown on
+    every press, which is the stall the window exists to prevent.
+    """
+    registry, pa, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    clock = [0.0]
+    monkeypatch.setattr(reset_module, "_now", lambda: clock[0])
+
+    # One clean rebuild, so the streak now counts device 88.
+    _live_default_input(coreaudio_stub, 88)
+    registry.refresh(_find_device)
+    assert registry.rebuild_device == 88
+
+    # Then the engine turns: every teardown from here on refuses.
+    pa.terminate.side_effect = OSError("Pa_Terminate failed")
+    _live_default_input(coreaudio_stub, 99)
+    for _ in range(reset_module.MAX_TERMINATE_FAILURES):
+        registry.refresh(_find_device)
+
+    assert registry.needs_restart is True
+    assert registry.terminate_failures == reset_module.MAX_TERMINATE_FAILURES
+    assert registry.rebuild_device == 88  # stale: the verdict is not about it
+
+    terminates = pa.terminate.call_count
+    result = registry.refresh(_find_device)
+
+    assert result.busy is True, "the engine verdict let a press run the futile teardown"
+    assert pa.terminate.call_count == terminates
+    assert registry.press_refusal_reason() == MICROPHONE_NEEDS_RESTART
+
+
 def test_an_oscillating_default_is_bounded_rather_than_rebuilding_forever(
     coreaudio_stub,
 ):
