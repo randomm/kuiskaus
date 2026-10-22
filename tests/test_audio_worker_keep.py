@@ -1,20 +1,22 @@
 """Who may still be inside a native PortAudio call.
 
-Two ledger gaps, both caught by the harness of the first fix:
+Two ledger gaps the gate has to close:
 
-1. workers had no ledger. ``terminate_all()`` consulted only
-   the named worker plus the keep-warm captures, and ``recording_thread`` is
-   a *name*, cleared by whichever successor completes first. A thread that
-   lost its name but was still inside ``pa.open()`` was invisible to the
-   gate, and the next press terminated PortAudio underneath it. ``WorkerKeep``
+1. workers have no name to be asked for. ``terminate_all()`` consulting only
+   the named worker plus the keep-warm captures is not enough, because
+   ``recording_thread`` is a *name*, cleared by whichever successor completes
+   first. A thread that lost its name but is still inside ``pa.open()`` is
+   invisible to the gate, and the next press terminates PortAudio underneath
+   it. ``WorkerKeep``
    is the ledger: every worker the session started stays named until its
    thread has actually finished. That scenario itself is reproduced in
    ``tests/test_audio_recorder_8.py``.
 
-2. **ISSUE** -- ``terminate_all()`` asked only the *dropped* captures. A
+2. ``terminate_all()`` asking only the *dropped* captures leaves the other
+   half unguarded. A
    capture still installed in ``WarmArm`` (the worker path never hands one
    over, resting on "with keep-warm on there is no worker", which is a race)
-   was not a blocker at all. Covered by ``WarmKeep.note_installed`` /
+   is not a blocker at all. Covered by ``WarmKeep.note_installed`` /
    ``installed_may_be_native``.
 
 Both are tested against ``PyAudioRegistry.terminate_all()`` -- the call that

@@ -1,6 +1,6 @@
 """The device-move reset: what ``refresh()`` actually rebuilds (issue #72).
 
-Split from ``kuiskaus.audio_device`` for the 500-line module cap. The
+Split from ``kuiskaus.audio_device``, which owns the instances themselves. The
 registry owns the instances and answers "what may I terminate"; this module
 owns the reset that consumes that answer -- read the live default, decide
 whether it moved, gate on the ledgers, terminate, rebuild, and hand the
@@ -372,8 +372,8 @@ def _native_blocker(
 
     Never drive PortAudio's init count to zero while another thread may
     be inside a native open() or stream.read() on a registered instance:
-    that is the state cleanup() refuses to terminate in (issue #37
-    task-c). The ledger (registry.workers / registry.warm) is the
+    that is the state cleanup() refuses to terminate in (issue #37). The
+    ledger (registry.workers / registry.warm) is the
     authority -- it names every worker this session started, including an
     issue #60 orphan whose name its successor already cleared, and the
     capture installed in the arm whether or not this caller handed one

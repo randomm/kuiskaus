@@ -1,10 +1,10 @@
 """What a refused press is told, and who is allowed to run the reset (issue #72).
 
-Split from ``kuiskaus.audio_device_reset`` for the 500-line module cap. That
-module owns the rebuild; this one owns the two questions a press asks on its
-way in and out: may it run the reset at all, and when it may not (or its
-worker's retry loop fails), what does the user read in the menubar's red
-line.
+Split from ``kuiskaus.audio_device_reset``, which owns the rebuild. That
+module answers "what does it take to rebuild the session"; this one answers
+the two questions a press asks on its way in and out: may it run the reset at
+all, and when it may not (or its worker's retry loop fails), what does the
+user read in the menubar's red line.
 
 Kept separate because the answers are read by different callers under
 different conditions: the gate runs before the recorder takes its lock, the

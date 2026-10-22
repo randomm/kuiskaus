@@ -1,7 +1,6 @@
 """The unnamed orphan worker.
 
-Split into its own module (test_audio_recorder_7.py is at the file cap).
-This drives the exact four-press sequence the harness reproduced through the
+This drives the exact four-press sequence through the
 public API only, on the real ``AudioRecorder`` and the real
 ``PyAudioRegistry``:
 
@@ -18,7 +17,7 @@ public API only, on the real ``AudioRecorder`` and the real
      frees the state W1 is still entering.
 
 The registry's worker ledger is what closes step 4, so the assertion is the
-one the harness's probe produced: no terminate while a worker it started is
+one that matters: no terminate while a worker the session started is
 still inside ``pa.open()``.
 """
 
@@ -102,7 +101,7 @@ def test_four_presses_cannot_terminate_under_a_worker_that_lost_its_name(
             lambda: pa.terminate.called or live["calls"] >= 3, timeout=8.0
         )
 
-        # The violation the harness measured: pa.terminate() firing while
+        # The violation itself: pa.terminate() firing while
         # another thread sits inside pa.open() on that same instance.
         pa.terminate.assert_not_called()
         assert live["in_open"] == 1  # W1 never left the native call

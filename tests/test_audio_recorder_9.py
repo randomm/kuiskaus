@@ -1,12 +1,11 @@
 """The user is told when PortAudio will not come down (issue #72).
 
-A press the device reset cannot complete used to fail in two flavours that
-looked identical from outside: "microphone busy" (a thread may still be native
--- defers, and resolves itself) and a poisoned session whose ``terminate()``
-never succeeds (never resolves, and nothing ever said so). the harness measured
-five consecutive presses returning busy with ``last_error`` None and the
-menubar still showing Ready -- the #72 symptom surviving inside the PR written
-to remove it.
+A press the device reset cannot complete fails in two flavours that look
+identical from outside: "microphone busy" (a thread may still be native --
+defers, and resolves itself) and a poisoned session whose ``terminate()``
+never succeeds (never resolves, and nothing ever says so). The second reads
+as the first forever: five consecutive presses return busy with
+``last_error`` None and the menubar still showing Ready.
 
 The budget lives on the registry (``test_audio_device_5.py``); these are the
 recorder-side consequences, driven through real presses: the refused press and

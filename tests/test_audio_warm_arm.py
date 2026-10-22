@@ -1,38 +1,28 @@
-"""The #72 adversarial findings, as failing-then-passing pairs.
+"""The arming, takeover and hand-back invariants, as failing-then-passing pairs.
 
-Round 1:
+1. Exactly one started capture survives any interleaving. Arming is a
+   check-then-act on ``recorder._warm`` from more than one caller thread (the
+   worker's ``recover`` re-arm, a hotkey press's reset re-arm), so two threads
+   can both pass the None check and both start a capture; the loser is
+   referenced by nobody and absent from ``WarmKeep._blockers``, so
+   ``terminate_all()`` drives PortAudio out from under it.
 
-1. Orphaned warm capture: ``set_keep_warm`` armed with a lock-free
-   check-then-act on ``recorder._warm``. #72 gave arming two extra
-   caller threads (the worker's ``recover`` re-arm, a hotkey press's
-   reset re-arm), so two threads could both pass the None check and
-   both start a capture; the loser is referenced by nobody and absent
-   from ``WarmKeep._blockers``, so ``terminate_all()`` drives PortAudio
-   out from under it. Exactly one started capture must survive any
-   interleaving.
+2. The reset gate consults the recorder's CURRENT worker, not one captured
+   before a join of up to 30 s. If that worker finished and a new one became
+   current in the meantime, a gate trusting the dead name terminates the
+   session under the live worker.
 
-2. Stale worker name in the reset gate: ``_open_warm_stream`` hands
-   ``refresh_recorder_session`` the worker it captured BEFORE a join of
-   up to 30 s. If that worker finished and a new one became current in
-   the meantime, the "never reset under a live worker" gate trusted the
-   dead name and terminated the session under the live worker. The gate
-   must consult the recorder's CURRENT worker at gate time.
+3. Only the menu is allowed to MAKE a keep-warm request. A re-arm that goes
+   through ``set_keep_warm(True)`` writes the request as well as satisfying
+   it, and ``reset_session`` runs outside the recorder lock for a whole
+   terminate-all + ``Pa_Initialize`` + re-enumeration -- long enough for the
+   user to uncheck the item. An erased uncheck leaves a capture re-armed and
+   the microphone open behind a menu item showing OFF. ``WarmArm.rearm``
+   satisfies the request the user has.
 
-Round 2:
-
-3. The reset's re-arm overrode the menu. It went through
-   ``set_keep_warm(True)``, which WRITES the keep-warm request as well as
-   satisfying it, and ``reset_session`` runs outside the recorder lock for a
-   whole terminate-all + ``Pa_Initialize`` + re-enumeration -- long enough
-   for the user to uncheck the item. The uncheck was erased, a capture was
-   re-armed, and the microphone was left open behind a menu item showing
-   OFF. ``WarmArm.rearm`` satisfies the request the user has; only the menu
-   is allowed to make one.
-
-4. A capture whose thread could not be created stayed installed, and (with
-   the gate fix, which treats an installed capture with no thread as
-   arming) would then refuse every later ``terminate_all()`` for the life of
-   the process.
+4. A capture whose thread could not be created must not stay installed: an
+   installed capture with no thread reads as arming, and would then refuse
+   every later ``terminate_all()`` for the life of the process.
 """
 
 import threading
