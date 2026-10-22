@@ -88,7 +88,15 @@ def test_busy_warm_reset_drops_the_capture_it_could_not_stop(coreaudio_stub):
     assert module.PyAudio.call_count == 1  # ... and nothing was rebuilt
 
 
-def test_successful_warm_reset_rearms_the_capture(coreaudio_stub):
+def test_successful_warm_reset_hands_the_capture_back_and_asks_recovery(
+    coreaudio_stub,
+):
+    """The press that triggered the rebuild must NOT be routed into a
+    freshly armed capture: it has not opened its stream yet, so begin()
+    seeds an empty ring and the take comes back empty and mislabelled
+    "microphone busy". The press records on the worker instead (recorder
+    _warm cleared by the rearm_warm(False) hand-back), and the worker's
+    own WarmKeep.recover() brings keep-warm back."""
     registry, pa, module = _registry()
     registry.open(_find_device)
     _live_default_input(coreaudio_stub, 77)
@@ -101,7 +109,9 @@ def test_successful_warm_reset_rearms_the_capture(coreaudio_stub):
     assert registry.press_check_if_admissible(False, warm, None, _find_device, rearm)
     warm.stop.assert_called_once()
     pa.terminate.assert_called_once()
-    rearm.assert_called_once_with(True)
+    rearm.assert_called_once_with(False)  # press goes to the worker path...
+    assert registry.warm._recover_pending  # ... and keep-warm returns there
+    assert module.PyAudio.call_count == 2  # rebuilt on the live device
 
 
 def test_the_worker_running_a_reset_is_never_its_own_blocker(coreaudio_stub):

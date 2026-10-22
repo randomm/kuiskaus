@@ -174,6 +174,7 @@ def _press_is_new_evidence(registry: PyAudioRegistry, live: LiveDefaultInput) ->
         not registry.terminate_failures
         and registry.rebuild.device is not None
         and registry.rebuild.is_new_device(live.device_id)
+        and registry.rebuild.claim_exemption()
     )
 
 
@@ -200,33 +201,6 @@ def _unchanged(registry: PyAudioRegistry, *, busy: bool = False) -> SessionRefre
     )
 
 
-def _rearm_after_reset(
-    registry: PyAudioRegistry,
-    rearm_warm: Callable[[bool], None] | None,
-    *,
-    usable: bool,
-) -> None:
-    """Hand the capture back, and keep a failed arming off the press.
-
-    ``WarmArm`` re-raises a capture whose ``start()`` failed, having already
-    undone the install and filed the recovery ask (an installed capture with
-    no thread reads as arming, so the name cannot be left behind). Nothing
-    is gained by carrying that raise up through the reset into the hotkey
-    callback: the press the user just made would die instead of falling back
-    to the worker path, and a later press recovers the capture through the
-    flag the arming already set.
-    """
-    if rearm_warm is None:
-        return
-    try:
-        rearm_warm(usable)
-    except Exception as arm_error:  # noqa: BLE001 - press-path boundary, logged
-        print(
-            f"Keep-warm hand-back failed ({str(arm_error)[:120]}); "
-            "the recording goes on without it."
-        )
-
-
 def _hand_back_capture(
     registry: PyAudioRegistry,
     warm: WarmCapture | None,
@@ -239,16 +213,35 @@ def _hand_back_capture(
     A capture stop() reported stopped is dead for presses either way -- its
     stop event is set, so it can never re-open -- so it is handed back rather
     than being left installed as a sink that silently swallows the next take.
+    The hand-back is always the drop (``rearm_warm(False)``): no reset path
+    arms a fresh capture from here -- not the bail-outs (no session to arm
+    against), and not the completed rebuild either, because a capture armed
+    mid-press has not opened its stream yet and routing that press into it
+    would discard the take (see ``_rebuild``). Keep-warm comes back through
+    the worker's ``WarmKeep.recover()`` instead.
 
     ``ask_recovery`` is the separate ask for the bail-out paths: stop()
     SUCCEEDED there, so ``drop()`` set no recovery flag and keep-warm would
     stay off -- menu checkmark and all -- for the life of the process.
+
+    ``WarmArm`` re-raises a capture whose ``start()`` failed, having already
+    undone the install and filed the recovery ask. Nothing is gained by
+    carrying that raise up through the reset into the hotkey callback: the
+    press the user just made would die instead of falling back to the worker
+    path, and a later press recovers the capture through the flag the arming
+    already set.
     """
     if ask_recovery:
         registry.warm.need_recovery()
-    if warm is None:
+    if warm is None or rearm_warm is None:
         return
-    _rearm_after_reset(registry, rearm_warm, usable=False)
+    try:
+        rearm_warm(False)
+    except Exception as arm_error:  # noqa: BLE001 - press-path boundary, logged
+        print(
+            f"Keep-warm hand-back failed ({str(arm_error)[:120]}); "
+            "the recording goes on without it."
+        )
 
 
 def reset_session(
@@ -348,6 +341,13 @@ def _settled_or_refused(
         if not _teardown_backoff_open(registry):
             registry.rebuild.settle()
             registry.needs_restart = False
+            # The verdict describes the teardown as it is NOW (see
+            # restart_verdict), so the refusal budget it was counted against
+            # goes with it: leaving terminate_failures standing meant one
+            # later refusal re-declared the verdict on sight, silently
+            # retiring MAX_TERMINATE_FAILURES as a budget after the first
+            # settle.
+            registry.terminate_failures = 0
         return _unchanged(registry)
 
     if _teardown_backoff_open(registry) and not _press_is_new_evidence(registry, live):
@@ -420,14 +420,24 @@ def _rebuild(
         # right after the coreaudiod storm that moved the default). Record
         # the pair THIS read saw instead: the guard needs a baseline, and
         # whichever read it comes from, the pair it compares has to be the
-        # one read that set it. Written BEFORE the re-arm below: the re-armed
-        # capture's own thread can run a reset immediately, and finding the
-        # baseline still unset there costs a second full rebuild inside this
-        # same press -- and a second unsynchronised write to the budget.
+        # one read that set it. Written BEFORE the hand-back below: the
+        # capture the worker's recovery re-arms can run a reset from its own
+        # thread immediately, and finding the baseline still unset there
+        # costs a second full rebuild inside this same press -- and a second
+        # unsynchronised write to the budget.
         registry.last_reset = live
     if warm is not None:
-        # Only now does the session exist to arm against.
-        _rearm_after_reset(registry, rearm_warm, usable=True)
+        # The press that moved the default records on the WORKER, not on a
+        # capture armed here: a fresh WarmCapture has not opened its stream
+        # yet (its run loop sets _ready and seeds the ring only after
+        # _open_stream() returns), so routing this press through begin()
+        # seeds the take from an empty ring -- the press comes back empty
+        # and mislabelled "microphone busy" for a reset that succeeded.
+        # Hand the stopped capture back (dead for presses either way) and
+        # ask for recovery: the press's own worker brings keep-warm back
+        # through WarmKeep.recover(), and the new capture's open joins that
+        # worker before opening, so #16's no-overlapping-opens rule holds.
+        _hand_back_capture(registry, warm, rearm_warm, ask_recovery=True)
     # An AirPod whose liveness flag oscillates makes every read a different
     # pair, and a default that alternates between two devices makes every
     # read a different DEVICE; the dedupe guard above is structurally blind

@@ -203,3 +203,39 @@ def test_a_clean_teardown_clears_the_restart_verdict(coreaudio_stub, monkeypatch
     for _ in range(MAX_TERMINATE_FAILURES - 1):
         assert registry.refresh(_find_device).busy is True
     assert registry.needs_restart is False
+
+
+def test_a_settled_session_clears_the_refusal_budget_not_just_the_verdict(
+    coreaudio_stub, monkeypatch
+):
+    """``settle()`` cleared ``needs_restart`` but left ``terminate_failures``
+    standing, so the FIRST later refusal re-declared the verdict on sight
+    ("PyAudio refused to terminate 4 times running") --
+    MAX_TERMINATE_FAILURES silently stopped being a budget after the first
+    settle. The verdict describes the teardown as it is now, so the press
+    that finds the session agreeing with the live device retires the
+    refusals it counted alongside the verdict."""
+    registry, _pa, _module = _poison_registry(coreaudio_stub)
+    clock = _fake_clock(monkeypatch)
+    for _ in range(MAX_TERMINATE_FAILURES):
+        assert registry.refresh(_find_device).busy is True
+    assert registry.needs_restart is True
+    assert registry.terminate_failures == MAX_TERMINATE_FAILURES
+
+    # The default comes back onto the device the session is bound to, once
+    # the backoff window has expired: that press is the settling evidence.
+    clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
+    _live_default_input(coreaudio_stub, 77)
+    assert registry.refresh(_find_device).busy is False
+    assert registry.needs_restart is False
+    assert registry.terminate_failures == 0
+
+    # The same poison instance refuses again: one refusal is one refusal
+    # again, not the fourth -- the budget is a budget again.
+    _live_default_input(coreaudio_stub, 99)
+    assert registry.refresh(_find_device).busy is True
+    assert registry.terminate_failures == 1
+    assert registry.needs_restart is False, (
+        "the first refusal after a settle re-declared the restart verdict: "
+        "MAX_TERMINATE_FAILURES stopped being a budget after the settle"
+    )

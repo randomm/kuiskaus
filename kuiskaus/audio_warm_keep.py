@@ -260,14 +260,15 @@ class WarmKeep:
             self._recover_pending = True
 
     def recover(self, rearm_warm: Callable[[bool], None]) -> None:
-        """Bring keep-warm back after a stuck-read drop (issue #72).
+        """Bring keep-warm back after a drop (issue #72).
 
-        ``rearm_warm(True)`` is otherwise reachable only from a warm press
-        that stopped its capture, so one stuck read left pre-roll off for the
-        life of the process while the menu still showed the checkmark. The
-        caller invokes this from the worker path, where the press has already
-        committed to a worker: the new capture's own open joins that worker
-        before opening, so the two native opens never overlap (issue #16).
+        This is the only route to ``rearm_warm(True)`` besides the menu:
+        a reset never arms a capture mid-press (a capture armed before its
+        stream opens would swallow that press's take -- see ``_rebuild``),
+        so every drop path ends here. The caller invokes this from the
+        worker path, where the press has already committed to a worker: the
+        new capture's own open joins that worker before opening, so the two
+        native opens never overlap (issue #16).
         """
         with self._lock:
             requested = self.enabled and self._recover_pending

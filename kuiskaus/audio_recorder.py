@@ -70,6 +70,7 @@ class AudioRecorder:
         self.recording = False
         self.audio_queue: queue.Queue[bytes] = queue.Queue()
         self.recording_thread: threading.Thread | None = None
+        self._press_warm: WarmCapture | None = None  # THIS press's route (#72)
         self.last_error: str | None = None
         self._lock = threading.Lock()
         # The keep-warm capture (issue #66), armed only through WarmArm
@@ -431,7 +432,7 @@ class AudioRecorder:
             my_gen = self._generation
             self._start_monotonic = time.monotonic()
             self.recording = True
-            self._capture_announced = False
+            self._capture_announced, self._press_warm = False, warm
             # Reset alongside the stream/queue state (issue #55).
             self._capture_rate = None
             # Clear before spawning: clearing after thread.start() could
@@ -472,7 +473,7 @@ class AudioRecorder:
             thread = self.recording_thread
             my_gen = self._generation
             start_monotonic = self._start_monotonic
-            warm = self._warm
+            warm = self._press_warm
             capture_rate = warm.capture_rate if warm else self._capture_rate
             if was_recording:
                 self.recording = False

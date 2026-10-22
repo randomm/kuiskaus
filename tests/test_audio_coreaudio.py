@@ -5,10 +5,10 @@ session-reset half stays in test_audio_device.py. No hardware and no
 CoreAudio framework: the autouse ``coreaudio_stub`` fixture owns the
 bridge, so a developer's real default input device can never leak into
 these assertions -- with the one exception at the foot of this file, which
-sets the stub aside to check the mirrored constants against the framework.
+compares the mirrored constants against the framework itself (imported at
+collection time, above, so the stub cannot make the guard skip).
 """
 
-import importlib
 import sys
 
 import pytest
@@ -19,6 +19,21 @@ from kuiskaus.audio_coreaudio import (
     session_needs_reset,
 )
 from tests.support_audio_recorder import _live_default_input
+
+# The genuine PyObjC bridge, captured at COLLECTION time -- before the
+# autouse ``coreaudio_stub`` fixture takes ``sys.modules["CoreAudio"]``.
+# The old fixture popped the stub and re-imported, but re-importing
+# re-runs PyObjC's bridge registration, which raises once the framework
+# has been loaded by anything else in the run (AVFoundation imports it in
+# tests/test_permissions.py) -- so the guard skipped SILENTLY in a
+# full-suite run, and a typo'd constant would have shipped green. Import
+# once here (where the stub is not yet installed) and hand the module
+# object to the fixture; the skip happens at collection, where skipping
+# is loud, rather than mid-run.
+try:
+    import CoreAudio as _real_coreaudio
+except Exception:  # noqa: BLE001 - optional framework boundary
+    _real_coreaudio = None
 
 # 'dIn ' / 'livn' as the stubbed bridge reports them. These are the SAME
 # integers the module mirrors, so they pin nothing on their own: a typo that
@@ -31,22 +46,16 @@ ALIVE_SELECTOR = 1818850926
 
 @pytest.fixture
 def real_coreaudio():
-    """The genuine PyObjC CoreAudio bridge, with the autouse stub set aside.
+    """The genuine PyObjC CoreAudio bridge (see ``_real_coreaudio``).
 
-    The stub lives in ``sys.modules`` for every test, so the real module has
-    to be re-imported around it -- and the stub put back afterwards, or the
-    next test would be reading this developer's microphone.
+    The stub owns ``sys.modules["CoreAudio"]`` during the test, so the
+    module object must come from the collection-time import -- popping the
+    stub and re-importing would re-run the PyObjC bridge registration and
+    raise (see the comment above), silently skipping the guard.
     """
-    saved = sys.modules.pop("CoreAudio", None)
-    try:
-        try:
-            return importlib.import_module("CoreAudio")
-        except Exception as e:  # noqa: BLE001 - optional framework boundary
-            pytest.skip(f"pyobjc-framework-CoreAudio unavailable: {e}")
-    finally:
-        sys.modules.pop("CoreAudio", None)
-        if saved is not None:
-            sys.modules["CoreAudio"] = saved
+    if _real_coreaudio is None:
+        pytest.skip("pyobjc-framework-CoreAudio unavailable")
+    return _real_coreaudio
 
 
 def test_constants_are_the_framework_s_own_values(real_coreaudio):
@@ -54,7 +63,8 @@ def test_constants_are_the_framework_s_own_values(real_coreaudio):
     bare integer whose name is its only documentation, and the tests mirror
     the same integers -- so a retyped number survived the suite and broke
     live detection on real hardware. This is the one place the digits are
-    compared to CoreAudio itself; it skips where the framework is absent.
+    compared to CoreAudio itself; it skips where the framework is absent
+    (loudly, at collection).
     """
     from kuiskaus import audio_coreaudio
 

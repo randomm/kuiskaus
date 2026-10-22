@@ -43,6 +43,19 @@ MAX_RESET_REBUILDS = 3
 # exemption exists to refuse -- keeps both ids inside eight.
 RECENT_DEVICE_WINDOW = 8
 
+# How many times the new-evidence exemption may lift the backoff since the
+# session last settled. The window above bounds WHICH ids read as unseen;
+# this bounds how often an unseen one buys the full futile teardown. Without
+# it a default reported as a DIFFERENT id on every press, rotating through
+# more ids than the window holds, evicts its own history: every press reads
+# as "new evidence", the exemption never closes, and the measured cost was
+# 35 full terminate-all + ``Pa_Initialize`` cycles over 40 presses. A
+# hand-moved default does not pay for this: the press after it finds the
+# session agreeing with the live device and ``settle()`` restores the
+# allowance, and once the allowance is spent the hand-switch still lands
+# when the backoff window expires.
+MAX_NEW_EVIDENCE_EXEMPTIONS = 8
+
 
 class RebuildBudget:
     """The consecutive rebuilds that bound the reset's churn.
@@ -72,6 +85,10 @@ class RebuildBudget:
         # exemption honours a device only until it has been rebuilt against,
         # so a pair alternating A<->B cannot keep the exemption open forever.
         self.recent: list[int] = []
+        # Exemptions claimed since the last settle -- see
+        # MAX_NEW_EVIDENCE_EXEMPTIONS for why the exemption needs a bound of
+        # its own next to the window.
+        self.new_evidence_spent = 0
 
     def note_rebuild(self, device_id: int) -> None:
         """Record one completed rebuild against ``device_id``."""
@@ -93,6 +110,7 @@ class RebuildBudget:
         self.device = None
         self.count = 0
         self.recent = []
+        self.new_evidence_spent = 0
 
     def is_new_device(self, device_id: int) -> bool:
         """Whether the session has not rebuilt against ``device_id``
@@ -105,3 +123,17 @@ class RebuildBudget:
         teardown on every press.
         """
         return device_id not in self.recent
+
+    def claim_exemption(self) -> bool:
+        """Claim one new-evidence exemption (paired with ``is_new_device``).
+
+        False once ``MAX_NEW_EVIDENCE_EXEMPTIONS`` have been spent since the
+        last settle: an id rotation faster than the window would otherwise
+        keep the exemption permanently open (each rotation evicts its own
+        history, so the window's novelty check fires on every press), and the
+        backoff the exemption suspends would never hold.
+        """
+        if self.new_evidence_spent >= MAX_NEW_EVIDENCE_EXEMPTIONS:
+            return False
+        self.new_evidence_spent += 1
+        return True

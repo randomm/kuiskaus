@@ -403,7 +403,13 @@ def finish_recording(
 
     The worker join plus the drain, kept as one sequence because the
     ``[audio.stop]`` reason it logs is read off observable state across all
-    of it (issue #40).
+    of it (issue #40). ``warm`` is the capture THIS press routed through --
+    the recorder passes its ``_press_warm``, not the current ``_warm``:
+    issue #72 makes the two diverge, because the press that pays for a
+    warm-path rebuild records on the worker while its own worker re-arms
+    keep-warm behind it, and classifying that take by a capture armed
+    mid-press would report "warm-not-ready" / "microphone busy" for a
+    worker press that merely stopped before the open delivered.
     """
     stuck_open = False
     if thread is not None:
