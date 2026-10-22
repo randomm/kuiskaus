@@ -20,6 +20,7 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 from kuiskaus.audio_coreaudio import (
+    LiveDefaultInput,
     read_live_default_input,
     session_needs_reset,
 )
@@ -42,6 +43,14 @@ if TYPE_CHECKING:
 MICROPHONE_NEEDS_RESTART = (
     "Microphone needs an app restart — PortAudio would not release the device"
 )
+
+# The other give-up: the teardown succeeded every time and the engine is
+# fine, but CoreAudio keeps reporting a different pair for the same device,
+# so the session cannot settle on it. Telling this user PortAudio would not
+# release the device is a false claim about a teardown that never failed,
+# and sending them to quit the app over a device that may settle in seconds
+# is the wrong ask -- the backoff retries on its own.
+MICROPHONE_NOT_SETTLING = "Microphone is not settling — try again in a moment"
 
 MICROPHONE_BUSY = "microphone busy — recording did not start"
 
@@ -98,7 +107,10 @@ def note_terminate_outcome(registry: PyAudioRegistry, clean: bool) -> None:
     registry.terminate_failures += 1
     if registry.needs_restart:
         # Already given up: re-arm the backoff so the next press does not
-        # pay for the same futile teardown, and stop there.
+        # pay for the same futile teardown, and stop there. What the user is
+        # now told follows from ``terminate_failures`` being non-zero (see
+        # ``restart_verdict``), so the stronger claim -- an instance really
+        # did refuse to release -- replaces the weaker one on its own.
         registry.restart_retry_after = _now() + RESTART_RETRY_SECONDS
         return
     if registry.terminate_failures < MAX_TERMINATE_FAILURES:
@@ -110,11 +122,65 @@ def note_terminate_outcome(registry: PyAudioRegistry, clean: bool) -> None:
     )
 
 
+def restart_verdict(registry: PyAudioRegistry) -> str:
+    """The give-up's user-facing claim, read off the state that holds it.
+
+    The two verdicts say different things and only one of them is allowed to
+    blame PortAudio: "would not release the device" is a claim about a
+    teardown, so it belongs to the session that has a refusal on the record
+    (``terminate_failures`` non-zero, which a clean teardown clears along
+    with the verdict -- see ``note_terminate_outcome``). The streak verdict
+    has no such refusal: every teardown released, and what will not settle is
+    the device. Choosing the wording here rather than storing it is what
+    keeps the sentence true after the state that earned it moves -- the same
+    reason the streak itself is not frozen into a message.
+    """
+    if registry.terminate_failures:
+        return MICROPHONE_NEEDS_RESTART
+    return MICROPHONE_NOT_SETTLING
+
+
 def _declare_needs_restart(registry: PyAudioRegistry, reason: str) -> None:
     """Give up on the teardown, say so, and arm the retry backoff."""
     registry.needs_restart = True
     registry.restart_retry_after = _now() + RESTART_RETRY_SECONDS
     print(reason)
+
+
+def _teardown_backoff_open(registry: PyAudioRegistry) -> bool:
+    """True while a declared give-up still excuses the teardown.
+
+    The window is what makes the verdict cheap to hold: the session says no
+    to the one call it has just proved futile, and asks again once the
+    window has expired.
+    """
+    return registry.needs_restart and _now() < registry.restart_retry_after
+
+
+def _press_is_new_evidence(registry: PyAudioRegistry, live: LiveDefaultInput) -> bool:
+    """True when this press reports something the verdict on the record does
+    not already cover.
+
+    Two verdicts can be on the record and only one of them is about a
+    device. The rebuild streak counts one device that will not settle, so a
+    press asking about a DIFFERENT device is not that repetition -- it is the
+    user moving the default by hand, the whole condition issue #72 exists to
+    follow, and it is attempted inside the window (where the streak itself is
+    restarted, since a change of device is progress).
+
+    The teardown's own verdict is not about a device at all -- PortAudio
+    refusing an instance says the ENGINE will not come down -- so a different
+    device is no new evidence there and the window still holds. That is also
+    why ``rebuild_device`` alone cannot be the test: it is the last device the
+    streak counted, which a later engine verdict has no reason to match, and
+    honouring it would spend the full futile teardown on every press -- the
+    stall the window exists to prevent.
+    """
+    return (
+        not registry.terminate_failures
+        and registry.rebuild_device is not None
+        and live.device_id != registry.rebuild_device
+    )
 
 
 class SessionRefresh(NamedTuple):
@@ -194,12 +260,6 @@ def reset_session(
     ledger, which holds every later terminate back until its thread has
     left the native read.
     """
-    if registry.needs_restart and _now() < registry.restart_retry_after:
-        # The teardown already refused and the budget is spent; re-running
-        # it now would stall this press for a result this session already
-        # has. The backoff expires and the next press asks again.
-        return _unchanged(registry, busy=True)
-
     live = read_live_default_input()
     if live is None:
         # CoreAudio saying "no evidence": never treated as a change, and
@@ -222,11 +282,28 @@ def reset_session(
         #
         # Reaching this line is itself the evidence the rebuild budget was
         # asking for -- the session is bound to what the system is on -- so
-        # the streak and the verdict it produced go with it.
-        registry.rebuild_streak = 0
-        registry.rebuild_device = None
-        registry.needs_restart = False
+        # the streak and the verdict it produced go with it. While the
+        # backoff is open it does not: a liveness flag flapping through a
+        # storm reads as "settled" on every other press, and taking that as
+        # the clearing evidence would hand the budget back to the very
+        # device that spent it and let it cost a full teardown every other
+        # press for the life of the process.
+        if not _teardown_backoff_open(registry):
+            registry.rebuild_streak = 0
+            registry.rebuild_device = None
+            registry.needs_restart = False
         return _unchanged(registry)
+
+    if _teardown_backoff_open(registry) and not _press_is_new_evidence(registry, live):
+        # The press that still wants the teardown is the one the verdict is
+        # about, and re-running it now stalls this press for a result this
+        # session already has. Sitting below the live read and the dedupe
+        # check is what makes the two refusals differ: a session bound to
+        # what the system reports, and a user who moved the default to a
+        # different device, are both picked up on that press instead of
+        # being refused for the rest of the window without the device ever
+        # having been read.
+        return _unchanged(registry, busy=True)
 
     # Never drive PortAudio's init count to zero while another thread may
     # be inside a native open() or stream.read() on a registered instance:
@@ -317,8 +394,8 @@ def reset_session(
         _declare_needs_restart(
             registry,
             f"Input device {live.device_id} never settled after "
-            f"{registry.rebuild_streak} rebuilds; the microphone needs an "
-            "app restart.",
+            f"{registry.rebuild_streak} rebuilds; the microphone is not "
+            "settling.",
         )
     return _unchanged(registry)
 
@@ -362,7 +439,7 @@ def press_refusal_reason(registry: PyAudioRegistry) -> str:
     Ready.
     """
     if registry.needs_restart:
-        return MICROPHONE_NEEDS_RESTART
+        return restart_verdict(registry)
     return MICROPHONE_BUSY
 
 
@@ -381,9 +458,10 @@ def unavailable_reason(
     what makes a -9986 storm recognisable in a bug report.
     """
     if registry.needs_restart:
+        verdict = restart_verdict(registry)
         if last_error is None:
-            return MICROPHONE_NEEDS_RESTART
-        return f"{MICROPHONE_NEEDS_RESTART} ({last_error})"
+            return verdict
+        return f"{verdict} ({last_error})"
     return microphone_unavailable(last_error)
 
 
@@ -392,10 +470,12 @@ __all__ = [
     "MAX_TERMINATE_FAILURES",
     "MICROPHONE_BUSY",
     "MICROPHONE_NEEDS_RESTART",
+    "MICROPHONE_NOT_SETTLING",
     "SessionRefresh",
     "note_terminate_outcome",
     "press_is_admissible",
     "press_refusal_reason",
     "reset_session",
+    "restart_verdict",
     "unavailable_reason",
 ]
