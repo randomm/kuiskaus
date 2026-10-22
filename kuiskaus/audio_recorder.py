@@ -7,7 +7,7 @@ import numpy as np
 import pyaudio
 
 from kuiskaus.audio_device import PyAudioRegistry
-from kuiskaus.audio_resample import TARGET_RATE, assemble_audio
+from kuiskaus.audio_resample import TARGET_RATE
 from kuiskaus.audio_retry import (
     MAX_ATTEMPTS,
     PA_INTERNAL_ERROR_ERRNO,
@@ -27,7 +27,9 @@ from kuiskaus.audio_warm_arm import (
     WarmArm,
     announce_capture,
     cleanup_recorder_session,
+    finish_recording,
     open_warm_capture_stream,
+    rearm_warm,
     refresh_recorder_session,
     start_press,
     warm_press_gate,
@@ -119,10 +121,10 @@ class AudioRecorder:
 
     @property
     def current_generation(self) -> int:
-        """Public read-only view of the recording generation counter
-        (issue #40/43 lens review MEDIUM #2): UI code (menubar drain
-        gate, capture-started enqueue) reads the current generation
-        through this accessor, not the private _generation attribute.
+        """Public read-only view of the recording generation counter (issue
+        #40/43): UI code (menubar drain gate, capture-started enqueue) reads
+        the current generation through this accessor, not the private
+        _generation attribute.
         Read lock-free: int reads are atomic under the GIL and every
         mutation happens under _lock."""
         return self._generation
@@ -136,7 +138,7 @@ class AudioRecorder:
     @property
     def _warm(self) -> WarmCapture | None:
         """The keep-warm capture slot; it lives in WarmArm, where every
-        transition is serialised (issue #72 finding 1)."""
+        transition is serialised (issue #72)."""
         return self._warm_arm.capture
 
     def _stale(self, my_gen: int) -> Callable[[], bool]:
@@ -204,7 +206,7 @@ class AudioRecorder:
             # never a second live instance alongside one. The pair comes from
             # one snapshot(): an index is only a fact about the instance that
             # enumerated it, so the two must not be read across an instance
-            # swap (#72 review, minor 1).
+            # swap (#72).
             live_pa, live_device_index = self._session.snapshot()
             pa, stream, error, capture_rate = attempt_open_once(
                 pyaudio,
@@ -271,25 +273,10 @@ class AudioRecorder:
 
     def _rearm_warm(self, usable: bool) -> None:
         """Re-arm the keep-warm capture after a reset replaced its session.
-        usable=False is the busy path: a capture that would not stop is
-        dead for presses (its stop event is set, so it can never re-open)
-        -- drop it and later presses take the worker path, not a dead sink.
-        The session keeps the handle on its live thread: see WarmKeep.drop().
-
-        usable=True goes through WarmArm.rearm, NOT set_keep_warm: the reset
-        ran outside the lock long enough for the menu to be unchecked, and
-        re-arming anyway leaves the mic open behind an unchecked item.
-
-        A drop() that reports False names a thread still parked in a native
-        read on the session being replaced: arming a fresh capture over it
-        puts two readers on PortAudio at once, so the arm is skipped and the
-        recovery flag (which drop() set) brings keep-warm back once the
-        ledger clears.
+        The rule (and why a busy path must not arm over a wedged reader) is
+        ``audio_warm_arm.rearm_warm``.
         """
-        dead = self._warm_arm.take()
-        if not self._session.warm.drop(dead) or not usable:
-            return
-        self._warm_arm.rearm(self._make_warm_capture)
+        rearm_warm(self, usable)
 
     def _announce_capture(self, my_gen: int) -> None:
         """Fire on_capture_started at most once per start_recording() cycle
@@ -306,12 +293,7 @@ class AudioRecorder:
     def set_keep_warm(self, enabled: bool) -> None:
         """Keep the input stream open between recordings (issue #66) -- the
         MENU's path, and the only caller that gets to state the request.
-
-        Arming is serialised in WarmArm (issue #72 adversarial
-        finding 1): #72 gave it worker- and press-side caller threads, and a
-        lock-free check-then-act could start two captures and orphan
-        the loser outside WarmKeep, where terminate_all() drives
-        PortAudio out from under it.
+        Arming itself is serialised in ``WarmArm``.
         """
         self._warm_arm.set_enabled(
             self._make_warm_capture,
@@ -464,17 +446,16 @@ class AudioRecorder:
                     daemon=True,
                 )
                 self.recording_thread = worker
-                # The session records the worker BEFORE it runs (issue #72
-                # adversarial review, finding 1): from here on the registry
-                # can answer "may a worker be inside PortAudio?" for itself,
-                # so a later press cannot terminate the engine underneath this
-                # one after it is displaced from recording_thread by its own
-                # successor.
+                # The session records the worker BEFORE it runs: from here on
+                # the registry can answer "may a worker be inside PortAudio?"
+                # for itself, so a later press cannot terminate the engine
+                # underneath this one after it is displaced from
+                # recording_thread by its own successor.
                 self._session.note_worker(worker)
 
         # Warm: route the ring, no open and no worker (issue #66). Worker:
         # launched through the helper, whose failure path keeps the worker
-        # ledger and the recorder's view honest (issue #72 review).
+        # ledger and the recorder's view honest (issue #72).
         start_press(self, warm, sink, my_gen, worker)
         return True
 
@@ -501,40 +482,9 @@ class AudioRecorder:
             log_stop(0, None, reason)
             return np.array([], dtype=np.float32)
 
-        stuck_open = False
-        if thread is not None:
-            thread.join(timeout=self._stuck_open_timeout_seconds)
-            if thread.is_alive():
-                # Stuck-open detection: a stuck (not failed) open
-                # surfaces as "no speech" because last_error hasn't
-                # been written yet -- the join timeout is the only
-                # observable signal.
-                with self._lock:
-                    if self._generation == my_gen:
-                        self.last_error = "microphone busy — recording did not start"
-                print(
-                    "Recording worker still alive after stop; microphone may be stuck"
-                )
-                stuck_open = True
-
-        if warm is not None:
-            warm.end()
-        audio_chunks = []
-        while not self.audio_queue.empty():
-            audio_chunks.append(self.audio_queue.get())
-
-        if audio_chunks:
-            return assemble_audio(audio_chunks, capture_rate)
-
-        reason = "stuck-open" if stuck_open else "race-lost"
-        if warm is not None:
-            # The warm stream was not delivering yet: report it (#66).
-            with self._lock:
-                if self._generation == my_gen:
-                    self.last_error = "microphone busy — recording did not start"
-            reason = "warm-not-ready"
-        log_stop(0, start_monotonic, reason)
-        return np.array([], dtype=np.float32)
+        return finish_recording(
+            self, thread, my_gen, start_monotonic, warm, capture_rate
+        )  # fmt: skip
 
     def cleanup(self) -> None:
         """Clean up PyAudio resources. terminate() is skipped -- and

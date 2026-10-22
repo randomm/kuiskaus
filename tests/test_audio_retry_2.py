@@ -142,8 +142,7 @@ def test_attempt_open_once_binds_the_resolved_index_to_the_registry():
     """Issue #72: when the session was unbound, the index this attempt
     resolved must be handed back via bind_index -- otherwise it dies with
     the attempt and every later press pays a fresh enumeration. It goes
-    back PAIRED with the instance it was resolved against (issue #72
-    review, round 1): a PortAudio index is a fact about one instance's
+    back PAIRED with the instance it was resolved against: a PortAudio index is a fact about one instance's
     frozen enumeration, and an unpaired binding is what pinned a session
     to a disconnected device forever."""
     from kuiskaus.audio_retry import attempt_open_once

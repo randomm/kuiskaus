@@ -1,4 +1,4 @@
-"""test_audio_recorder tests, part 2 of 6 (issue #70)."""
+"""test_audio_recorder tests, part 2 of 6 (issue #72)."""
 
 import gc
 import threading
@@ -65,7 +65,7 @@ def test_retry_reuses_the_live_session_and_constructs_nothing(
 def test_retry_runtime_error_from_device_lookup_sets_last_error(
     audio_recorder_module,
 ):
-    """Round-2 review CRITICAL finding: if the retry's own
+    """if the retry's own
     _find_default_input_device() call exhausts its fallback loop and
     raises RuntimeError (no input device at all -- e.g. the mic was
     unplugged between the two attempts), the worker must not die
@@ -83,8 +83,7 @@ def test_retry_runtime_error_from_device_lookup_sets_last_error(
     # Fast-failure path: both attempts fail immediately (the retry's
     # device lookup raises RuntimeError), so the worker can complete and
     # clear recording before any capture; wait for completion on
-    # observable state instead (lens review HIGH #1/#4 read-before-start
-    # race).
+    # observable state instead.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -98,7 +97,7 @@ def test_retry_runtime_error_from_device_lookup_sets_last_error(
 def test_late_successful_open_does_not_clobber_already_surfaced_last_error(
     audio_recorder_module,
 ):
-    """Round-2 review ISSUES finding: if stop_recording()'s stuck-open
+    """if stop_recording()'s stuck-open
     detection already set last_error for this generation (worker still
     blocked in open() past the join timeout) and the worker's open()
     subsequently succeeds late, it must not clear that already-surfaced
@@ -167,7 +166,7 @@ def test_worker_thread_is_daemon(audio_recorder_module):
     stream = _blocking_stream(OSError("stop the loop"), release_event)
     pa1.open.return_value = stream
 
-    # pa1 is the __init__'s cached instance; attempt 1 reuses it (issue #42).
+    # pa1 is the __init__'s cached instance; attempt 1 reuses it (issue #72).
     recorder = _make_recorder(module, init_probe=pa1)
     assert recorder.start_recording() is True
     thread = recorder.recording_thread
@@ -302,8 +301,7 @@ def test_release_during_backoff_sleep_aborts_before_next_attempt(
 
     # Fast-abort pattern: fake_sleep flips the state synchronously during
     # the sleep, so the worker may tear down before the thread handle is
-    # captured; wait for completion on observable state instead (lens
-    # review HIGH #1/#4).
+    # captured; wait for completion on observable state instead.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -433,7 +431,7 @@ def test_max_attempts_less_than_one_raises_value_error(
     audio_recorder_module, bad_attempts
 ):
     """max_attempts <= 0 would otherwise silently skip the retry loop and
-    surface a bogus "unknown error" (lens review MEDIUM #2)."""
+    surface a bogus "unknown error"."""
     module = audio_recorder_module
     with pytest.raises(ValueError, match="max_attempts must be >= 1"):
         module.AudioRecorder(max_attempts=bad_attempts)

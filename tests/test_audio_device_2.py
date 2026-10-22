@@ -1,7 +1,7 @@
 """The keep-warm press gate and the capture that would not stop.
 
 Split out of test_audio_device.py, which had grown past the 500-line module
-cap (issue #72 review). Everything here is the same question from the
+cap (issue #72). Everything here is the same question from the
 registry's side: a keep-warm capture whose thread is parked in a native
 ``stream.read()`` is dropped from the recorder's state, and the session is
 the only thing left that can name that thread -- so every path that would
@@ -11,22 +11,8 @@ drive PortAudio's init count to zero has to ask it first.
 import threading
 from unittest.mock import MagicMock, call
 
-from kuiskaus.audio_device import PyAudioRegistry
+from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
-
-
-def _registry(pa_module=None, pa=None):
-    """A registry over a stubbed pyaudio module yielding ``pa`` (or one
-    fresh mock) per construction."""
-    module = pa_module or MagicMock(name="pyaudio-module")
-    if pa is None:
-        pa = MagicMock(name="PyAudioInstance")
-    module.PyAudio = MagicMock(return_value=pa)
-    return PyAudioRegistry(module), pa, module
-
-
-def _find_device(_pa):
-    return 3
 
 
 def _stuck_capture():
@@ -48,7 +34,7 @@ def test_refused_press_is_admitted_without_touching_the_session(
 ):
     """The recorder refuses a press while a recording is live, so the gate
     must not reach refresh() first: that would stop the warm capture
-    feeding the in-progress recording and rebuild under it (#72 review)."""
+    feeding the in-progress recording and rebuild under it (#72)."""
     registry, pa, module = _registry()
     registry.open(_find_device)
     _live_default_input(coreaudio_stub, 77)  # the default moved mid-capture
@@ -83,7 +69,7 @@ def test_busy_warm_reset_drops_the_capture_it_could_not_stop(coreaudio_stub):
     when the stuck read returns the thread exits and it can never
     re-open. The busy return must hand it back as rearm(False) so the
     recorder clears _warm -- otherwise the next press that needs no reset
-    records silently into that dead sink (#72 review)."""
+    records silently into that dead sink (#72)."""
     registry, pa, module = _registry()
     registry.open(_find_device)
     _live_default_input(coreaudio_stub, 77)
@@ -144,7 +130,7 @@ def test_the_worker_running_a_reset_is_never_its_own_blocker(coreaudio_stub):
 def test_terminate_all_refuses_while_a_dropped_capture_may_still_be_reading(
     coreaudio_stub,
 ):
-    """CRITICAL (issue #72 review): the recorder forgets a capture it could
+    """the recorder forgets a capture it could
     not stop, so the session's handle on it is the only thing that can make
     this refusal. Without it the quit path drives PortAudio's init count to
     zero under a thread parked inside stream.read()."""
@@ -211,7 +197,7 @@ def test_terminate_all_keeps_an_instance_it_could_not_terminate(
     """Forgetting an instance whose terminate() raised is how it becomes
     permanently unreachable while still holding PortAudio's init count above
     zero -- so it stays registered and the next attempt gets another shot
-    (issue #72 review)."""
+    (issue #72)."""
     registry, bad, _module = _registry()
     registry.open(_find_device)
     bad.terminate.side_effect = OSError("Pa_Terminate failed")
@@ -230,7 +216,7 @@ def test_terminate_all_keeps_an_instance_it_could_not_terminate(
 def test_terminate_all_survives_a_terminate_that_raises_a_non_oserror(
     coreaudio_stub,
 ):
-    """MINOR (issue #72 review): Pa_Terminate runs its own cleanup and the
+    """Pa_Terminate runs its own cleanup and the
     PyAudio wrapper raises whatever it produces -- a RuntimeError from a
     SwigPyObject teardown, not an OSError. Catching only OSError let it escape
     the loop mid-list, so the instances after it were never reached: still
@@ -288,7 +274,7 @@ def _terminate_refusing_registry(coreaudio_stub):
 def test_busy_reset_after_a_stopped_capture_hands_it_back_and_asks_recovery(
     coreaudio_stub,
 ):
-    """CRITICAL (issue #72 review round 4): the terminate_all()-failure
+    """the terminate_all()-failure
     branch stopped the warm capture and then returned busy WITHOUT the
     hand-back its sibling branch does. Observed consequence: press 1
     refused, press 2 (default settled back, or one transient no-evidence
@@ -312,7 +298,7 @@ def test_busy_reset_after_a_stopped_capture_hands_it_back_and_asks_recovery(
 def test_recovery_flag_from_a_bailed_reset_brings_keep_warm_back(
     coreaudio_stub,
 ):
-    """The recovery half of the same finding: with only the rearm(False)
+    """The recovery half: with only the rearm(False)
     hand-back, _recover_pending was still False (drop() sets it only on a
     FAILED stop), so WarmKeep.recover() -- reachable from the worker path
     -- never fired and keep-warm never returned. The bailed reset must
@@ -339,7 +325,7 @@ def test_recovery_flag_from_a_bailed_reset_brings_keep_warm_back(
 def test_persistent_dead_default_rebuilds_once_not_every_press(
     coreaudio_stub,
 ):
-    """ISSUE (issue #72 review): refresh() re-records device_id but not
+    """refresh() re-records device_id but not
     the liveness it reset against, so a stable default the alive-read
     reports dead (or fails to read) re-triggered a full teardown + rebuild
     on EVERY press forever -- measured at one PyAudio() construction per

@@ -165,6 +165,21 @@ def test_stop_ends_thread_and_closes_stream(warm):
     assert capture.ready is False
 
 
+def test_thread_names_the_reader_while_it_runs(warm):
+    """``thread`` is what the session's terminate gate asks, so it has to be
+    the real reader thread -- a name that never appeared would let
+    ``terminate_all()`` drive PortAudio out from under a live reader."""
+    stream = FakeStream()
+    capture = warm(lambda: (stream, RATE))
+    assert capture.thread is None
+    capture.start()
+    assert _wait_until(lambda: capture.ready)
+    reader = capture.thread
+    assert reader is not None and reader.is_alive()
+    assert capture.stop() is True
+    assert not reader.is_alive()
+
+
 def test_stop_reports_false_when_open_is_stuck(warm):
     release = threading.Event()
 

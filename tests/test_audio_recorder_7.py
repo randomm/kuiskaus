@@ -1,7 +1,7 @@
 """The stuck keep-warm capture: what it blocks, and what brings it back.
 
 Split out of test_audio_recorder_3.py, which had grown past the 500-line
-module cap (issue #72 review). These are the recorder-level lifecycle tests
+module cap (issue #72). These are the recorder-level lifecycle tests
 for a keep-warm capture whose thread is parked in a native
 ``stream.read()``: the capture comes out of the recorder's state so later
 presses do not record into a dead sink, but its thread is still alive and
@@ -75,7 +75,7 @@ def test_busy_warm_press_drops_the_capture_it_could_not_stop(
     stop event, so when the stuck read returns the thread exits and that
     WarmCapture can never re-open. The busy press must drop it: keeping
     it installed lets the next press that needs no reset record silently
-    into a dead sink while keep-warm stays advertised (#72 review)."""
+    into a dead sink while keep-warm stays advertised."""
     module = audio_recorder_module
     release = threading.Event()
     pa = _make_pyaudio_instance(0, rate=16000.0)
@@ -116,7 +116,7 @@ def test_busy_warm_press_keeps_a_capture_that_still_works(
 ):
     """The drop belongs to the warm-stop-False path alone: a
     blocked_worker busy report never stopped the capture, so keep-warm
-    survives that press intact (#72 review)."""
+    survives that press intact."""
     module = audio_recorder_module
     release = threading.Event()
     recorder, pa = _warm_recorder(module, _streaming_stream(release))
@@ -142,7 +142,7 @@ def test_busy_warm_press_keeps_a_capture_that_still_works(
 def test_press_after_a_dropped_warm_capture_does_not_terminate_under_it(
     audio_recorder_module, coreaudio_stub
 ):
-    """CRITICAL (issue #72 review): dropping the stuck capture from the
+    """dropping the stuck capture from the
     recorder must not orphan its live thread.
 
     The abandoned thread is alive by definition -- that is exactly why
@@ -214,7 +214,7 @@ def test_cleanup_does_not_terminate_under_a_dropped_warm_capture(
 def test_keep_warm_returns_after_a_dropped_capture_thread_leaves_the_read(
     audio_recorder_module, coreaudio_stub
 ):
-    """Pre-roll comes back on its own (issue #72 review).
+    """Pre-roll comes back on its own (issue #72).
 
     ``rearm_warm(True)`` was otherwise reachable only from a warm press that
     stopped its capture, so one stuck read left keep-warm off for the life of
@@ -278,7 +278,7 @@ def test_worker_path_does_not_rearm_warm_when_the_user_switched_it_off(
 def test_refused_warm_press_joins_a_wedged_capture_only_once(
     audio_recorder_module, coreaudio_stub
 ):
-    """Issue #72 review, round 2 (measured regression): ONE refused press
+    """Issue #72(measured regression): ONE refused press
     joined the wedged keep-warm thread TWICE -- refresh() dropped the capture,
     then handed the same object to rearm_warm(False), which dropped it again.
     Each stop() is a 2.0s join of a thread proven parked in stream.read(), so
@@ -319,7 +319,7 @@ def test_refused_warm_press_joins_a_wedged_capture_only_once(
 
 
 def test_warm_keep_a_second_drop_of_a_wedged_capture_probes_never_rejoins():
-    """WarmKeep unit (issue #72 review, round 2): the busy reset path drops a
+    """WarmKeep unit (issue #72): the busy reset path drops a
     wedged capture and then hands the SAME object to rearm_warm(False), which
     drops it again. A capture already on the blockers list has been joined and
     is proven parked, so the second ask is answered by the probe -- two joins
@@ -404,7 +404,7 @@ def test_warm_keep_want_off_withdraws_a_pending_recovery():
 
 
 def test_warm_keep_a_probe_during_the_join_sees_the_capture_being_stopped():
-    """WarmKeep unit (issue #72 review, round 1): the blocker must be named
+    """WarmKeep unit (issue #72): the blocker must be named
     BEFORE ``stop()`` joins.
 
     The join window is exactly the interval in which the capture's thread is
@@ -451,7 +451,7 @@ def test_warm_keep_a_probe_during_the_join_sees_the_capture_being_stopped():
 
 
 def test_warm_keep_clear_prunes_rather_than_reassigning_the_blocker_list():
-    """WarmKeep unit (issue #72 review, round 1): a capture registered while
+    """WarmKeep unit (issue #72): a capture registered while
     ``clear()``'s probes were running must survive the commit.
 
     The probes cannot hold the lock (a wedged capture must never be able to

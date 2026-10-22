@@ -1,4 +1,4 @@
-"""A PortAudio that will not come down has to say so (issue #72, round 1).
+"""A PortAudio that will not come down has to say so (issue #72).
 
 ``terminate_all()`` keeps an instance it could not terminate registered --
 forgetting a live instance is how it becomes permanently unreachable -- and
@@ -32,23 +32,9 @@ import threading
 from unittest.mock import MagicMock
 
 import kuiskaus.audio_device_reset as reset_module
-from kuiskaus.audio_device import PyAudioRegistry
 from kuiskaus.audio_device_reset import MAX_TERMINATE_FAILURES
+from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
-
-
-def _registry(pa_module=None, pa=None):
-    """A registry over a stubbed pyaudio module yielding ``pa`` (or one
-    fresh mock) per construction."""
-    module = pa_module or MagicMock(name="pyaudio-module")
-    if pa is None:
-        pa = MagicMock(name="PyAudioInstance")
-    module.PyAudio = MagicMock(return_value=pa)
-    return PyAudioRegistry(module), pa, module
-
-
-def _find_device(_pa):
-    return 3
 
 
 def _poison_registry(coreaudio_stub):
@@ -127,7 +113,7 @@ def test_the_reset_keeps_trying_and_never_rebuilds_while_the_instance_stays_up(
 def test_a_teardown_that_never_succeeds_ends_in_a_surfaced_restart_need(
     coreaudio_stub,
 ):
-    """The finding: past the budget the session has to admit it. The user
+    """past the budget the session has to admit it. The user
     gets a dead microphone either way; the only question is whether anything
     says so."""
     registry, _pa, _module = _poison_registry(coreaudio_stub)

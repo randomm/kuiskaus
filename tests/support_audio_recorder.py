@@ -1,6 +1,6 @@
-"""Shared helpers for the test_audio_recorder test modules (issue #70).
+"""Shared helpers for the test_audio_recorder test modules (issue #72).
 
-Hardware-free unit tests for AudioRecorder (issue #16).
+Hardware-free unit tests for AudioRecorder (issue #72).
 
 A failed microphone open must cost the user one recording, visibly -- not
 the session. These tests exercise the concurrency guard (lock + liveness
@@ -58,7 +58,7 @@ def _assert_stop_log_line(
 ) -> None:
     """Assert exactly one well-formed ``[audio.stop] chunks=<n>
     duration_ms=<m> reason=<value>`` line in captured stdout, with the
-    given reason (issue #40). Optionally pin the chunks count and a
+    given reason (issue #72). Optionally pin the chunks count and a
     duration_ms floor. Shared by the four empty-return reason tests so
     the line shape is asserted in one place."""
     log_lines = [
@@ -84,7 +84,7 @@ def _live_default_input(stub: MagicMock, device_id: int, is_alive: bool = True) 
 
     The autouse stub's default is "every read fails" -- no evidence, so
     ``read_live_default_input()`` returns None and the recorder takes the
-    no-reset fast path, which is what the pre-#72 recorder tests were
+    no-reset fast path, which is what the pre-#72ecorder tests were
     written against. A test that exercises the device-change reset has to
     say what the system default actually is; call this again with a
     different id to move it.
@@ -115,14 +115,14 @@ def _make_pyaudio_instance(
 ) -> MagicMock:
     """A mock PyAudio() instance with a resolvable default input device.
 
-    ``rate`` adds a native ``defaultSampleRate`` to the device info (issue #55).
+    ``rate`` adds a native ``defaultSampleRate`` to the device info (issue #72).
     """
     device_info: dict = {"index": index}
     if rate is not None:
         device_info["defaultSampleRate"] = rate
     instance = MagicMock(name=f"PyAudioInstance-{index}")
     instance.get_default_input_device_info.return_value = device_info
-    # Issue #55 lens review MEDIUM (security): the open-time native-rate
+    # Issue #55 (security): the open-time native-rate
     # query now targets the resolved device via get_device_info_by_index
     # (the default-device info is only used to resolve the index), so the
     # fixture mirrors the rate on that path too.
@@ -137,8 +137,7 @@ def _make_recorder(
     extra_pa: MagicMock | None = None,
     **kwargs,
 ):
-    """Build an AudioRecorder wired for the cached-instance shape (issue
-    #42: PR #38's per-recording construction is retired).
+    """Build an AudioRecorder wired for the cached-instance shape (issue #42: PR #38 per-recording construction is retired).
 
     ``module.pyaudio.PyAudio`` yields, in order: ``init_probe`` (the
     __init__'s persistent cached instance -- synthesized when not given),

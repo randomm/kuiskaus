@@ -1,7 +1,4 @@
-"""Unit tests for kuiskaus.audio_retry.attempt_open_once (issue #40/43
-lens review MEDIUM #1: the one-shot open attempt was extracted from
-audio_recorder._attempt_open_once so audio_recorder.py stays under the
-500-line module limit in AGENTS.md).
+"""Unit tests for kuiskaus.audio_retry.attempt_open_once.
 
 The function is a free function over the pyaudio module object and a
 device-resolution callable, so tests drive it directly with mocks -- no
@@ -57,7 +54,7 @@ def test_attempt_open_once_success_returns_pa_stream_and_no_error():
         input_device_index=7,
         frames_per_buffer=1024,
     )
-    # Issue #55 lens review MEDIUM (security): the native-rate query must
+    # Issue #55 (security): the native-rate query must
     # target the resolved device index (7), not the default-device info.
     pa_ok.get_device_info_by_index.assert_called_once_with(7)
     pa_ok.get_default_input_device_info.assert_not_called()
@@ -213,7 +210,7 @@ def test_attempt_open_once_queries_native_rate_24000():
     """Issue #55: a device reporting defaultSampleRate=24000.0
     (AirPods Pro) must have the stream opened at rate=24000, not 16000.
     The rate is queried from get_device_info_by_index (the resolved
-    device), not get_default_input_device_info (lens review MEDIUM)."""
+    device), not get_default_input_device_info."""
     from kuiskaus.audio_retry import attempt_open_once
 
     pa_module = MagicMock(name="pyaudio")
@@ -273,7 +270,7 @@ def test_attempt_open_once_falls_back_to_sample_rate_when_no_defaultSampleRate()
 
 
 def test_attempt_open_once_falls_back_to_sample_rate_when_rate_is_zero(capsys):
-    """Issue #55 + lens review MEDIUM (error handling): a device reporting
+    """Issue #55: a device reporting
     defaultSampleRate=0.0 (some driver combos -- precisely the failure
     mode this ticket addresses) must fall back to the provided
     sample_rate, not open at rate=0, AND print a log line so an operator
@@ -324,7 +321,7 @@ def test_attempt_open_once_falls_back_to_sample_rate_on_oserror():
 
 
 def test_attempt_open_once_falls_back_when_rate_out_of_bounds(capsys):
-    """Issue #55 lens review LOW (defense-in-depth): a native rate outside
+    """Issue #55 LOW (defense-in-depth): a native rate outside
     the sanity bounds 4000..192000 Hz (a corrupted device report) must
     fall back to the provided sample_rate with a log line."""
     from kuiskaus.audio_retry import attempt_open_once

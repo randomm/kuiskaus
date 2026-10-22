@@ -1,15 +1,14 @@
-"""Who may still be inside a native PortAudio call (issue #72 adversarial
-review).
+"""Who may still be inside a native PortAudio call.
 
-Two ledger gaps, both caught by the review of the first fix:
+Two ledger gaps, both caught by the harness of the first fix:
 
-1. **CRITICAL** -- workers had no ledger. ``terminate_all()`` consulted only
+1. workers had no ledger. ``terminate_all()`` consulted only
    the named worker plus the keep-warm captures, and ``recording_thread`` is
    a *name*, cleared by whichever successor completes first. A thread that
    lost its name but was still inside ``pa.open()`` was invisible to the
    gate, and the next press terminated PortAudio underneath it. ``WorkerKeep``
    is the ledger: every worker the session started stays named until its
-   thread has actually finished. The CRITICAL scenario itself is reproduced in
+   thread has actually finished. That scenario itself is reproduced in
    ``tests/test_audio_recorder_8.py``.
 
 2. **ISSUE** -- ``terminate_all()`` asked only the *dropped* captures. A
@@ -27,23 +26,10 @@ from __future__ import annotations
 import threading
 from unittest.mock import MagicMock
 
-from kuiskaus.audio_device import PyAudioRegistry
 from kuiskaus.audio_warm_keep import WarmKeep
 from kuiskaus.audio_worker_keep import WorkerKeep
+from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
-
-
-def _registry(pa_module=None):
-    """A registry over a stubbed pyaudio module yielding one fresh mock
-    instance per construction."""
-    module = pa_module or MagicMock(name="pyaudio-module")
-    pa = MagicMock(name="PyAudioInstance")
-    module.PyAudio = MagicMock(return_value=pa)
-    return PyAudioRegistry(module), pa, module
-
-
-def _find_device(_pa):
-    return 3
 
 
 def _capture(thread=None, *, stops=True, released_after=None):
@@ -52,12 +38,12 @@ def _capture(thread=None, *, stops=True, released_after=None):
 
     Built on ``MagicMock`` rather than a duck-typed class so the type checker
     reads it as the real thing at the typed ``note_installed``/``drop``
-    boundaries. ``is_alive`` tracks ``thread`` at CALL time, so a test can let
-    the reader exit and watch the ledger release it.
+    boundaries. ``thread`` is the only thing the ledger asks of an installed
+    capture, and it asks ``thread.is_alive()`` -- the same question the real
+    ``WarmCapture`` answers.
     """
     warm = MagicMock(name="warm-capture")
     warm.thread = thread
-    warm.is_alive.side_effect = lambda: thread is not None and thread.is_alive()
 
     def stop(timeout: float = 2.0) -> bool:
         if timeout == 0.0 and released_after is not None:
@@ -173,7 +159,7 @@ def test_worker_reset_reports_busy_for_a_worker_no_caller_named(coreaudio_stub):
 
 
 def test_terminate_all_refuses_while_an_installed_capture_may_be_reading():
-    """ISSUE (issue #72 adversarial review): ``WarmKeep._blockers`` only ever
+    """ISSUE: ``WarmKeep._blockers`` only ever
     held captures that had been *dropped*. The worker path hands no capture
     at all, resting on "with keep-warm on there is no worker" -- a race, not
     an invariant: a capture armed from the menu during a press reads on a
@@ -194,7 +180,7 @@ def test_terminate_all_refuses_while_an_installed_capture_may_be_reading():
 
 
 def test_an_installed_capture_with_no_thread_yet_still_blocks_a_terminate():
-    """ISSUE (issue #72 review, round 2, finding 2): the gate was blind to
+    """ISSUE: the gate was blind to
     the one window ``note_installed`` exists to cover.
 
     ``WarmArm`` names the capture BEFORE ``capture.start()`` assigns its

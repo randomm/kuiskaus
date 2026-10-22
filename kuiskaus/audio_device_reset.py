@@ -46,7 +46,7 @@ MICROPHONE_NEEDS_RESTART = (
 MICROPHONE_BUSY = "microphone busy — recording did not start"
 
 # How many consecutive teardowns an instance may refuse before the session
-# stops implying the microphone might come back (issue #72 review, round 1).
+# stops implying the microphone might come back (issue #72).
 # Retrying forever is right -- forgetting a live instance would leave
 # PortAudio's init count above zero and make every later rebuild useless --
 # but retrying forever *silently* is what reproduced the issue's own symptom
@@ -351,7 +351,7 @@ def press_is_admissible(
 
 
 def press_refusal_reason(registry: PyAudioRegistry) -> str:
-    """Why an admitted press was refused (issue #72 review, round 1).
+    """Why an admitted press was refused (issue #72).
 
     The two refusals look alike to the press and are not alike. A ledger
     deferral -- a worker or a warm capture still inside a native call --

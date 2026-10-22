@@ -34,8 +34,8 @@ def test_failed_open_leaves_recording_false_and_next_start_succeeds(
     recorder = _make_recorder(module, pa_retry, init_probe=pa1, max_attempts=2)
     # Fast-failure path: both attempts fail immediately, so the worker
     # can complete and clear recording/recording_thread before any
-    # capture; wait for completion on observable state instead (lens
-    # review HIGH #1/#4 read-before-start race).
+    # capture; wait for completion on observable state instead: the
+    # read-before-start race is real.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -72,8 +72,7 @@ def test_stop_recording_after_failed_open_returns_empty_array(audio_recorder_mod
     recorder = _make_recorder(module, pa_retry, init_probe=pa1, max_attempts=2)
     # Fast-failure path: both attempts fail immediately, so the worker
     # can complete and clear recording before any capture; wait for
-    # completion on observable state instead (lens review HIGH #1/#4
-    # read-before-start race).
+    # completion on observable state instead.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -220,9 +219,7 @@ def test_stop_recording_omits_log_line_on_non_empty_return(
 def test_current_generation_reflects_recording_cycles(audio_recorder_module):
     """The public current_generation property mirrors the internal
     generation counter: 0 before any recording, 1 after the first
-    start_recording(), 2 after the second (issue #40/43 lens review
-    MEDIUM #2: UI drain code reads the current generation through this
-    accessor instead of the private _generation attribute)."""
+    start_recording(), 2 after the second."""
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
     release1 = threading.Event()
@@ -273,8 +270,7 @@ def test_failed_open_teardown_only_touches_worker_owned_objects(audio_recorder_m
     recorder = _make_recorder(module, init_probe=pa1, max_attempts=2)
     # Fast-failure path: both attempts fail immediately, so the worker
     # can complete and clear recording before any capture; wait for
-    # completion on observable state instead (lens review HIGH #1/#4
-    # read-before-start race).
+    # completion on observable state instead.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -318,8 +314,7 @@ def test_all_attempts_exhausted_surfaces_error_and_recovers(
     )
     # Fast-exhaustion path: all attempts fail immediately, so the
     # worker can complete and clear recording before any capture; wait
-    # for completion on observable state instead (lens review HIGH
-    # #1/#4 read-before-start race).
+    # for completion on observable state instead.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 

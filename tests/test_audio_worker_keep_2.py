@@ -1,5 +1,4 @@
-"""A worker that was noted but never started is ARMING, not finished
-(issue #72 adversarial review, finding 2).
+"""A worker that was noted but never started is ARMING, not finished.
 
 ``start_recording()`` notes the worker under ``_lock`` and starts it after
 the release -- a window in which the thread exists, has never run, and may

@@ -69,7 +69,7 @@ def test_a_persistently_dead_default_rebuilds_once_not_once_per_press(
 def test_an_oscillating_default_is_bounded_rather_than_rebuilding_forever(
     coreaudio_stub,
 ):
-    """The finding: with the pair changing on every read the guard cannot
+    """with the pair changing on every read the guard cannot
     engage, so consecutive rebuilds have to be counted -- otherwise the
     session churns PortAudio for the life of the process and never says so."""
     registry, _pa, module = _registry()

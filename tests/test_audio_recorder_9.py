@@ -1,9 +1,9 @@
-"""The user is told when PortAudio will not come down (issue #72, round 1).
+"""The user is told when PortAudio will not come down (issue #72).
 
 A press the device reset cannot complete used to fail in two flavours that
 looked identical from outside: "microphone busy" (a thread may still be native
 -- defers, and resolves itself) and a poisoned session whose ``terminate()``
-never succeeds (never resolves, and nothing ever said so). The review measured
+never succeeds (never resolves, and nothing ever said so). the harness measured
 five consecutive presses returning busy with ``last_error`` None and the
 menubar still showing Ready -- the #72 symptom surviving inside the PR written
 to remove it.
@@ -81,7 +81,7 @@ def test_a_refused_press_says_busy_while_a_retry_is_still_possible(
 def test_the_press_that_learns_the_engine_will_not_come_down_says_restart(
     audio_recorder_module, coreaudio_stub
 ):
-    """The finding, at the press boundary. The press is refused either way,
+    """at the press boundary. The press is refused either way,
     so all that changes is whether anything tells the user the microphone is
     not coming back: the presses before the budget say "busy", the one that
     spends it says restart."""

@@ -1,9 +1,9 @@
-"""The dedupe baseline must be ONE read, not two (issue #72 review, CRITICAL).
+"""The dedupe baseline must be ONE read, not two (issue #72).
 
 Split from test_audio_device_3.py, which is at the module-cap margin. These
-are the regressions for the two remaining reset findings:
+are the regressions for the two reset bugs:
 
-* CRITICAL -- ``reset_session`` read CoreAudio once for its own decision
+* ``reset_session`` read CoreAudio once for its own decision
   and ``registry.open()`` read it a SECOND time for ``device_id``, while
   ``last_reset`` was pinned to the FIRST read. When the two reads
   disagreed (a coreaudiod storm is exactly when they do), the dedupe
@@ -11,7 +11,7 @@ are the regressions for the two remaining reset findings:
   -- suppressed the still-needed reset forever: the session stayed bound
   to the device the second read had named, and every later press of the
   real default was told the session was already fresh.
-* MINOR -- the keep-warm re-arm ran BEFORE the ``if not rebuilt`` bail, so
+* the keep-warm re-arm ran BEFORE the ``if not rebuilt`` bail, so
   a rebuild that never came back re-armed a capture over a session that
   does not exist (and left no recovery ask behind for when it does).
 
@@ -25,26 +25,11 @@ from unittest.mock import MagicMock, call, patch
 
 import kuiskaus.audio_device as device_module
 from kuiskaus.audio_coreaudio import LiveDefaultInput
-from kuiskaus.audio_device import PyAudioRegistry
+from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
 
-
-def _registry(pa_module=None, pa=None):
-    """A registry over a stubbed pyaudio module yielding ``pa`` (or one
-    fresh mock) per construction."""
-    module = pa_module or MagicMock(name="pyaudio-module")
-    if pa is None:
-        pa = MagicMock(name="PyAudioInstance")
-    module.PyAudio = MagicMock(return_value=pa)
-    return PyAudioRegistry(module), pa, module
-
-
-def _find_device(_pa):
-    return 3
-
-
 # ---------------------------------------------------------------------------
-# CRITICAL: device_id and last_reset must come from the SAME CoreAudio read
+# device_id and last_reset must come from the SAME CoreAudio read
 # ---------------------------------------------------------------------------
 
 
@@ -86,7 +71,7 @@ def test_a_construction_failure_clears_the_stale_baseline(coreaudio_stub):
 def test_split_reads_that_disagree_do_not_pin_the_dedupe_baseline(
     coreaudio_stub,
 ):
-    """The CRITICAL, as the two independent reads produce it.
+    """as the two independent reads produce it.
 
     The reset's own read says the live default is 77; ``open()``'s second
     read says 88 (a storm makes the two disagree -- exactly the moment
@@ -156,7 +141,7 @@ def test_a_settled_pair_dedupes_without_the_guard_pinning_a_wrong_device(
 
 
 # ---------------------------------------------------------------------------
-# MINOR: re-arm only after the rebuild actually came back
+# re-arm only after the rebuild actually came back
 # ---------------------------------------------------------------------------
 
 

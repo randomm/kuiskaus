@@ -1,4 +1,4 @@
-"""test_audio_recorder tests, part 3 of 6 (issue #70)."""
+"""test_audio_recorder tests, part 3 of 6 (issue #72)."""
 
 import threading
 import time
@@ -24,7 +24,7 @@ def test_oserror_from_device_enumeration_is_retryable(audio_recorder_module):
     """A coreaudiod storm can make device enumeration itself raise OSError
     -9986 in _find_default_input_device's fallback path
     (get_default_input_device_info fails, then get_device_count raises),
-    not just open() (lens review HIGH #3). That must cost one attempt and
+    not just open(). That must cost one attempt and
     let the loop continue on the SAME live instance (issue #72), not
     propagate out of _recording_worker and kill the thread silently (the
     exact bug #16 this PR closes)."""
@@ -78,7 +78,7 @@ def test_stuck_open_sets_last_error_on_join_timeout(audio_recorder_module, capsy
     pa_retry = _make_pyaudio_instance(1)
     pa_retry.open.side_effect = OSError("retry fails too")
 
-    # pa1 is the __init__'s cached instance (issue #42); the retry
+    # pa1 is the __init__'s cached instance (issue #72); the retry
     # attempt's fresh instance is pa_retry.
     recorder = _make_recorder(module, pa_retry, init_probe=pa1)
     assert recorder.start_recording() is True
@@ -189,7 +189,7 @@ def test_press_while_actively_recording_is_still_refused(audio_recorder_module):
 
 def test_refresh_does_not_hold_lock_during_native_calls(audio_recorder_module):
     """stop_recording() (hotkey release) needs _lock; the device refresh
-    calls native PortAudio and can block for seconds (issue #60), so it
+    calls native PortAudio and can block for seconds (issue #72), so it
     must run without holding the lock."""
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
@@ -216,8 +216,7 @@ def test_refused_warm_press_does_not_reset_the_live_session(
     audio_recorder_module, coreaudio_stub
 ):
     """With keep-warm on, the press itself runs the live-default check -- so
-    a press that is about to be refused must not reach it (issue #72
-    review): refresh() stops the warm capture that is delivering chunks to
+    a press that is about to be refused must not reach it (issue #72): refresh() stops the warm capture that is delivering chunks to
     the recording in progress and terminates the session underneath it."""
     module = audio_recorder_module
     release = threading.Event()
@@ -249,7 +248,7 @@ def test_backoff_loop_makes_up_to_n_attempts_with_sleep_between(
     audio_recorder_module, monkeypatch
 ):
     """max_attempts consecutive OSErrors exhaust the loop: attempt 1
-    reuses the cached instance (issue #42), attempts 2..N each construct
+    reuses the cached instance (issue #72), attempts 2..N each construct
     a fresh PyAudio(), sleeping exactly max_attempts - 1 times between
     attempts."""
     module = audio_recorder_module
@@ -271,8 +270,8 @@ def test_backoff_loop_makes_up_to_n_attempts_with_sleep_between(
     # Fast-exhaustion pattern: all attempts fail in <1ms (sleep is mocked
     # to a no-op), so the worker may have already torn down and cleared
     # recording_thread before the capture below. Wait for completion on
-    # observable state instead of capturing the thread handle (lens
-    # review HIGH #1/#4: the read-before-start race failed in CI).
+    # observable state instead of capturing the thread handle: the
+    # read-before-start race failed in CI.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -306,7 +305,7 @@ def test_backoff_sleep_cadence_matches_schedule(audio_recorder_module, monkeypat
     )
     # Fast-exhaustion pattern: the worker may tear down before the thread
     # handle can be captured; wait for completion on observable state
-    # instead (lens review HIGH #1/#4).
+    # instead.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -368,7 +367,7 @@ def test_last_error_mentions_killall_coreaudiod_for_paInternalError(
     # Fast-exhaustion path: the worker can complete and clear
     # recording_thread before a plain read of the attribute; assert on
     # observable state instead of the transient thread handle (same
-    # race fixed in PR #38 round 2 for the sibling tests).
+    # sibling tests hit the same race and were fixed the same way).
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     assert recorder.last_error is not None
@@ -387,7 +386,7 @@ def test_last_error_generic_for_non_paInternalError(audio_recorder_module):
     # Fast-exhaustion path: the worker can complete and clear
     # recording_thread before a plain read of the attribute; assert on
     # observable state instead of the transient thread handle (same
-    # race fixed in PR #38 round 2 for the sibling tests).
+    # sibling tests hit the same race and were fixed the same way).
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
     assert recorder.last_error is not None

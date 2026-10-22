@@ -94,21 +94,18 @@ class PyAudioRegistry:
         # ``_warm`` at that same moment, so this is the only handle left that
         # can name those threads (see WarmKeep).
         self.warm = WarmKeep()
-        # Every worker this session started (issue #72 adversarial review,
-        # finding 1). The reset gate used to decide from the two thread names
-        # its caller happened to pass, and the recorder drops a wedged
-        # worker's name as soon as its successor clears recording_thread --
-        # so the gate could be told "nothing is alive" by a caller that had
-        # simply lost the name. The session keeps the list instead.
+        # Every worker this session started. The reset gate used to decide
+        # from the two thread names its caller happened to pass, and the
+        # recorder drops a wedged worker's name as soon as its successor
+        # clears recording_thread -- so the gate could be told "nothing is
+        # alive" by a caller that had simply lost the name.
         self.workers = WorkerKeep()
-        # Consecutive teardowns that an instance refused (issue #72 review,
-        # round 1), and the verdict they add up to. Counted by
-        # terminate_all() -- the one call that knows whether a refusal came
-        # from an instance that would not die (counts) or from the ledger
-        # gate excusing a thread that may still be native (does not: that is
-        # a deferral which releases itself, and blaming it on a dead
-        # microphone would send the user to quit the app over a read that was
-        # about to return).
+        # Consecutive teardowns an instance refused, and the verdict they add
+        # up to. terminate_all() is the one call that knows whether a refusal
+        # came from an instance that would not die (counts) or from the ledger
+        # gate excusing a thread that may still be native (does not: that is a
+        # deferral which releases itself, and blaming it on a dead microphone
+        # would send the user to quit the app over a read about to return).
         self.terminate_failures = 0
         self.needs_restart = False
         # Rebuilds this session has run against the same device in a row. A
@@ -145,23 +142,23 @@ class PyAudioRegistry:
                 self._instances.remove(pa)
 
     def note_worker(self, worker: threading.Thread) -> None:
-        """Record a worker the caller is about to start (issue #72 review).
+        """Record a worker the caller is about to start.
 
-        The recorder calls this before ``thread.start()``, so from the
-        instant a worker exists the session -- not the caller's memory --
-        knows it may enter a native call. That is what makes "no worker is in
-        PortAudio" a question the registry can answer for itself, including
-        for the orphan a successor already displaced from ``recording_thread``
-        (issue #60), whose name nobody holds any more.
+        The recorder calls this before ``thread.start()``, so from the instant
+        a worker exists the session -- not the caller's memory -- knows it may
+        enter a native call. That is what makes "no worker is in PortAudio" a
+        question the registry answers for itself, including for the orphan a
+        successor already displaced from ``recording_thread`` (issue #60),
+        whose name nobody holds any more.
         """
         self.workers.note(worker)
 
     def forget_worker(self, worker: threading.Thread) -> None:
         """Remove a worker that can never run (its ``start()`` raised).
 
-        A thread that never started counts as a blocker -- the arming
-        window is exactly what the ledger exists to cover (issue #72
-        review) -- so a launch that failed must be taken back out by hand
+        A thread that never started counts as a blocker -- the arming window
+        is exactly what the ledger exists to cover -- so a launch that failed
+        must be taken back out by hand
         or it would refuse every later terminate_all() for the life of the
         process. See ``audio_warm_arm.start_press``, the only caller.
         """
@@ -171,32 +168,36 @@ class PyAudioRegistry:
     def device_id(self) -> int | None:
         """The device the live session was opened against, or None.
 
-        Read-only, and derived from ``last_reset``: the device id and the
-        liveness the reset dedupes on are the same CoreAudio read, and two
-        fields would be two chances to disagree.
+        Read-only, derived from ``last_reset``: the id and the liveness the
+        reset dedupes on are one CoreAudio read, and two fields would be two
+        chances to disagree.
         """
         return None if self.last_reset is None else self.last_reset.device_id
 
     @property
     def input_device_index(self) -> int | None:
-        """The session's device index, while it describes the live instance
-        (issue #72 review, round 1; see ``DeviceIndexBinding``).
+        """The session's device index while it describes the live instance
+        (see ``DeviceIndexBinding``).
 
-        None means "unresolved", and it is the answer a caller wants when
-        the binding came from an instance that is gone: re-resolving is the
-        only correct response to an index into a device list nobody here
-        has, and trusting one was how the mic stayed dead until restart.
+        None means "unresolved" -- the answer a caller wants when the binding
+        came from an instance that is gone, because re-resolving is the only
+        correct response to an index into a device list nobody here has.
+        Trusting one was how the mic stayed dead until restart.
         """
         return self._indices.resolve(self.pyaudio)
+
+    def tracks(self, pa: pyaudio.PyAudio) -> bool:
+        """Whether this session still tracks ``pa`` as live."""
+        with self._instances_lock:
+            return pa in self._instances
 
     def snapshot(self) -> tuple[pyaudio.PyAudio | None, int | None]:
         """The live instance and its resolved index, read as ONE pair.
 
-        An index is only meaningful as a fact about the instance it came from
-        (see ``DeviceIndexBinding``), so a caller that wants both has to take
-        both from here: two separate property reads leave room for the live
-        instance to be replaced in between, which is exactly the mismatch the
-        binding exists to make impossible.
+        An index is only meaningful as a fact about the instance it came from,
+        so a caller that wants both takes both from here: two property reads
+        leave room for the live instance to be replaced in between, which is
+        the mismatch the binding exists to make impossible.
         """
         pa = self.pyaudio
         return pa, self._indices.resolve(pa)
@@ -215,20 +216,17 @@ class PyAudioRegistry:
         self._indices.publish(device_index, resolved_on)
 
     def bind_index(self, device_index: int, resolved_on: pyaudio.PyAudio) -> None:
-        """Publish the device index a retry attempt resolved (issue #72).
+        """Publish the device index a retry attempt resolved.
 
-        The loop resolves a device only while the session has no usable
-        index; with no way to hand the value back (the open-attempt tuple
-        carries the rate, not the index) it died with the attempt and every
-        later press paid a fresh enumeration.
-
-        It is published WITH the instance it was resolved against, which is
-        what keeps the hand-back from becoming the wedge: an index survived
-        its instance once, and every later attempt then opened on a dead
-        device forever (issue #72 review, round 1). A binding already
-        serving the live instance stands -- two attempts in one press can
-        both resolve, and the one against the instance being opened on is
-        the one to keep.
+        The loop resolves a device only while the session has no usable index;
+        with no way to hand the value back (the open-attempt tuple carries the
+        rate, not the index) it died with the attempt and every later press
+        paid a fresh enumeration. It goes with the instance it was resolved
+        against, which is what keeps the hand-back from becoming the wedge: an
+        index survived its instance once, and every later attempt then opened
+        on a dead device forever. A binding already serving the live instance
+        stands -- two attempts in one press can both resolve, and the one
+        against the instance being opened on is the one to keep.
         """
         if self.input_device_index is not None:
             return
@@ -242,10 +240,10 @@ class PyAudioRegistry:
         if not terminate_quietly(pa):
             return False
         self.forget(pa)
-        # An index resolved against an instance that has just been
-        # terminated describes a device list that no longer exists, so the
-        # pairing goes with it (issue #72 review, round 1): a leftover
-        # binding is what let every later press open on a dead index.
+        # An index resolved against an instance that has just been terminated
+        # describes a device list that no longer exists, so the pairing goes
+        # with it: a leftover binding is what let every later press open on a
+        # dead index.
         self._indices.unbind(pa)
         return True
 
@@ -262,24 +260,21 @@ class PyAudioRegistry:
         """Terminate every instance this session ever built. True = all gone.
 
         PortAudio's init count is reference-counted, so a single missed
-        instance -- an unregistered one, or one whose terminate() raised
-        -- keeps the engine up and the next construction reuses the
-        frozen device list. terminate_quietly() swallows per-instance
-        failures so one broken instance cannot strand the rest, but it
-        reports them: an instance that would not terminate STAYS
-        registered, because forgetting a live instance is how it becomes
-        permanently unreachable -- the next attempt gets another shot.
+        instance -- an unregistered one, or one whose terminate() raised --
+        keeps the engine up and the next construction reuses the frozen device
+        list. terminate_quietly() swallows per-instance failures so one broken
+        instance cannot strand the rest, but it reports them: an instance that
+        would not terminate STAYS registered, because forgetting a live
+        instance is how it becomes permanently unreachable.
 
-        Two different False answers live here, and only one of them is
-        counted. A refusal from the ledger gate -- a worker this session
-        started, or a keep-warm capture it installed or dropped, may still be
-        inside a native call -- is a deferral that releases itself, so callers
-        treat it as busy and nothing is claimed. A refusal from an instance
-        that would not terminate is a different matter: it is retried (an
-        untracked live instance is exactly what this class exists to reach)
-        but it is also counted, and past ``MAX_TERMINATE_FAILURES`` in a row
-        the session says so through ``needs_restart`` rather than leaving the
-        app reporting Ready over a dead microphone (issue #72 review, r1).
+        Two different False answers live here, and only one is counted. A
+        refusal from the ledger gate -- a worker this session started, or a
+        keep-warm capture it installed or dropped, may still be inside a native
+        call -- is a deferral that releases itself, so callers treat it as busy
+        and nothing is claimed. A refusal from an instance that would not
+        terminate is retried and counted, and past ``MAX_TERMINATE_FAILURES``
+        in a row the session says so through ``needs_restart`` rather than
+        leaving the app reporting Ready over a dead microphone.
         """
         if self._refuse_teardown():
             return False
@@ -308,13 +303,17 @@ class PyAudioRegistry:
                 f"Terminated {disposed} of {len(pending)} PyAudio instances; "
                 "the session may still name one of them."
             )
-        if self.pyaudio is not None and self.pyaudio not in self._instances:
+        live = self.pyaudio
+        if live is not None and not self.tracks(live):
             # The session names an instance this pass terminated. Left bound,
             # the retry loop opens on a corpse and cannot get a replacement
             # (registry_for() finds no session to rebuild), so the name goes
-            # with the instance and the next press rebuilds.
-            self.pyaudio = None
-            self._indices.clear()
+            # with the instance and the next press rebuilds. Unbind rather
+            # than clear: a press that rebuilt in the meantime owns the
+            # binding now.
+            self._indices.unbind(live)
+            if self.pyaudio is live:
+                self.pyaudio = None
         note_terminate_outcome(self, clean=not incomplete)
         return not incomplete
 
@@ -329,12 +328,11 @@ class PyAudioRegistry:
         return True
 
     def open(self, find_default_input_device: Callable[[pyaudio.PyAudio], int]) -> bool:
-        """Construct the persistent cached session (issue #42) and record
-        the CoreAudio device it was resolved against (issue #72) -- that
-        baseline is what a later live read is compared to. False leaves the
-        session unbound (every field None); the retry loop still builds a
-        session on demand, and the absent baseline makes the next live read
-        re-bind it."""
+        """Construct the persistent cached session (issue #42) and record the
+        CoreAudio device it was resolved against -- that baseline is what a
+        later live read is compared to. False leaves the session unbound; the
+        retry loop still builds a session on demand, and the absent baseline
+        makes the next live read re-bind it."""
         try:
             pa = self._pa_module.PyAudio()
         except Exception as construct_error:  # noqa: BLE001 - PyAudio()
@@ -344,16 +342,15 @@ class PyAudioRegistry:
                 "Warning: PyAudio construction failed at startup "
                 f"({construct_error}); will retry at first recording."
             )
-            # No instance, no baseline: a previous open's pair left
-            # standing would have the dedupe guard vouch for a session
-            # that does not exist.
+            # No instance, no baseline: a previous open's pair left standing
+            # would have the dedupe guard vouch for a session that is gone.
             self.last_reset = None
             return False
         self.register(pa)
         self.pyaudio = pa
         # ONE read writes the whole dedupe baseline, liveness and device id
-        # together: a reset whose read gave no evidence fills it from its
-        # own read instead (see audio_device_reset).
+        # together: a reset whose read gave no evidence fills it from its own
+        # read instead (see audio_device_reset).
         self.last_reset = read_live_default_input()
         # A fresh instance re-enumerates, so whatever was resolved before
         # describes another instance's device list.
@@ -386,13 +383,11 @@ class PyAudioRegistry:
         session. Returns False (stream closed, abort logged) if the retry
         sequence was superseded while it ran.
 
-        Under issue #72 every attempt opens on the single live instance,
-        so ``new_pa`` is normally the instance already in the registry;
-        a different one only shows up when the session was never bound --
-        the fresh instance then becomes the live one (its resolved device
-        index was bound by the attempt itself, via bind_index -- paired with
-        that instance, so the binding is readable only while it IS the live
-        one; issue #72 review round 1).
+        Every attempt opens on the single live instance, so ``new_pa`` is
+        normally the instance already in the registry; a different one only
+        shows up when the session was never bound -- the fresh instance then
+        becomes the live one, and the attempt already bound its index paired
+        with itself, so the binding reads only while it IS the live one.
         """
         orphan: pyaudio.PyAudio | None = None
         previous: pyaudio.PyAudio | None = None
@@ -400,25 +395,21 @@ class PyAudioRegistry:
         abandoned: pyaudio.Stream | None = None
         with lock:
             if is_superseded():
-                # The stream this worker opened and no longer owns. Its
-                # close is a native call, so it is only DEFERRED here and run
-                # after the release (issue #60 discipline, #72 review minor 2:
-                # it used to run inside the recorder lock, which stop_
-                # recording() needs).
+                # The stream this worker opened and no longer owns. Its close
+                # is a native call, so it is only DEFERRED here and run after
+                # the release -- never inside the recorder lock, which
+                # stop_recording() needs (issue #60).
                 abandoned = stream
-                # An instance this worker itself constructed (the session
-                # never had one): the worker owns its termination. It must
-                # actually take it -- attempt_open_once registers what it
-                # builds, so an abandoned instance is registered and only
-                # terminate_all() can ever see it; while the session stays
-                # unbound, registry_for(None) is None, refresh() cannot run,
-                # and every superseded press leaves another live instance
-                # holding PortAudio's init count above zero: the frozen
-                # device list this module exists to clear. The recorder's
-                # own live session is never touched here -- a later press
-                # still needs it, and the retry loop opens on that instance.
-                # Untracking happens under the lock; the terminate() runs
-                # outside it, as does the stream close above.
+                # An instance this worker itself constructed (the session never
+                # had one): the worker owns its termination, and must actually
+                # take it -- attempt_open_once registers what it builds, so an
+                # abandoned instance stays registered and only terminate_all()
+                # can see it; while the session stays unbound registry_for(None)
+                # is None, refresh() cannot run, and every superseded press
+                # leaves another live instance holding PortAudio's init count
+                # above zero. The recorder's own live session is never touched
+                # here. Untracking happens under the lock; terminate() and the
+                # stream close run outside it.
                 if new_pa is not self.pyaudio:
                     orphan = new_pa
                     self.forget(new_pa)
@@ -445,18 +436,17 @@ class PyAudioRegistry:
         if superseded:
             log_retry_attempt(attempt, max_attempts, attempt_start, None, "abort")
             return False
-        # Outside the lock: whoever captured the displaced instance owns
-        # its termination (cleanup() uses the same pattern, so a double
-        # terminate is impossible by construction).
+        # Outside the lock: whoever captured the displaced instance owns its
+        # termination (cleanup() uses the same pattern, so a double terminate
+        # is impossible by construction).
         #
-        # Invariant (lens review HIGH #3): nothing else opens a stream
-        # concurrently here -- only _recording_worker does, AFTER the open
-        # returns -- so stream_is_open() is a defensive guard, not a racy
-        # gate. And the displaced instance is only a DIFFERENT instance
-        # after a device reset: the retry loop reuses the single live
-        # instance on every attempt (issue #72), so terminating "the
-        # previous" unconditionally would terminate the one this stream is
-        # open on.
+        # Invariant: nothing else opens a stream concurrently here -- only
+        # _recording_worker does, AFTER the open returns -- so stream_is_open()
+        # is a defensive guard, not a racy gate. And the displaced instance is
+        # only a DIFFERENT instance after a device reset: the retry loop reuses
+        # the single live instance on every attempt, so terminating "the
+        # previous" unconditionally would terminate the one this stream is open
+        # on.
         if previous is not None and previous is not new_pa and not stream_is_open():
             self.terminate(previous)
         return True
@@ -487,7 +477,7 @@ class PyAudioRegistry:
         find_default_input_device: Callable[[pyaudio.PyAudio], int],
         rearm_warm: Callable[[bool], None],
     ) -> bool:
-        """The keep-warm press gate (issue #72); the rule itself is
+        """The keep-warm press gate; the rule itself is
         ``audio_device_reset.press_is_admissible``."""
         return press_is_admissible(
             self, recording, warm, worker, find_default_input_device, rearm_warm

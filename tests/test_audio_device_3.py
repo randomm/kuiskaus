@@ -1,7 +1,7 @@
-"""Device-index ownership and the rebuild dedupe (issue #72, review round 1).
+"""Device-index ownership and the rebuild dedupe (issue #72).
 
 Split from ``test_audio_device.py`` for the 500-line module cap. These are
-the regressions for the two findings of the first adversarial review:
+the regressions for the bugs it found:
 
 * an index is a fact about ONE PortAudio instance's frozen enumeration, so
   it must not outlive the instance it was resolved against;
@@ -14,22 +14,8 @@ from unittest.mock import MagicMock, patch
 import kuiskaus.audio_device as device_module
 from kuiskaus.audio_coreaudio import read_live_default_input
 from kuiskaus.audio_device import PyAudioRegistry
+from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
-
-
-def _registry(pa_module=None, pa=None):
-    """A registry over a stubbed pyaudio module yielding ``pa`` (or one
-    fresh mock) per construction."""
-    module = pa_module or MagicMock(name="pyaudio-module")
-    if pa is None:
-        pa = MagicMock(name="PyAudioInstance")
-    module.PyAudio = MagicMock(return_value=pa)
-    return PyAudioRegistry(module), pa, module
-
-
-def _find_device(_pa):
-    return 3
-
 
 # ---------------------------------------------------------------------------
 # The (instance, index) pair is read as one value
@@ -37,7 +23,7 @@ def _find_device(_pa):
 
 
 def test_snapshot_never_pairs_the_live_instance_with_another_one_s_index():
-    """MINOR (issue #72 review): the retry attempt used to read
+    """the retry attempt used to read
     ``registry.pyaudio`` and ``registry.input_device_index`` as two separate
     property accesses, so a reset landing between them handed the attempt a
     live instance and an index into some other instance's frozen device list -
@@ -78,7 +64,7 @@ def test_snapshot_pairs_the_index_with_the_instance_that_resolved_it():
 
 def test_bound_index_refuses_an_index_from_another_instance():
     """A PortAudio index is a fact about ONE instance's frozen enumeration
-    (issue #72 review, round 1): an index resolved elsewhere must never be
+    (issue #72): an index resolved elsewhere must never be
     served as the session's, because opening on it names a device the live
     instance never enumerated.
     """
@@ -93,7 +79,7 @@ def test_bound_index_refuses_an_index_from_another_instance():
 def test_a_disposed_binding_stops_naming_a_device():
     """The unbound session is where a stale index does its damage: with no
     instance to compare against, an index left behind by an attempt that
-    then failed was read back forever (issue #72 review, round 1).
+    then failed was read back forever (issue #72).
     """
     registry, pa, _ = _registry()
     registry.bind_index(3, pa)  # an attempt on an unbound session
@@ -109,7 +95,7 @@ def test_a_disposed_binding_stops_naming_a_device():
 def test_a_disposed_attempt_instance_forces_the_next_attempt_to_re_resolve(
     coreaudio_stub,
 ):
-    """The wedge from the issue #72 review, round 1, end to end.
+    """The wedge from the issue #72, end to end.
 
     Trace: the session is unbound, a press's attempt constructs an instance,
     resolves the default on it (old AirPods, index 3), binds that index, and
@@ -175,7 +161,7 @@ def test_a_disposed_attempt_instance_forces_the_next_attempt_to_re_resolve(
 def test_a_rebuild_records_its_pair_when_open_could_not_read_the_default(
     coreaudio_stub,
 ):
-    """ISSUE (issue #72 review, round 1): the dedupe baseline was set from
+    """the dedupe baseline was set from
     the refresh's own read, but ``device_id`` -- which the dedupe guard
     requires to be non-None -- came only from ``open()``'s second read. A
     CoreAudio read that failed inside ``open()`` (quite possible right

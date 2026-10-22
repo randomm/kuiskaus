@@ -50,7 +50,7 @@ class WarmCapture:
     @property
     def thread(self) -> threading.Thread | None:
         """The capture's reader thread, for the session's terminate gate
-        (issue #72 review): ``PyAudio.terminate()`` under a thread that may
+        (issue #72): ``PyAudio.terminate()`` under a thread that may
         be inside ``stream.read()`` is undefined behaviour, and the thread is
         the only evidence of that. ``WarmKeep`` holds the capture, so it asks
         the capture rather than trusting a caller to still know the name."""

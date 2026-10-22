@@ -10,7 +10,7 @@ way -- ``PyAudio.terminate()`` running underneath a live reader -- so the
 capture is dropped from the recorder's state and named here instead, where
 every later terminate can refuse to run until its thread has exited.
 
-This is the issue #72 review's CRITICAL: the invariant "never terminate
+This is the issue #72: the invariant "never terminate
 PortAudio while a warm thread may be inside a native read" is only checkable
 while somebody still holds the thread.
 """
@@ -58,8 +58,8 @@ class WarmKeep:
     Owned by the session (``PyAudioRegistry``), because the session is what
     must not be terminated while any of them may still be reading.
 
-    Threading (issue #72 review, round 1): this list IS the check the
-    CRITICAL invariant rests on, and it has more than one writer. A press's
+    Threading (issue #72): this list IS the check the invariant rests on,
+    and it has more than one writer. A press's
     ``drop()`` runs on the hotkey dispatcher's worker thread while
     ``set_keep_warm``/``cleanup()`` run on the rumps main thread, and
     ``CallbackDispatcher.stop(timeout=5.0)`` explicitly tolerates an in-flight
@@ -76,10 +76,10 @@ class WarmKeep:
         # dropped on a stuck read can be brought back.
         self.enabled = False
         self._blockers: list[WarmCapture] = []
-        # The capture the recorder has INSTALLED right now (issue #72
-        # adversarial review, finding 2). ``_blockers`` only ever held
-        # captures somebody had already handed over to drop(), so a capture
-        # armed and never dropped was invisible to terminate_all(): the
+        # The capture the recorder has INSTALLED right now. ``_blockers``
+        # only ever held captures somebody had already handed over to drop(),
+        # so a capture armed and never dropped was invisible to
+        # terminate_all(): the
         # worker-side reset passed no capture at all, resting on "with
         # keep-warm on there is no worker" -- a race, not an invariant, since
         # WarmArm.set_enabled() arms from the menu thread. The name lives
@@ -110,8 +110,7 @@ class WarmKeep:
         ``exempt`` is the capture a caller is on its way to stop, which the
         warm press hands over before this is asked.
 
-        No thread yet means ARMING, not idle (issue #72 review, round 2,
-        finding 2): ``WarmArm`` names the capture here precisely so a
+        No thread yet means ARMING, not idle (issue #72): ``WarmArm`` names the capture here precisely so a
         terminate racing the arm sees it, and it does so BEFORE
         ``capture.start()`` assigns the thread. Requiring a non-None thread
         made this predicate blind to the one window ``note_installed`` exists
@@ -142,15 +141,14 @@ class WarmKeep:
         press or cleanup() drive PortAudio's init count to zero underneath it.
 
         The name goes on the list BEFORE ``stop()`` and comes off only when
-        ``stop()`` reports success (issue #72 review, round 1). Registering
+        ``stop()`` reports success (issue #72). Registering
         after the join instead left that whole window -- precisely the
         interval in which the thread is proven wedged in ``stream.read()``
         -- with the capture invisible, so a ``clear()`` racing in from the
         menu thread reported a safe-to-terminate session while the reader was
         still parked on it.
 
-        Dropping the same capture twice is idempotent about the JOIN (issue
-        #72 review, round 2): a capture already on the blockers list has been
+        Dropping the same capture twice is idempotent about the JOIN (issue #72): a capture already on the blockers list has been
         joined once and is proven parked, so the second caller gets the
         non-blocking probe. Without that, ``refresh()`` dropping a wedged
         capture and then handing the same object to ``rearm_warm(False)`` --
@@ -197,8 +195,7 @@ class WarmKeep:
         probe), so the commit removes the provably-dead entries from the
         CURRENT list rather than reassigning a snapshot -- a reassignment
         would permanently erase a capture that another thread's ``drop()``
-        registered while these probes were running (issue #72 review,
-        round 1).
+        registered while these probes were running (issue #72).
         """
         with self._lock:
             pending = list(self._blockers)
@@ -224,8 +221,7 @@ class WarmKeep:
                 self._recover_pending = False
 
     def wanted(self) -> bool:
-        """The user's keep-warm request AS IT STANDS NOW (issue #72 review,
-        round 2, finding 1).
+        """The user's keep-warm request AS IT STANDS NOW (issue #72).
 
         Read under the lock, not as a bare attribute read, because the
         question is asked by a thread that has been busy for as long as a
@@ -248,7 +244,7 @@ class WarmKeep:
             self._recover_pending = False
 
     def need_recovery(self) -> None:
-        """Ask for keep-warm to be brought back later (issue #72 review).
+        """Ask for keep-warm to be brought back later (issue #72).
 
         ``drop()`` sets the recovery flag only when ``stop()`` FAILS, so a
         reset that stopped its capture cleanly and then bailed (the
@@ -262,7 +258,7 @@ class WarmKeep:
             self._recover_pending = True
 
     def recover(self, rearm_warm: Callable[[bool], None]) -> None:
-        """Bring keep-warm back after a stuck-read drop (issue #72 review).
+        """Bring keep-warm back after a stuck-read drop (issue #72).
 
         ``rearm_warm(True)`` is otherwise reachable only from a warm press
         that stopped its capture, so one stuck read left pre-roll off for the

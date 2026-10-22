@@ -1,4 +1,4 @@
-"""test_audio_recorder tests, part 5 of 6 (issue #70)."""
+"""test_audio_recorder tests, part 5 of 6 (issue #72)."""
 
 import threading
 from unittest.mock import MagicMock
@@ -134,7 +134,7 @@ def test_on_capture_started_skipped_when_generation_superseded(
     # teardown is generation-gated, so it never clears recording for
     # this generation; the only deterministic observable is the stream
     # closure below. Wait on that instead of the transient thread handle
-    # (lens review HIGH #1/#4 read-before-start race).
+    # .
     assert _wait_until(lambda: stream.close.called, timeout=5.0)
 
     assert callback.call_count == 0
@@ -166,8 +166,7 @@ def test_on_capture_started_skipped_when_recording_false(audio_recorder_module):
     # The worker's read loop breaks on the next iteration (recording is
     # False); the callback is suppressed this time and the loop exits.
     # The worker can clear recording_thread before a capture, so assert
-    # on observable state instead (lens review HIGH #1/#4 read-before-
-    # start race).
+    # on observable state instead.
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
     thread = recorder.recording_thread
     if thread is not None:
@@ -272,7 +271,7 @@ def test_on_capture_started_fires_after_retry_adoption(audio_recorder_module):
 
 
 # ---------------------------------------------------------------------------
-# Native sample rate (issue #55)
+# Native sample rate (issue #72)
 # ---------------------------------------------------------------------------
 def test_open_stream_uses_native_rate_48000(audio_recorder_module):
     """Issue #55: a device reporting defaultSampleRate=48000.0 must have
@@ -357,7 +356,7 @@ def test_open_stream_falls_back_to_16000_when_rate_query_raises(
     rate of 16000 and the fallback is printed -- never a silent skip.
 
     The mock's open-time rate query (get_device_info_by_index -- the
-    exact device being opened, issue #55 lens review MEDIUM security)
+    exact device being opened, issue #55)
     raises OSError -- a per-attempt OSError is what the edge-case spec
     describes for a coreaudiod storm mid-recording."""
     module = audio_recorder_module

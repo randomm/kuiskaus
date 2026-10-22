@@ -10,21 +10,8 @@ from unittest.mock import MagicMock
 
 from kuiskaus.audio_device import PyAudioRegistry
 from kuiskaus.audio_retry import check_superseded, registry_for
+from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
-
-
-def _registry(pa_module=None, pa=None):
-    """A registry over a stubbed pyaudio module yielding ``pa`` (or one
-    fresh mock) per construction."""
-    module = pa_module or MagicMock(name="pyaudio-module")
-    if pa is None:
-        pa = MagicMock(name="PyAudioInstance")
-    module.PyAudio = MagicMock(return_value=pa)
-    return PyAudioRegistry(module), pa, module
-
-
-def _find_device(_pa):
-    return 3
 
 
 def test_open_survives_a_hostile_bridge(coreaudio_stub):
@@ -153,7 +140,7 @@ def test_moved_default_rebuilds_exactly_one_instance(coreaudio_stub):
 
 def test_reset_resolves_the_device_index_on_the_fresh_instance(coreaudio_stub):
     """Issue #72 AC: index resolved on the fresh instance ONLY. The
-    pre-#72 refresh resolved against the stale cached instance (whose
+    pre-#72efresh resolved against the stale cached instance (whose
     PortAudio snapshot was the bug) -- so the resolver must be handed the
     newly constructed PyAudio, never the displaced one."""
     registry, stale, module = _registry()
@@ -235,7 +222,7 @@ def test_reset_reports_busy_rather_than_terminating_under_a_live_worker(
     """terminate_all() under a thread that may be inside pa.open() or
     stream.read() is the state cleanup() refuses to touch (issue #37
     task-c), and the pre-#72 poll never reached it because the reset never
-    ran. Busy, and the session stays whole and dirty (issue #72 review)."""
+    ran. Busy, and the session stays whole and dirty (issue #72)."""
     registry, pa, module = _registry()
     registry.open(_find_device)
     _live_default_input(coreaudio_stub, 77)
@@ -277,7 +264,7 @@ def _adopt(registry, new_pa, stream, superseded, stream_open, capture_rate=16000
 
 
 def test_superseded_adopt_closes_the_abandoned_stream_outside_the_lock():
-    """MINOR (issue #72 review): closing a stream is a native call and this
+    """closing a stream is a native call and this
     lock is the one stop_recording() needs on the hotkey release. The close is
     deferred past the release (the #60 discipline the rest of the file follows
     for terminate()); running it inside would let a wedged Pa_CloseStream hold
@@ -325,7 +312,7 @@ def test_adopt_publishes_instance_and_rate():
     assert registry.pyaudio is live
     assert published["rate"] == 16000
     # The retry reused the live instance, so nothing may be terminated --
-    # the stream is open on it (issue #72's invariant).
+    # the stream is open on it (issue #72 invariant).
     live.terminate.assert_not_called()
     stream.close.assert_not_called()
 
@@ -368,7 +355,7 @@ def test_superseded_adopt_disposes_an_untracked_fresh_instance():
 
 
 def test_superseded_adopt_disposes_the_registered_instance_the_worker_built():
-    """The flow that actually happens (issue #72 review): attempt_open_once
+    """The flow that actually happens (issue #72): attempt_open_once
     registers the instance it constructs, so an abandoned instance is IN the
     registry while the session stays unbound -- registry_for(None) is None
     for the next press and refresh() can never reach it. Left alone it
@@ -390,7 +377,7 @@ def test_superseded_adopt_keeps_an_orphan_it_could_not_terminate():
     """Same rule as terminate_all(), applied to the orphan adopt() abandons:
     an instance whose terminate() raised is still live and still holds
     PortAudio's init count, so it stays on the list for the next attempt
-    instead of becoming unreachable (issue #72 review)."""
+    instead of becoming unreachable (issue #72)."""
     registry, worker_pa, _ = _registry()
     registry.register(worker_pa)
     worker_pa.terminate.side_effect = OSError("Pa_Terminate failed")

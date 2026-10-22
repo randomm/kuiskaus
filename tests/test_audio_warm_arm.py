@@ -1,4 +1,4 @@
-"""The #72 adversarial findings, as failing-then-passing pairs.
+"""The #72s, as failing-then-passing pairs.
 
 Round 1:
 
@@ -30,7 +30,7 @@ Round 2:
    is allowed to make one.
 
 4. A capture whose thread could not be created stayed installed, and (with
-   the round-2 gate fix, which treats an installed capture with no thread as
+   the gate fix, which treats an installed capture with no thread as
    arming) would then refuse every later ``terminate_all()`` for the life of
    the process.
 """
@@ -99,7 +99,7 @@ def test_concurrent_arming_from_two_threads_starts_exactly_one_capture(
             errors.append(exc)
 
     # Thread A (the menu) enters the arm first and is held in the
-    # constructor; Thread B (a #72 re-arm caller) then runs its whole
+    # constructor; Thread B (a #72e-arm caller) then runs its whole
     # _rearm_warm against the still-unassigned slot.
     t_menu = threading.Thread(
         target=_run, args=(lambda: recorder.set_keep_warm(True),), daemon=True
@@ -145,7 +145,7 @@ def _arm_fixture():
 
 
 def test_rearm_never_states_a_keep_warm_request_the_user_never_made():
-    """Round 2 finding 1 (unit): the re-arm hand-back must satisfy the
+    """the re-arm hand-back must satisfy the
     request, not make one. Only ``set_enabled`` -- the menu's path -- writes
     ``WarmKeep.enabled``."""
     keep, arm, built, make = _arm_fixture()
@@ -168,7 +168,7 @@ def test_rearm_never_states_a_keep_warm_request_the_user_never_made():
 
 
 def test_rearm_on_an_installed_capture_spends_the_pending_recovery():
-    """Round 2 finding 1, the counterpart of ``want(True)``'s flag clearing:
+    """of ``want(True)``'s flag clearing:
     ``rearm`` no longer routes through ``want``, so it must consume the
     recovery itself or the next worker press re-arms a SECOND capture over a
     working one."""
@@ -185,7 +185,7 @@ def test_rearm_on_an_installed_capture_spends_the_pending_recovery():
 
 
 def test_a_capture_whose_thread_could_not_start_is_not_left_installed():
-    """Round 2 finding 2's companion: the gate now treats an installed
+    """'s companion: the gate now treats an installed
     capture with no thread as arming, so a ``start()`` that failed (thread
     creation does fail under a thread-limit storm) must undo the install --
     otherwise a capture that can never read would refuse every later
@@ -205,7 +205,7 @@ def test_a_capture_whose_thread_could_not_start_is_not_left_installed():
 
 
 def test_a_capture_whose_start_raised_leaves_keep_warm_reachable_again():
-    """Issue #72 review, minor: undoing the install without asking for
+    """Issue #72: undoing the install without asking for
     recovery left keep-warm OFF for the life of the process behind a
     checked menu item. The user's request is still live, the slot is now
     empty, and nothing else ever re-arms from this state (the reset's
@@ -239,7 +239,7 @@ def _keep_warm_stays_off(recorder) -> bool:
 def test_a_reset_does_not_resurrect_keep_warm_the_user_unchecked_during_it(
     audio_recorder_module, coreaudio_stub
 ):
-    """Round 2 finding 1, end to end through the public API.
+    """, end to end through the public API.
 
     The uncheck is fired from inside the reset's own ``PyAudio()``
     construction -- a moment genuinely inside the window a menu click can

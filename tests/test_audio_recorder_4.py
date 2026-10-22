@@ -1,4 +1,4 @@
-"""test_audio_recorder tests, part 4 of 6 (issue #70)."""
+"""test_audio_recorder tests, part 4 of 6 (issue #72)."""
 
 import re
 import threading
@@ -194,8 +194,7 @@ def test_backoff_loop_aborts_on_generation_supersede(
     # the sleep, so the worker may tear down before the thread handle is
     # captured. Wait for completion via the abort's observable outcome:
     # the abort path writes no state, so last_error stays None and the
-    # retry attempt (attempt 2) is never constructed (lens review
-    # HIGH #1/#4).
+    # retry attempt (attempt 2) is never constructed.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -237,8 +236,7 @@ def test_backoff_loop_aborts_on_release_mid_backoff(audio_recorder_module, monke
 
     # Fast-abort pattern: the release fires synchronously inside the
     # mocked sleep, so the worker may tear down before the thread handle
-    # is captured; wait for completion on observable state instead (lens
-    # review HIGH #1/#4).
+    # is captured; wait for completion on observable state instead.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -316,8 +314,7 @@ def test_init_survives_probe_oserror_during_coreaudiod_storm(
     enumeration path at app launch) must not propagate out of
     __init__: construction succeeds (the cached instance is kept) with
     input_device_index left None, and the worker's poll + retry loop
-    re-resolve at the first start_recording() call (lens review
-    MEDIUM #4)."""
+    re-resolve at the first start_recording() call."""
     module = audio_recorder_module
     probe = _make_pyaudio_instance(-1)
     probe.get_default_input_device_info.side_effect = OSError("no default")

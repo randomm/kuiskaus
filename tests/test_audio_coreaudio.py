@@ -23,7 +23,7 @@ from tests.support_audio_recorder import _live_default_input
 # 'dIn ' / 'livn' as the stubbed bridge reports them. These are the SAME
 # integers the module mirrors, so they pin nothing on their own: a typo that
 # kept the comment and retyped the number left the whole suite green (issue
-# #72 review, round 2). test_constants_are_the_framework_s_own_values is the
+# #72). test_constants_are_the_framework_s_own_values is the
 # guard; these two stay because they are readable in the stub's plumbing.
 DEFAULT_INPUT_SELECTOR = 1682533920
 ALIVE_SELECTOR = 1818850926
@@ -50,7 +50,7 @@ def real_coreaudio():
 
 
 def test_constants_are_the_framework_s_own_values(real_coreaudio):
-    """MINOR (issue #72 review, round 2): every constant in this module is a
+    """every constant in this module is a
     bare integer whose name is its only documentation, and the tests mirror
     the same integers -- so a retyped number survived the suite and broke
     live detection on real hardware. This is the one place the digits are
@@ -131,7 +131,7 @@ def test_a_raising_bridge_read_is_no_evidence(coreaudio_stub, capsys):
     'no evidence' -- never an exception: this read runs on the
     AudioRecorder.__init__ path (menubar/app construct it unguarded) and
     on the press path, so an escape there is an app that will not launch
-    or a hotkey handler that dies mid-press (#72 review)."""
+    or a hotkey handler that dies mid-press (#72)."""
     coreaudio_stub.AudioObjectGetPropertyData.side_effect = OSError("coreaudiod storm")
     assert read_live_default_input() is None
     assert "CoreAudio property read failed" in capsys.readouterr().out
