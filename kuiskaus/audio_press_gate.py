@@ -55,13 +55,17 @@ def press_is_admissible(
     to run at all (its worker resets at the top of its own loop). Both are
     admitted (True). An admitted keep-warm press runs the reset itself;
     False = fail this press, and ``press_refusal_reason`` is what the user is
-    told about it.
+    told about it. A ``locked`` busy is the one busy that admits: it means
+    the very reset this press asks for is already running on another thread
+    (issue #72 -- press, worker and warm capture all enter), and a press must
+    not fail because its own work is being done.
     """
     if recording or warm is None:
         return True
-    return not reset_session(
+    result = reset_session(
         registry, find_default_input_device, warm, rearm_warm, lambda: (worker,)
-    ).busy
+    )
+    return result.locked or not result.busy
 
 
 def press_refusal_reason(registry: PyAudioRegistry) -> str:

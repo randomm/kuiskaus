@@ -389,3 +389,47 @@ def test_attempt_open_once_native_rate_with_existing_pa():
     )
     cached_pa.get_device_info_by_index.assert_called_once_with(42)
     cached_pa.get_default_input_device_info.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Quiet teardown helpers (issue #72)
+# ---------------------------------------------------------------------------
+
+
+def test_close_stream_quietly_swallows_whatever_the_wrapper_raises(capsys):
+    """stop_stream()/close() are native PortAudio calls behind PyAudio's
+    wrapper, and terminate_quietly already teaches why ``except OSError``
+    is the wrong net: the wrapper "raises whatever it produces", and an
+    escape here aborts the caller's cleanup path over a stream nobody will
+    use again. Logged, bounded, never propagated."""
+    from kuiskaus.audio_retry import close_stream_quietly
+
+    stream = MagicMock(name="stream")
+    stream.stop_stream.return_value = None
+    stream.close.side_effect = RuntimeError("Pa_CloseStream in a bad state")
+
+    close_stream_quietly(stream)  # must not raise
+
+    assert stream.close.call_count == 1  # it was attempted...
+    assert "Error closing stream" in capsys.readouterr().out  # ... and logged
+
+
+def test_quiet_teardown_helpers_bound_the_foreign_text(capsys):
+    """Both helpers print on the cleanup path, and the foreign exception
+    text is bounded like every other piece of native text that reaches a
+    log line (audio_retry's own [:120] discipline) -- a native PortAudio
+    description can be arbitrarily long."""
+    from kuiskaus.audio_retry import close_stream_quietly, terminate_quietly
+
+    stream = MagicMock(name="stream")
+    stream.close.side_effect = OSError("x" * 5000)
+    close_stream_quietly(stream)
+
+    pa = MagicMock(name="pa")
+    pa.terminate.side_effect = RuntimeError("y" * 5000)
+    assert terminate_quietly(pa) is False  # the verdict, not the raise
+
+    printed = capsys.readouterr().out
+    assert "Error closing stream" in printed
+    assert "Error terminating PyAudio instance" in printed
+    assert len(printed) < 400, f"unbounded native teardown text: {len(printed)} chars"

@@ -105,11 +105,10 @@ def test_live_read_reports_dead_device(coreaudio_stub):
 def test_failed_liveness_read_doubts_the_device(coreaudio_stub):
     """A device whose liveness cannot be proven is treated as NOT alive:
     the safe response to an unproven device is a rebuild, not a stream."""
-    from kuiskaus import audio_coreaudio
 
     def _read(object_id, address, _qs, _q, _s, _out):
         if address.mSelector == DEFAULT_INPUT_SELECTOR:
-            return 0, 4, (96).to_bytes(4, audio_coreaudio.sys.byteorder)
+            return 0, 4, (96).to_bytes(4, sys.byteorder)
         return 1852797029, 0, None  # '!sta' -- read failed
 
     coreaudio_stub.AudioObjectGetPropertyData.side_effect = _read
@@ -124,6 +123,30 @@ def test_non_bytes_property_data_is_no_evidence(coreaudio_stub):
     assert audio_coreaudio._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) is None
 
 
+def test_a_wrong_shape_payload_logs_a_bounded_diagnostic(coreaudio_stub, capsys):
+    """A wrong-type or wrong-length payload is the third
+    "CoreAudio answered something unparseable" failure -- and it was the
+    only silent one: a refused read logs, a raising bridge logs, this just
+    returned None, so a bridge that consistently handed back garbage left
+    no trace of WHY every reset was skipped. One line per read, under the
+    same log budget as the refused-read line (this runs on the press path).
+    """
+    from kuiskaus import audio_coreaudio
+
+    wrong_type = (0, 4, 42)  # a successful status carrying an int
+    wrong_length = (0, 4, b"\x60\x00")  # two bytes, not a UInt32
+    for payload in (wrong_type, wrong_length) * (audio_coreaudio._OSSTATUS_LOG_BUDGET):
+        coreaudio_stub.AudioObjectGetPropertyData.return_value = payload
+        assert audio_coreaudio._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) is None
+
+    printed = capsys.readouterr().out
+    assert "CoreAudio returned" in printed
+    assert (
+        printed.count("CoreAudio returned") <= audio_coreaudio._OSSTATUS_LOG_BUDGET
+    ), "the payload-shape diagnostic prints unbounded on the press path"
+    assert len(printed) < 1000, f"unbounded payload diagnostic: {len(printed)} chars"
+
+
 def test_a_memoryview_is_measured_in_bytes_not_elements(coreaudio_stub):
     """``len`` of a memoryview counts ELEMENTS, so a 2-element view of 2-byte
     items is 4 long and 2 bytes short of a UInt32. Reading it as a device id
@@ -136,7 +159,7 @@ def test_a_memoryview_is_measured_in_bytes_not_elements(coreaudio_stub):
     coreaudio_stub.AudioObjectGetPropertyData.return_value = (0, 4, short)
     assert audio_coreaudio._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) is None
 
-    whole = memoryview(bytearray((96).to_bytes(4, audio_coreaudio.sys.byteorder)))
+    whole = memoryview(bytearray((96).to_bytes(4, sys.byteorder)))
     coreaudio_stub.AudioObjectGetPropertyData.return_value = (0, 4, whole)
     assert audio_coreaudio._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) == 96
 

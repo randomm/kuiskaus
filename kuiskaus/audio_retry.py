@@ -239,8 +239,10 @@ def terminate_quietly(pa: "pyaudio.PyAudio") -> bool:
         # Not just OSError: Pa_Terminate runs its own cleanup and PyAudio
         # raises whatever its wrapper produces, and an escaping exception here
         # would abort terminate_all() before it reached the remaining
-        # instances -- a live instance nobody can reach any more.
-        print(f"Error terminating PyAudio instance: {e}")
+        # instances -- a live instance nobody can reach any more. Bounded
+        # like the rest of the foreign text: a native description can be
+        # arbitrarily long and this prints on cleanup paths.
+        print(f"Error terminating PyAudio instance: {str(e)[:120]}")
         return False
     return True
 
@@ -302,12 +304,19 @@ def check_superseded(
 
 
 def close_stream_quietly(stream: "pyaudio.Stream") -> None:
-    """Best-effort stream teardown; close failures must not propagate."""
+    """Best-effort stream teardown; close failures must not propagate.
+
+    The same net as ``terminate_quietly``: stop_stream()/close() are native
+    PortAudio calls behind PyAudio's wrapper, which raises whatever it
+    produces -- an OSError-only net let a wrapper RuntimeError escape into
+    the caller's cleanup path (a dropped or abandoned stream), where it
+    aborts the rest of that path over a stream nobody will use again.
+    """
     try:
         stream.stop_stream()
         stream.close()
-    except OSError as e:
-        print(f"Error closing stream: {e}")
+    except Exception as e:  # noqa: BLE001 - native teardown boundary, logged
+        print(f"Error closing stream: {str(e)[:120]}")
 
 
 # Upper bound on how long a new worker waits for an orphaned predecessor stuck

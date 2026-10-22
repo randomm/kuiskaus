@@ -11,6 +11,8 @@ drive PortAudio's init count to zero has to ask it first.
 import threading
 from unittest.mock import MagicMock, call
 
+import pytest
+
 from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
 
@@ -62,6 +64,32 @@ def test_press_without_a_warm_capture_never_runs_a_press_side_reset(
     pa.terminate.assert_not_called()
     assert module.PyAudio.call_count == 1
     rearm.assert_not_called()
+
+
+def test_a_press_admits_while_another_thread_is_running_the_reset():
+    """The gate's one busy that must NOT refuse the press (issue #72): a
+    ``locked`` deferral means the reset this press asks for is already
+    running on another thread (the worker at the top of its session, the
+    warm capture opening its stream). Refusing the press over it failed the
+    press made right after ``set_keep_warm(True)`` -- the capture thread's
+    own pre-open reset was still in flight -- which is this suite's "the
+    press is admitted, never refused" property. The LEDGER deferral still
+    refuses (see test_busy_warm_reset_drops_the_capture_it_could_not_stop);
+    only "someone else is doing this reset right now" admits.
+    """
+    registry, _pa, _module = _registry()
+    registry.open(_find_device)
+    rearm = MagicMock(name="rearm-warm")
+    warm = MagicMock(name="warm")
+    assert registry._reset_lock.acquire(blocking=False)  # the other entrant
+    try:
+        assert registry.press_check_if_admissible(
+            False, warm, None, _find_device, rearm
+        )
+    finally:
+        registry._reset_lock.release()
+    rearm.assert_not_called()  # admitted without touching the capture
+    warm.stop.assert_not_called()
 
 
 def test_busy_warm_reset_drops_the_capture_it_could_not_stop(coreaudio_stub):
@@ -325,6 +353,47 @@ def test_recovery_flag_from_a_bailed_reset_brings_keep_warm_back(
     # A second recover() with nothing pending must not re-arm again.
     registry.warm.recover(rearm)
     assert rearm.call_count == 2
+
+
+def test_warm_keep_a_rearm_that_raises_refiles_the_recovery_ask():
+    """WarmKeep unit (issue #72): a failed re-arm must not spend the ask.
+
+    ``recover()`` clears ``_recover_pending`` before calling ``rearm_warm``,
+    and the capture is built (``make_capture``) OUTSIDE
+    ``WarmArm._arm_locked``'s try -- that one only covers ``start()`` and
+    re-files recovery there. A raise from anywhere else on the re-arm path
+    therefore propagated with the ask already cleared: keep-warm stayed off
+    behind a checked menu for the life of the process, with nothing left to
+    re-file it. The ask must come back with the raise, so a later press
+    retries.
+    """
+    from kuiskaus.audio_warm_keep import WarmKeep
+
+    keep = WarmKeep()
+    keep.want(True)
+    keep.need_recovery()
+    arms = []
+
+    def _raising_rearm(_usable: bool) -> None:
+        arms.append(True)
+        raise OSError("capture construction failed under a device storm")
+
+    with pytest.raises(OSError):
+        keep.recover(_raising_rearm)
+    assert len(arms) == 1
+
+    # The ask survived the raise: a later recover() tries again...
+    with pytest.raises(OSError):
+        keep.recover(_raising_rearm)
+    assert len(arms) == 2
+
+    # ... and a re-arm that succeeds spends it exactly once (no second
+    # capture armed over a working one).
+    ok = MagicMock()
+    keep.recover(ok)
+    ok.assert_called_once_with(True)
+    keep.recover(ok)
+    ok.assert_called_once_with(True)
 
 
 # ---------------------------------------------------------------------------

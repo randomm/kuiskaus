@@ -145,11 +145,23 @@ def _read_uint32(object_id: int, selector: int, scope: int, element: int) -> int
         # Not a UInt32 at all: the bridge handed back something the property
         # contract does not describe, which is no evidence rather than a
         # number to guess at.
-        return None
-    payload = bytes(raw)
-    if len(payload) != _SIZE_BYTES:
-        return None
-    return int.from_bytes(payload, sys.byteorder)
+        bad_shape = f"a {type(raw).__name__} payload"
+    elif len(payload := bytes(raw)) != _SIZE_BYTES:
+        bad_shape = f"a {len(payload)}-byte payload"
+    else:
+        return int.from_bytes(payload, sys.byteorder)
+    # The third "CoreAudio answered something unparseable" failure, and the
+    # only silent one until now: a refused read logs, a raising bridge logs,
+    # this just returned None -- so a bridge consistently handing back
+    # garbage left no trace of why every reset was skipped. Same bounded
+    # budget as the refused-read line: this runs on the press path.
+    if _osstatus_logged < _OSSTATUS_LOG_BUDGET:
+        _osstatus_logged += 1
+        print(
+            f"CoreAudio returned {bad_shape} for selector {selector}; "
+            "treating as no evidence."
+        )
+    return None
 
 
 def read_live_default_input() -> LiveDefaultInput | None:

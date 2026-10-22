@@ -48,8 +48,8 @@ RECENT_DEVICE_WINDOW = 8
 # this bounds how often an unseen one buys the full futile teardown. Without
 # it a default reported as a DIFFERENT id on every press, rotating through
 # more ids than the window holds, evicts its own history: every press reads
-# as "new evidence", the exemption never closes, and the measured cost was
-# 35 full terminate-all + ``Pa_Initialize`` cycles over 40 presses. A
+# as "new evidence", the exemption never closes, and every such press pays
+# the full futile teardown. A
 # hand-moved default does not pay for this: the press after it finds the
 # session agreeing with the live device and ``settle()`` restores the
 # allowance, and once the allowance is spent the hand-switch still lands

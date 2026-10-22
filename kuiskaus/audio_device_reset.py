@@ -25,7 +25,6 @@ from kuiskaus.audio_coreaudio import (
     session_needs_reset,
 )
 from kuiskaus.audio_rebuild_budget import MAX_RESET_REBUILDS
-from kuiskaus.audio_retry import MICROPHONE_BUSY
 from kuiskaus.audio_worker_keep import terminate_blocker, worker_may_be_native
 
 if TYPE_CHECKING:
@@ -169,12 +168,15 @@ def _press_is_new_evidence(registry: PyAudioRegistry, live: LiveDefaultInput) ->
     The teardown's own verdict is not about a device at all -- PortAudio
     refusing an instance says the ENGINE will not come down -- so a
     different device is no new evidence there and the window still holds.
+
+    A pure read: the exemption itself is claimed by ``reset_session``, on
+    the path that actually proceeds to the rebuild -- a press the ledger
+    gate then defers must not pay for a teardown it never ran.
     """
     return (
         not registry.terminate_failures
         and registry.rebuild.device is not None
         and registry.rebuild.is_new_device(live.device_id)
-        and registry.rebuild.claim_exemption()
     )
 
 
@@ -182,23 +184,26 @@ class SessionRefresh(NamedTuple):
     """What the caller writes back under its lock: the session to use and
     the device index resolved against it. ``busy`` means something may still
     be inside a native call, so PortAudio was NOT terminated and the session
-    stays dirty for the next press to retry."""
+    stays dirty for the next press to retry. ``locked`` marks the busy that
+    is only "another thread's reset is running right now" -- admissible to
+    the press gate, unlike the ledger deferral."""
 
     pyaudio: _PyAudio | None
     input_device_index: int | None
     busy: bool
+    locked: bool = False
 
 
-def _unchanged(registry: PyAudioRegistry, *, busy: bool = False) -> SessionRefresh:
+def _unchanged(
+    registry: PyAudioRegistry, *, busy: bool = False, locked: bool = False
+) -> SessionRefresh:
     """A refresh result that leaves the session where it is.
 
     The pair is read from ``snapshot()`` as one value: an index is only a
     fact about the instance that enumerated it.
     """
     pyaudio_instance, device_index = registry.snapshot()
-    return SessionRefresh(
-        pyaudio=pyaudio_instance, input_device_index=device_index, busy=busy
-    )
+    return SessionRefresh(pyaudio_instance, device_index, busy, locked)
 
 
 def _hand_back_capture(
@@ -267,44 +272,60 @@ def reset_session(
     half-reset, and the dropped capture stays named in the registry's
     ledger, which holds every later terminate back until its thread has
     left the native read.
+
+    Serialised (issue #72): the press (via the keep-warm gate), the worker
+    and the warm capture all enter, and two can arrive at once. The
+    registry's ``_reset_lock`` makes one of them the reset; the others get
+    the deferral answer immediately (``locked``) -- never a wait, which
+    would park the hotkey callback behind another thread's teardown (#60).
     """
-    live = read_live_default_input()
-    if live is None:
-        # CoreAudio saying "no evidence": never treated as a change, and
-        # never as an absence either. Nothing was proved about the session,
-        # so nothing here may clear a verdict an earlier press earned.
-        return _unchanged(registry)
-    settled = _settled_or_refused(registry, live)
-    if settled is not None:
-        return settled
-    blocked = _native_blocker(registry, warm, blocked_workers)
-    if blocked is not None:
-        print(f"Device reset deferred: {blocked} may still be native.")
-        return _unchanged(registry, busy=True)
-    if not registry.warm.drop(warm):
-        # The stuck read owns a capture whose stop event is already set:
-        # when the read returns the thread exits and THIS capture can never
-        # re-open. Left installed, the next press that needs no reset would
-        # be admitted and record silently into a dead sink, so the hand-back
-        # below tells the recorder to drop it -- later presses take the
-        # worker path.
-        #
-        # Dropped for presses, NOT gone for PortAudio: WarmKeep kept the
-        # only remaining handle on that thread, and that handle is what
-        # gates every later terminate_all() until the thread has actually
-        # exited. The hand-back asks for that SAME object to be dropped
-        # again; WarmKeep.drop() answers with a probe, not a second join.
-        print("Keep-warm capture would not stop; dropping it.")
-        _hand_back_capture(registry, warm, rearm_warm, ask_recovery=False)
-        return _unchanged(registry, busy=True)
-    if not registry.terminate_all():
-        # Busy: the session stays dirty and the next press retries. The
-        # capture was stopped cleanly above and is dead for presses
-        # either way, so hand it back and ask for recovery (see
-        # _hand_back_capture).
-        _hand_back_capture(registry, warm, rearm_warm, ask_recovery=True)
-        return _unchanged(registry, busy=True)
-    return _rebuild(registry, live, warm, rearm_warm, find_default_input_device)
+    if not registry._reset_lock.acquire(blocking=False):
+        return _unchanged(registry, busy=True, locked=True)
+    try:
+        live = read_live_default_input()
+        if live is None:
+            # CoreAudio saying "no evidence": never treated as a change, and
+            # never as an absence either. Nothing was proved about the session,
+            # so nothing here may clear a verdict an earlier press earned.
+            return _unchanged(registry)
+        settled = _settled_or_refused(registry, live)
+        if settled is not None:
+            return settled
+        blocked = _native_blocker(registry, warm, blocked_workers)
+        if blocked is not None:
+            print(f"Device reset deferred: {blocked} may still be native.")
+            return _unchanged(registry, busy=True)
+        if _teardown_backoff_open(registry) and not registry.rebuild.claim_exemption():
+            # The backoff still being open means the press was let through
+            # on the new-evidence exemption -- so it is spent here, on the
+            # path that rebuilds, not in the predicate.
+            return _unchanged(registry, busy=True)
+        if not registry.warm.drop(warm):
+            # The stuck read owns a capture whose stop event is already set:
+            # when the read returns the thread exits and THIS capture can never
+            # re-open. Left installed, the next press that needs no reset would
+            # be admitted and record silently into a dead sink, so the
+            # hand-back below tells the recorder to drop it -- later presses
+            # take the worker path.
+            #
+            # Dropped for presses, NOT gone for PortAudio: WarmKeep kept the
+            # only remaining handle on that thread, and that handle is what
+            # gates every later terminate_all() until the thread has actually
+            # exited. The hand-back asks for that SAME object to be dropped
+            # again; WarmKeep.drop() answers with a probe, not a second join.
+            print("Keep-warm capture would not stop; dropping it.")
+            _hand_back_capture(registry, warm, rearm_warm, ask_recovery=False)
+            return _unchanged(registry, busy=True)
+        if not registry.terminate_all():
+            # Busy: the session stays dirty and the next press retries. The
+            # capture was stopped cleanly above and is dead for presses
+            # either way, so hand it back and ask for recovery (see
+            # _hand_back_capture).
+            _hand_back_capture(registry, warm, rearm_warm, ask_recovery=True)
+            return _unchanged(registry, busy=True)
+        return _rebuild(registry, live, warm, rearm_warm, find_default_input_device)
+    finally:
+        registry._reset_lock.release()
 
 
 def _settled_or_refused(
@@ -469,7 +490,6 @@ def _rebuild(
 # Re-exported for callers that name the entry point rather than the module.
 __all__ = [
     "MAX_TERMINATE_FAILURES",
-    "MICROPHONE_BUSY",
     "MICROPHONE_NEEDS_RESTART",
     "MICROPHONE_NOT_SETTLING",
     "SessionRefresh",

@@ -57,9 +57,12 @@ class PyAudioRegistry:
     operation this exists for -- it drives PortAudio's init count to zero
     so the next construction re-enumerates the hardware.
 
-    Threading: one thread runs the session's lifecycle at a time (a new
-    worker joins its predecessor before touching anything), but the lock
-    discipline is narrower than "everything under ``_lock``":
+    Threading: more than one thread enters the session lifecycle (issue
+    #72) -- a worker joins its predecessor before touching anything, but
+    ``reset_session`` is also entered from the hotkey press, the recording
+    worker and the warm-capture thread, so it runs under a non-blocking
+    registry-level ``_reset_lock`` (a second entrant gets busy, never a
+    wait). The lock discipline is narrower than "everything under ``_lock``":
     ``open()``, ``bind_index()`` and ``refresh()`` deliberately run their
     native calls OUTSIDE the recorder's ``_lock`` (they can block for
     seconds and stop_recording() needs that lock, issue #60), and so
@@ -122,6 +125,10 @@ class PyAudioRegistry:
         # Guards only the _instances list mutations -- never held across a
         # native call, so it cannot be the lock a blocking terminate waits on.
         self._instances_lock = threading.Lock()
+        # Serialises the device reset across its entrant threads (press,
+        # worker, warm capture); acquired non-blocking only -- see
+        # audio_device_reset.reset_session.
+        self._reset_lock = threading.Lock()
 
     def register(self, pa: pyaudio.PyAudio) -> pyaudio.PyAudio:
         """Track an instance built by this session (the retry loop opens
@@ -350,9 +357,11 @@ class PyAudioRegistry:
         self._indices.clear()
         try:
             self.bind_index(find_default_input_device(pa), pa)
-        except (OSError, RuntimeError):
-            # Transient (coreaudiod storm) or no device at all: the retry
-            # loop re-resolves, exactly as before.
+        except (OSError, RuntimeError, KeyError, TypeError, ValueError):
+            # The retry loop's sibling guard's set: transient (coreaudiod
+            # storm) or no device at all -- the fallback walk in
+            # find_default_input_device reads device dicts that raise these
+            # under a storm. The retry loop re-resolves, exactly as before.
             print(
                 "Warning: microphone probe failed; "
                 "will re-resolve at the next recording."

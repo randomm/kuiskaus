@@ -11,6 +11,7 @@ thread. Nothing bounded that, so the "one rebuild" property issue #72 is
 about was only ever true for a well-behaved CoreAudio.
 """
 
+import threading
 from itertools import cycle
 from unittest.mock import MagicMock, patch
 
@@ -23,10 +24,10 @@ from kuiskaus.audio_coreaudio import (
 )
 from kuiskaus.audio_device_reset import (
     MAX_TERMINATE_FAILURES,
-    MICROPHONE_BUSY,
     MICROPHONE_NEEDS_RESTART,
     MICROPHONE_NOT_SETTLING,
 )
+from kuiskaus.audio_retry import MICROPHONE_BUSY
 from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
 
@@ -249,6 +250,53 @@ def test_an_alternating_default_is_bounded_and_the_backoff_holds(
             "the backoff honoured a flapping default as new evidence on "
             "every press: the futile teardown still runs inside the window"
         )
+
+
+def test_a_ledger_deferred_press_does_not_spend_the_exemption(
+    coreaudio_stub, monkeypatch
+):
+    """The new-evidence exemption buys the REBUILD, so only a press that
+    reaches the rebuild may pay for it. The claim used to sit inside
+    ``_press_is_new_evidence`` -- a predicate -- so a press the ledger gate
+    then deferred (a worker still inside a native call) spent an exemption
+    on a teardown that never ran: deferred presses alone could drain the
+    whole allowance and leave a later hand-moved default refused for the
+    rest of the window.
+    """
+    registry, _pa, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    monkeypatch.setattr(reset_module, "_now", lambda: 0.0)
+    # A clean-teardown DEVICE verdict on the record -- the shape the
+    # exemption answers to -- with the streak counting device 88.
+    registry.rebuild.note_rebuild(88)
+    registry.last_reset = LiveDefaultInput(88, True)
+    registry.needs_restart = True
+    registry.terminate_failures = 0
+    registry.restart_retry_after = 1e12
+
+    # The default moves to a device the budget has never counted: new
+    # evidence, and the press wants the teardown -- but a live worker is
+    # still inside a native call.
+    _live_default_input(coreaudio_stub, 99, is_alive=True)
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait, daemon=True)
+    worker.start()
+    try:
+        deferred = registry.refresh(_find_device, None, None, lambda: (worker,))
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert deferred.busy is True
+    assert registry.rebuild.new_evidence_spent == 0, (
+        "the ledger-deferred press paid an exemption for a rebuild it never ran"
+    )
+
+    # The press that does reach the rebuild spends it.
+    result = registry.refresh(_find_device)
+    assert result.busy is False
+    assert registry.rebuild.new_evidence_spent == 1
 
 
 def _oscillating_liveness(stub, device_id: int) -> None:

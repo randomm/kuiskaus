@@ -275,7 +275,19 @@ class WarmKeep:
         if requested and self.clear():
             with self._lock:
                 self._recover_pending = False
-            rearm_warm(True)
+            try:
+                rearm_warm(True)
+            except BaseException:
+                # The ask was spent on an arm that never completed. WarmArm
+                # re-files recovery only for a FAILED START; the capture is
+                # built (make_capture) outside that try, so a raise from the
+                # build -- or anywhere else on the re-arm path -- would
+                # propagate with the ask already cleared and leave keep-warm
+                # off behind a checked menu for the life of the process.
+                # Re-file, then let the caller's guard have it: recover_quietly
+                # logs it and the press goes on.
+                self.need_recovery()
+                raise
 
     def recover_quietly(self, rearm_warm: Callable[[bool], None]) -> None:
         """``recover()`` as the worker head runs it: a failed re-arm must

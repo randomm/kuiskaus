@@ -8,6 +8,7 @@ never leak into these assertions.
 import threading
 from unittest.mock import MagicMock
 
+import kuiskaus.audio_device_reset as reset_module
 from kuiskaus.audio_device import PyAudioRegistry
 from kuiskaus.audio_retry import check_superseded
 from tests.support_audio_device import _find_device, _registry
@@ -23,6 +24,73 @@ def test_open_survives_a_hostile_bridge(coreaudio_stub):
     assert registry.open(_find_device) is True
     assert registry.pyaudio is pa
     assert registry.device_id is None
+
+
+def test_open_survives_a_device_probe_that_raises_beyond_oserror(coreaudio_stub):
+    """The probe's fallback walk reads CoreAudio-populated device dicts, so
+    a storm can surface KeyError/TypeError/ValueError from
+    find_default_input_device -- the same set the retry loop's sibling
+    guard covers. An escape here is a constructor-path crash instead of the
+    re-resolvable transient it is: open() must still bind the session and
+    leave the index unresolved for the retry loop."""
+
+    def _hostile_probe(_pa):
+        raise KeyError("index")
+
+    registry, pa, _ = _registry()
+
+    assert registry.open(_hostile_probe) is True
+    assert registry.pyaudio is pa
+    assert registry.input_device_index is None  # re-resolved at the next recording
+
+
+def test_a_second_reset_entered_while_one_runs_returns_busy(
+    coreaudio_stub, monkeypatch
+):
+    """reset_session has more than one entrant thread (issue #72): the
+    hotkey press running the keep-warm gate, the recording worker, and the
+    warm-capture thread opening its stream. The registry docstring's "one
+    thread at a time" was a hope, not an invariant -- so the registry
+    serialises the reset with a non-blocking lock, and a second entrant
+    gets the deferral answer (busy, session untouched) instead of joining
+    the first inside PortAudio. It must not WAIT either: a blocking wait
+    would park the hotkey callback behind a full teardown on another
+    thread."""
+    registry, pa, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    _live_default_input(coreaudio_stub, 88)  # the default moved
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_read = reset_module.read_live_default_input
+
+    def _blocking_read():
+        entered.set()
+        release.wait(5.0)
+        return real_read()
+
+    monkeypatch.setattr(reset_module, "read_live_default_input", _blocking_read)
+    first = threading.Thread(target=registry.refresh, args=(_find_device,), daemon=True)
+    first.start()
+    assert entered.wait(5.0), "the first reset never reached the live read"
+    try:
+        result = registry.refresh(_find_device)
+        assert result.busy is True
+        assert (
+            result.locked is True
+        )  # busy because the reset is running, not the ledger
+        assert result.pyaudio is pa  # the running reset's session, untouched
+        pa.terminate.assert_not_called()  # the loser terminated nothing
+    finally:
+        release.set()
+        first.join(timeout=5.0)
+
+    assert not first.is_alive()
+    # The lock is scoped to the reset itself: released when it ends, so a
+    # finished reset cannot lock the session out for the rest of the run.
+    assert registry._reset_lock.acquire(blocking=False)
+    registry._reset_lock.release()
 
 
 # ---------------------------------------------------------------------------
