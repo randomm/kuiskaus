@@ -169,10 +169,13 @@ def attempt_open_once(
                 _dispose_attempt_instance(pa, registry)
             return None, None, device_error, None
         if registry is not None:
-            # The session was unbound: hand the resolved index back, or it
-            # dies with this attempt and every later press pays a fresh
-            # enumeration (issue #72).
-            registry.bind_index(device_index)
+            # The session had no usable index: hand the resolved one back,
+            # or it dies with this attempt and every later press pays a
+            # fresh enumeration (issue #72). It is handed back PAIRED with
+            # the instance it was resolved against, so a binding left by a
+            # disposed attempt can never be read as if it still named a
+            # device (issue #72 review, round 1).
+            registry.bind_index(device_index, pa)
 
     # Issue #55: query the device's native sample rate so the stream
     # is opened at the rate CoreAudio actually uses, avoiding the

@@ -17,6 +17,7 @@ while somebody still holds the thread.
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -30,6 +31,18 @@ class WarmKeep:
 
     Owned by the session (``PyAudioRegistry``), because the session is what
     must not be terminated while any of them may still be reading.
+
+    Threading (issue #72 review, round 1): this list IS the check the
+    CRITICAL invariant rests on, and it has more than one writer. A press's
+    ``drop()`` runs on the hotkey dispatcher's worker thread while
+    ``set_keep_warm``/``cleanup()`` run on the rumps main thread, and
+    ``CallbackDispatcher.stop(timeout=5.0)`` explicitly tolerates an in-flight
+    press callback outliving its join -- so a stuck press and a quit really
+    can overlap. Every field is therefore read and written under ``_lock``.
+    The lock is never held across ``warm.stop()``: that join can take seconds
+    and a probe from the other thread must be answered immediately rather
+    than queued behind it, which is why ``clear()`` snapshots, probes
+    lock-free, then commits by removal (see each method).
     """
 
     def __init__(self) -> None:
@@ -38,6 +51,8 @@ class WarmKeep:
         self.enabled = False
         self._blockers: list[WarmCapture] = []
         self._recover_pending = False
+        # Guards the three fields above. Never held across warm.stop().
+        self._lock = threading.Lock()
 
     def drop(self, warm: WarmCapture | None) -> bool:
         """Stop a capture the caller is letting go of. True = nothing of it
@@ -49,12 +64,27 @@ class WarmKeep:
         own reference, so recording it here is what keeps that thread
         nameable: what this replaces was dropping it, which let the next
         press or cleanup() drive PortAudio's init count to zero underneath it.
+
+        The name goes on the list BEFORE ``stop()`` and comes off only when
+        ``stop()`` reports success (issue #72 review, round 1). Registering
+        after the join instead left that whole window -- precisely the
+        interval in which the thread is proven wedged in ``stream.read()``
+        -- with the capture invisible, so a ``clear()`` racing in from the
+        menu thread reported a safe-to-terminate session while the reader was
+        still parked on it.
         """
-        if warm is None or warm.stop():
+        if warm is None:
             return True
-        if warm not in self._blockers:
-            self._blockers.append(warm)
-        self._recover_pending = True
+        with self._lock:
+            if warm not in self._blockers:
+                self._blockers.append(warm)
+        if warm.stop():
+            with self._lock:
+                if warm in self._blockers:
+                    self._blockers.remove(warm)
+            return True
+        with self._lock:
+            self._recover_pending = True
         return False
 
     def clear(self) -> bool:
@@ -65,23 +95,37 @@ class WarmKeep:
         (already set) stop event and joins with no timeout, so it reports
         liveness without ever parking the caller on a thread that may be
         parked for the life of the process.
+
+        The probes run with no lock held (they are foreign code, and a
+        wedged capture must never be able to hold up the other thread's
+        probe), so the commit removes the provably-dead entries from the
+        CURRENT list rather than reassigning a snapshot -- a reassignment
+        would permanently erase a capture that another thread's ``drop()``
+        registered while these probes were running (issue #72 review,
+        round 1).
         """
-        live: list[WarmCapture] = []
-        for warm in self._blockers:
-            if not warm.stop(0.0):
-                live.append(warm)
-        self._blockers = live
-        return not live
+        with self._lock:
+            pending = list(self._blockers)
+        dead = [warm for warm in pending if warm.stop(0.0)]
+        if not dead:
+            with self._lock:
+                return not self._blockers
+        with self._lock:
+            self._blockers = [warm for warm in self._blockers if warm not in dead]
+            return not self._blockers
 
     def want(self, enabled: bool) -> None:
         """Record the menu's keep-warm request (issue #66).
 
         Checking it also withdraws a pending recovery: a capture the user
-        switched off and then back on must not wait on a stale flag.
+        switched off and then back on must not wait on a stale flag. Written
+        from the menu thread while a worker thread may be mid-``drop()``, so
+        both fields move under the lock together.
         """
-        self.enabled = enabled
-        if enabled:
-            self._recover_pending = False
+        with self._lock:
+            self.enabled = enabled
+            if enabled:
+                self._recover_pending = False
 
     def need_recovery(self) -> None:
         """Ask for keep-warm to be brought back later (issue #72 review).
@@ -94,7 +138,8 @@ class WarmKeep:
         exactly that case, and the worker path's ``recover()`` picks it up
         the same way it picks up a stuck read.
         """
-        self._recover_pending = True
+        with self._lock:
+            self._recover_pending = True
 
     def recover(self, rearm_warm: Callable[[bool], None] | None) -> None:
         """Bring keep-warm back after a stuck-read drop (issue #72 review).
@@ -106,8 +151,11 @@ class WarmKeep:
         committed to a worker: the new capture's own open joins that worker
         before opening, so the two native opens never overlap (issue #16).
         """
-        if rearm_warm is None or not self.enabled:
+        if rearm_warm is None:
             return
-        if self._recover_pending and self.clear():
-            self._recover_pending = False
+        with self._lock:
+            requested = self.enabled and self._recover_pending
+        if requested and self.clear():
+            with self._lock:
+                self._recover_pending = False
             rearm_warm(True)

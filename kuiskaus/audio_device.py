@@ -27,6 +27,7 @@ from kuiskaus.audio_coreaudio import (
     read_live_default_input,
     session_needs_reset,
 )
+from kuiskaus.audio_device_index import DeviceIndexBinding
 from kuiskaus.audio_retry import (
     close_stream_quietly,
     log_retry_attempt,
@@ -78,7 +79,13 @@ class PyAudioRegistry:
     def __init__(self, pa_module: ModuleType) -> None:
         self._pa_module = pa_module
         self.pyaudio: pyaudio.PyAudio | None = None
-        self.input_device_index: int | None = None
+        # The device index lives in ``_indices``, paired with the instance it
+        # was resolved against (issue #72 review, round 1): a PortAudio index
+        # is a fact about ONE instance's frozen enumeration, so an index
+        # whose instance is gone is not an index at all -- reading it back
+        # opens a stream on a device that instance never had. Read it
+        # through the property below, never through a copy.
+        self._indices = DeviceIndexBinding()
         self.device_id: int | None = None
         # The (device_id, is_alive) pair the last FULLY SUCCESSFUL reset
         # was performed against (issue #72 review): a default that stays
@@ -115,6 +122,62 @@ class PyAudioRegistry:
             if pa in self._instances:
                 self._instances.remove(pa)
 
+    @property
+    def input_device_index(self) -> int | None:
+        """The session's device index, while it describes the live instance
+        (issue #72 review, round 1; see ``DeviceIndexBinding``).
+
+        None means "unresolved", and it is the answer a caller wants when
+        the binding came from an instance that is gone: re-resolving is the
+        only correct response to an index into a device list nobody here
+        has, and trusting one was how the mic stayed dead until restart.
+        """
+        return self._indices.resolve(self.pyaudio)
+
+    def set_index(self, device_index: int | None) -> None:
+        """Record a (live instance, index) pair the caller holds together.
+
+        The recorder's session write-back comes through here: it read the
+        pair together, so the pairing is recorded as it was read rather than
+        inferred afterwards (issue #72 review, round 1).
+        """
+        self._indices.publish(device_index, self.pyaudio)
+
+    def bind_index(self, device_index: int, resolved_on: pyaudio.PyAudio) -> None:
+        """Publish the device index a retry attempt resolved (issue #72).
+
+        The loop resolves a device only while the session has no usable
+        index; with no way to hand the value back (the open-attempt tuple
+        carries the rate, not the index) it died with the attempt and every
+        later press paid a fresh enumeration.
+
+        It is published WITH the instance it was resolved against, which is
+        what keeps the hand-back from becoming the wedge: an index survived
+        its instance once, and every later attempt then opened on a dead
+        device forever (issue #72 review, round 1). A binding already
+        serving the live instance stands -- two attempts in one press can
+        both resolve, and the one against the instance being opened on is
+        the one to keep.
+        """
+        if self.input_device_index is not None:
+            return
+        self._indices.bind(device_index, resolved_on)
+
+    def _dispose(self, pa: pyaudio.PyAudio) -> bool:
+        """Terminate one instance and unbind everything that was a fact
+        about it. False = it would not terminate, so it stays registered
+        (and its index binding stays readable) for the next attempt.
+        """
+        if not terminate_quietly(pa):
+            return False
+        self.forget(pa)
+        # An index resolved against an instance that has just been
+        # terminated describes a device list that no longer exists, so the
+        # pairing goes with it (issue #72 review, round 1): a leftover
+        # binding is what let every later press open on a dead index.
+        self._indices.unbind(pa)
+        return True
+
     def terminate(self, pa: pyaudio.PyAudio) -> None:
         """Terminate and unregister one instance (its stream must be
         closed first: closing the last stream is what releases the
@@ -122,8 +185,7 @@ class PyAudioRegistry:
         registered: an untracked live instance is exactly what this class
         exists to reach.
         """
-        if terminate_quietly(pa):
-            self.forget(pa)
+        self._dispose(pa)
 
     def terminate_all(self) -> bool:
         """Terminate every instance this session ever built. True = all gone.
@@ -148,9 +210,7 @@ class PyAudioRegistry:
         with self._instances_lock:
             pending = list(self._instances)
         for pa in pending:
-            if terminate_quietly(pa):
-                self.forget(pa)
-            else:
+            if not self._dispose(pa):
                 incomplete = True
         return not incomplete
 
@@ -175,8 +235,11 @@ class PyAudioRegistry:
         self.pyaudio = pa
         live = read_live_default_input()
         self.device_id = None if live is None else live.device_id
+        # A fresh instance re-enumerates, so whatever was resolved before
+        # describes another instance's device list (issue #72 review, r1).
+        self._indices.clear()
         try:
-            self.input_device_index = find_default_input_device(pa)
+            self.bind_index(find_default_input_device(pa), pa)
         except (OSError, RuntimeError):
             # Transient (coreaudiod storm at startup) or no device at all:
             # the retry loop re-resolves, exactly as before.
@@ -185,19 +248,6 @@ class PyAudioRegistry:
                 "will re-resolve at first recording."
             )
         return True
-
-    def bind_index(self, device_index: int) -> None:
-        """Publish the device index a retry attempt resolved (issue #72).
-
-        The loop resolves a device only while the session is unbound; with
-        no way to hand the value back (the open-attempt tuple carries the
-        rate, not the index) it died with the attempt and every later press
-        paid a fresh enumeration. A single-word write, not the composite
-        state the recorder's _lock guards: a reader may observe it one
-        press late, never torn.
-        """
-        if self.input_device_index is None:
-            self.input_device_index = device_index
 
     def adopt(
         self,
@@ -220,7 +270,9 @@ class PyAudioRegistry:
         so ``new_pa`` is normally the instance already in the registry;
         a different one only shows up when the session was never bound --
         the fresh instance then becomes the live one (its resolved device
-        index was bound by the attempt itself, via bind_index).
+        index was bound by the attempt itself, via bind_index -- paired with
+        that instance, so the binding is readable only while it IS the live
+        one; issue #72 review round 1).
         """
         orphan: pyaudio.PyAudio | None = None
         previous: pyaudio.PyAudio | None = None
@@ -257,7 +309,7 @@ class PyAudioRegistry:
                 self.register(new_pa)
                 self.pyaudio = new_pa
                 publish_capture_rate(capture_rate)
-        if orphan is not None and not terminate_quietly(orphan):
+        if orphan is not None and not self._dispose(orphan):
             # An orphan that would not terminate goes back on the list: it is
             # still live, still holding PortAudio's init count, and the next
             # terminate_all() has to be able to find it.
@@ -309,7 +361,9 @@ class PyAudioRegistry:
         thread and let the next press terminate underneath it).
         """
         live = read_live_default_input()
-        if not session_needs_reset(live, self.device_id):
+        if live is None or not session_needs_reset(live, self.device_id):
+            # ``live is None`` is CoreAudio saying "no evidence" -- never
+            # treated as a change, and never as an absence either.
             return SessionRefresh(self.pyaudio, self.input_device_index, False)
         if self.device_id is not None and live == self._last_reset:
             # A fully successful reset already ran against this exact live
@@ -374,7 +428,7 @@ class PyAudioRegistry:
             self.warm.need_recovery()
             return SessionRefresh(self.pyaudio, self.input_device_index, True)
         self.pyaudio = None
-        self.input_device_index = None
+        self._indices.clear()
         rebuilt = self.open(find_default_input_device)
         if warm_stopped and warm is not None and rearm_warm is not None:
             rearm_warm(True)
@@ -384,8 +438,16 @@ class PyAudioRegistry:
             # nothing left holding PortAudio open.
             return SessionRefresh(None, None, False)
         # Dedupe baseline: this exact live read now has a session built
-        # against it (see the dedupe check above).
+        # against it (see the dedupe check above). device_id is filled from
+        # THIS read when open()'s second read gave no evidence: the dedupe
+        # guard needs a non-None device_id to engage, and leaving it None
+        # (open()'s transient failure is quite possible right after a
+        # coreaudiod storm) meant a full rebuild on every press -- on the
+        # hotkey callback thread in the keep-warm path, the exact hazard
+        # the dedupe was added to remove (issue #72 review, round 1).
         self._last_reset = live
+        if self.device_id is None:
+            self.device_id = live.device_id
         return SessionRefresh(self.pyaudio, self.input_device_index, False)
 
     def press_check_if_admissible(

@@ -334,3 +334,85 @@ def test_warm_keep_want_off_withdraws_a_pending_recovery():
     assert keep.clear() is False  # still must refuse to terminate underneath it
     keep.recover(rearm)
     rearm.assert_not_called()
+
+
+def test_warm_keep_a_probe_during_the_join_sees_the_capture_being_stopped():
+    """WarmKeep unit (issue #72 review, round 1): the blocker must be named
+    BEFORE ``stop()`` joins.
+
+    The join window is exactly the interval in which the capture's thread is
+    proven to be parked in ``stream.read()``. Registering only after
+    ``stop()`` returned left the capture invisible there, so a ``clear()``
+    racing in from the rumps main thread (set_keep_warm and cleanup() run
+    there, while a stuck press runs on the hotkey dispatcher's worker -- and
+    CallbackDispatcher.stop() tolerates that callback outliving its join)
+    reported a session it was free to terminate, with a reader still parked
+    inside PortAudio.
+    """
+    keep = WarmKeep()
+    entering_the_join = threading.Event()
+    let_the_join_finish = threading.Event()
+    probe_saw = {}
+
+    wedged = MagicMock(name="wedged-capture")
+
+    def _wedged_stop(timeout: float = 2.0) -> bool:
+        if timeout == 0.0:
+            return False  # a probe: the thread is still in the read
+        entering_the_join.set()
+        let_the_join_finish.wait(5.0)  # the blocking join itself
+        return False  # and it never came back
+
+    wedged.stop.side_effect = _wedged_stop
+
+    def probe():
+        entering_the_join.wait(5.0)
+        probe_saw["clear"] = keep.clear()
+
+    observer = threading.Thread(target=probe, daemon=True)
+    observer.start()
+    try:
+        assert keep.drop(wedged) is False
+        observer.join(timeout=5.0)
+        assert probe_saw == {"clear": False}, (
+            "a concurrent clear() reported a session it was free to "
+            "terminate while drop() was mid-join on the capture blocking it"
+        )
+    finally:
+        let_the_join_finish.set()
+        observer.join(timeout=5.0)
+
+
+def test_warm_keep_clear_prunes_rather_than_reassigning_the_blocker_list():
+    """WarmKeep unit (issue #72 review, round 1): a capture registered while
+    ``clear()``'s probes were running must survive the commit.
+
+    The probes cannot hold the lock (a wedged capture must never be able to
+    hold up the other thread's probe), so a ``drop()`` landing between the
+    snapshot and the commit is a lost update if the commit writes the probed
+    list back. Losing an entry permanently un-gates every later
+    terminate_all() against a thread still inside a native read.
+    """
+    keep = WarmKeep()
+    late = MagicMock(name="late-capture")
+    late.stop.return_value = False  # stuck: it registers as a blocker
+
+    retiring = MagicMock(name="retiring-capture")
+
+    def _retiring_stop(timeout: float = 2.0) -> bool:
+        # The other thread's drop() lands inside this probe.
+        if timeout == 0.0:
+            keep.drop(late)
+            return True  # and this capture's thread has really exited
+        return False
+
+    retiring.stop.side_effect = _retiring_stop
+    assert keep.drop(retiring) is False  # wedged -> it is a blocker now
+
+    assert keep.clear() is False, (
+        "clear() erased a blocker another thread registered mid-probe"
+    )
+    assert late in keep._blockers
+    assert retiring not in keep._blockers  # the provably-dead one WAS pruned
+    keep.clear()  # and from here on the survivor is probed like any blocker
+    late.stop.assert_called_with(0.0)

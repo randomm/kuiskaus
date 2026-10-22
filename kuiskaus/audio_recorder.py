@@ -98,7 +98,7 @@ class AudioRecorder:
 
     @input_device_index.setter
     def input_device_index(self, index: int | None) -> None:
-        self._session.input_device_index = index
+        self._session.set_index(index)
 
     @property
     def current_generation(self) -> int:
@@ -361,7 +361,8 @@ class AudioRecorder:
             self.recording, self._warm, self.recording_thread,
             find_default_input_device, self._rearm_warm,
         ):  # fmt: skip
-            self.last_error = "microphone busy — recording did not start"
+            with self._lock:  # every last_error write holds _lock (issue #55)
+                self.last_error = "microphone busy — recording did not start"
             return False
 
         with self._lock:
