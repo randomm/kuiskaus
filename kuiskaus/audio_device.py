@@ -36,7 +36,6 @@ from kuiskaus.audio_rebuild_budget import RebuildBudget
 from kuiskaus.audio_retry import (
     close_stream_quietly,
     log_retry_attempt,
-    stamp_owner,
     terminate_quietly,
 )
 from kuiskaus.audio_warm_keep import WarmKeep
@@ -124,14 +123,13 @@ class PyAudioRegistry:
 
     def register(self, pa: pyaudio.PyAudio) -> pyaudio.PyAudio:
         """Track an instance built by this session (the retry loop opens
-        its stream on the live one; a warm-up may construct its own) and
-        stamp it with its owner, so a caller holding only the instance can
-        still find the registry that must terminate it (issue #72)."""
+        its stream on the live one; a warm-up may construct its own). An
+        instance PortAudio still counts must be findable by name here --
+        ``terminate_all()`` is the only thing that can reach it."""
         if pa not in self._instances:
             with self._instances_lock:
                 if pa not in self._instances:
                     self._instances.append(pa)
-        stamp_owner(pa, self)
         return pa
 
     def forget(self, pa: pyaudio.PyAudio) -> None:
@@ -306,11 +304,9 @@ class PyAudioRegistry:
         live = self.pyaudio
         if live is not None and not self.tracks(live):
             # The session names an instance this pass terminated. Left bound,
-            # the retry loop opens on a corpse and cannot get a replacement
-            # (registry_for() finds no session to rebuild), so the name goes
-            # with the instance and the next press rebuilds. Unbind rather
-            # than clear: a press that rebuilt in the meantime owns the
-            # binding now.
+            # the retry loop opens on a corpse, so the name goes with the
+            # instance and the next press rebuilds. Unbind rather than clear: a
+            # press that rebuilt in the meantime owns the binding now.
             self._indices.unbind(live)
             if self.pyaudio is live:
                 self.pyaudio = None
@@ -339,8 +335,8 @@ class PyAudioRegistry:
             # construction wraps PortAudio's Pa_Initialize(), whose
             # failure modes aren't documented as a narrow exception set.
             print(
-                "Warning: PyAudio construction failed at startup "
-                f"({construct_error}); will retry at first recording."
+                "Warning: PyAudio construction failed "
+                f"({construct_error}); will retry at the next recording."
             )
             # No instance, no baseline: a previous open's pair left standing
             # would have the dedupe guard vouch for a session that is gone.
@@ -358,11 +354,11 @@ class PyAudioRegistry:
         try:
             self.bind_index(find_default_input_device(pa), pa)
         except (OSError, RuntimeError):
-            # Transient (coreaudiod storm at startup) or no device at all:
-            # the retry loop re-resolves, exactly as before.
+            # Transient (coreaudiod storm) or no device at all: the retry
+            # loop re-resolves, exactly as before.
             print(
-                "Warning: microphone probe failed at startup; "
-                "will re-resolve at first recording."
+                "Warning: microphone probe failed; "
+                "will re-resolve at the next recording."
             )
         return True
 
@@ -403,13 +399,11 @@ class PyAudioRegistry:
                 # An instance this worker itself constructed (the session never
                 # had one): the worker owns its termination, and must actually
                 # take it -- attempt_open_once registers what it builds, so an
-                # abandoned instance stays registered and only terminate_all()
-                # can see it; while the session stays unbound registry_for(None)
-                # is None, refresh() cannot run, and every superseded press
-                # leaves another live instance holding PortAudio's init count
-                # above zero. The recorder's own live session is never touched
-                # here. Untracking happens under the lock; terminate() and the
-                # stream close run outside it.
+                # abandoned instance stays registered and holds PortAudio's
+                # init count above zero until some later terminate_all() gets
+                # to it, which on this path may never come. The recorder's own
+                # live session is never touched here. Untracking happens under
+                # the lock; terminate() and the stream close run outside it.
                 if new_pa is not self.pyaudio:
                     orphan = new_pa
                     self.forget(new_pa)

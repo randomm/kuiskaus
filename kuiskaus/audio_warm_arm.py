@@ -48,11 +48,11 @@ import numpy as np
 
 from kuiskaus.audio_resample import assemble_audio
 from kuiskaus.audio_retry import (
+    MICROPHONE_BUSY,
     PREVIOUS_WORKER_WAIT_SECONDS,
     find_default_input_device,
     log_stop,
     open_warm_stream,
-    refresh_pyaudio_session,
     worker_alive,
 )
 
@@ -271,15 +271,29 @@ def refresh_recorder_session(
     ``blocked`` is the worker just joined, and the gate also consults the
     recorder's CURRENT worker at gate time -- which is why the
     name travels as a callable rather than as the thread.
+
+    The session is asked for its own reset, not looked up through the instance
+    it happens to be holding: a half-finished teardown unbinds ``pyaudio``
+    (terminate_all() terminated the live instance and a second one refused)
+    while that instance stays registered, and that is exactly the state where
+    the reset is the only thing that can finish the job. Resolving the session
+    from a None instance answers "no session here" and leaves PortAudio
+    initialised on a frozen device list -- the #72 symptom, back inside the
+    fix, on the default (non-keep-warm) path.
     """
-    pa, device_index = recorder._session.snapshot()
-    pa, device_index = refresh_pyaudio_session(
-        pa,
-        device_index,
+    result = recorder._session.refresh(
         find_default_input_device,
-        lambda: (blocked, current_worker(recorder)),
+        blocked_workers=lambda: (blocked, current_worker(recorder)),
     )
-    recorder.publish_session(pa, device_index)
+    if result.busy:
+        # The press proceeds against the stale session (the only safe move
+        # while a thread may be inside a native call), but the deferral has to
+        # be visible in the same log stream as the open attempts.
+        print(
+            "[audio.retry] device reset deferred: a worker may still hold "
+            "PortAudio; session stays dirty for the next press."
+        )
+    recorder.publish_session(result.pyaudio, result.input_device_index)
 
 
 def rearm_warm(recorder: AudioRecorder, usable: bool) -> None:
@@ -354,7 +368,7 @@ def finish_recording(
             # timeout is the only observable signal.
             with recorder._lock:
                 if recorder._generation == my_gen:
-                    recorder.last_error = "microphone busy — recording did not start"
+                    recorder.last_error = MICROPHONE_BUSY
             print("Recording worker still alive after stop; microphone may be stuck")
             stuck_open = True
 
@@ -372,7 +386,7 @@ def finish_recording(
         # The warm stream was not delivering yet: report it (#66).
         with recorder._lock:
             if recorder._generation == my_gen:
-                recorder.last_error = "microphone busy — recording did not start"
+                recorder.last_error = MICROPHONE_BUSY
         reason = "warm-not-ready"
     log_stop(0, start_monotonic, reason)
     return np.array([], dtype=np.float32)

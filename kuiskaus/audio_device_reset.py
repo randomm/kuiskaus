@@ -25,7 +25,7 @@ from kuiskaus.audio_coreaudio import (
     session_needs_reset,
 )
 from kuiskaus.audio_rebuild_budget import MAX_RESET_REBUILDS
-from kuiskaus.audio_retry import microphone_unavailable
+from kuiskaus.audio_retry import MICROPHONE_BUSY, microphone_unavailable
 from kuiskaus.audio_warm_arm import worker_may_be_native
 from kuiskaus.audio_worker_keep import terminate_blocker
 
@@ -52,8 +52,6 @@ MICROPHONE_NEEDS_RESTART = (
 # and sending them to quit the app over a device that may settle in seconds
 # is the wrong ask -- the backoff retries on its own.
 MICROPHONE_NOT_SETTLING = "Microphone is not settling — try again in a moment"
-
-MICROPHONE_BUSY = "microphone busy — recording did not start"
 
 # How many consecutive teardowns an instance may refuse before the session
 # stops implying the microphone might come back (issue #72).

@@ -12,7 +12,7 @@ Round 1:
    interleaving.
 
 2. Stale worker name in the reset gate: ``_open_warm_stream`` hands
-   ``_refresh_pyaudio_session`` the worker it captured BEFORE a join of
+   ``refresh_recorder_session`` the worker it captured BEFORE a join of
    up to 30 s. If that worker finished and a new one became current in
    the meantime, the "never reset under a live worker" gate trusted the
    dead name and terminated the session under the live worker. The gate
@@ -40,7 +40,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kuiskaus.audio_warm_arm import WarmArm
+from kuiskaus.audio_warm_arm import WarmArm, refresh_recorder_session
 from kuiskaus.audio_warm_keep import WarmKeep
 from tests.support_audio_recorder import (
     _cleanup_recorder,
@@ -317,7 +317,7 @@ def test_reset_gate_checks_the_current_worker_not_the_joined_name(
         recorder.recording_thread = w2
         _live_default_input(coreaudio_stub, 77)  # the default moved
 
-        recorder._refresh_pyaudio_session(w1)
+        refresh_recorder_session(recorder, w1)
 
         pa.terminate.assert_not_called()
         assert recorder.pyaudio is pa
@@ -328,6 +328,6 @@ def test_reset_gate_checks_the_current_worker_not_the_joined_name(
 
     # The busy verdict is a deferral, not a wedge: with both named
     # workers gone, the next reset proceeds and terminates.
-    recorder._refresh_pyaudio_session(w1)
+    refresh_recorder_session(recorder, w1)
     pa.terminate.assert_called_once()
     assert module.pyaudio.PyAudio.call_count == 2

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from kuiskaus.audio_device_reset import SessionRefresh
 from tests.support_audio_recorder import (
     _assert_stop_log_line,
     _blocking_stream,
@@ -188,7 +189,7 @@ def test_press_while_actively_recording_is_still_refused(audio_recorder_module):
 
 
 def test_refresh_does_not_hold_lock_during_native_calls(audio_recorder_module):
-    """stop_recording() (hotkey release) needs _lock; the device refresh
+    """stop_recording() (hotkey release) needs _lock; the device reset
     calls native PortAudio and can block for seconds (issue #72), so it
     must run without holding the lock."""
     module = audio_recorder_module
@@ -196,19 +197,19 @@ def test_refresh_does_not_hold_lock_during_native_calls(audio_recorder_module):
     recorder = _make_recorder(module, init_probe=pa1)
     lock_free_during_native_call: list[bool] = []
 
-    def fake_refresh(pa, idx, _find, _blocked=None):
+    def fake_refresh(_find, blocked_workers=None):
         acquired = recorder._lock.acquire(blocking=False)
         lock_free_during_native_call.append(acquired)
         if acquired:
             recorder._lock.release()
-        return pa, idx
+        return SessionRefresh(pyaudio=pa1, input_device_index=0, busy=False)
 
-    # The worker's reset lives in audio_warm_arm (the seam the warm reopen
-    # shares), which is where the native call is actually made from.
+    # The worker's reset seam (shared with the warm reopen) is where the
+    # native call is made from, so that is what the lock is asserted around.
     from kuiskaus import audio_warm_arm
 
-    with mock.patch.object(audio_warm_arm, "refresh_pyaudio_session", fake_refresh):
-        recorder._refresh_pyaudio_session()
+    with mock.patch.object(recorder._session, "refresh", fake_refresh):
+        audio_warm_arm.refresh_recorder_session(recorder)
     assert lock_free_during_native_call == [True]
 
 

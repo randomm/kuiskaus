@@ -9,7 +9,7 @@ import threading
 from unittest.mock import MagicMock
 
 from kuiskaus.audio_device import PyAudioRegistry
-from kuiskaus.audio_retry import check_superseded, registry_for
+from kuiskaus.audio_retry import check_superseded
 from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
 
@@ -69,14 +69,16 @@ def test_terminate_unregisters_so_the_instance_is_not_terminated_twice():
     pa.terminate.assert_called_once()
 
 
-def test_register_stamps_the_owning_registry():
-    """The worker's reset is handed an instance, not the session, so the
-    instance must be able to find its registry (issue #72)."""
+def test_tracks_answers_for_the_instances_this_session_built():
+    """``terminate_all()`` asks this to decide whether the session still
+    names an instance it just terminated, so the answer has to follow
+    register() and the disposal that untracks (issue #72)."""
     registry, pa, _ = _registry()
+    assert registry.tracks(pa) is False
     registry.register(pa)
-    assert registry_for(pa) is registry
-    assert registry_for(MagicMock(name="unowned")) is None
-    assert registry_for(None) is None
+    assert registry.tracks(pa) is True
+    registry.terminate(pa)
+    assert registry.tracks(pa) is False
 
 
 def test_open_binds_the_instance_and_the_live_device(coreaudio_stub):
@@ -88,7 +90,6 @@ def test_open_binds_the_instance_and_the_live_device(coreaudio_stub):
     assert registry.device_id == 55
     assert registry.input_device_index == 3
     assert module.PyAudio.call_count == 1
-    assert registry_for(pa) is registry
 
 
 def test_open_failure_leaves_session_unbound():
@@ -357,10 +358,10 @@ def test_superseded_adopt_disposes_an_untracked_fresh_instance():
 def test_superseded_adopt_disposes_the_registered_instance_the_worker_built():
     """The flow that actually happens (issue #72): attempt_open_once
     registers the instance it constructs, so an abandoned instance is IN the
-    registry while the session stays unbound -- registry_for(None) is None
-    for the next press and refresh() can never reach it. Left alone it
-    holds PortAudio's init count above zero for the life of the process:
-    the frozen device list this module exists to clear."""
+    registry while the session stays unbound. Left alone it holds PortAudio's
+    init count above zero until some later terminate_all() reaches it -- the
+    frozen device list this module exists to clear -- so the worker that built
+    it terminates it here."""
     registry, worker_pa, _ = _registry()
     registry.register(worker_pa)  # what attempt_open_once did
     assert registry.pyaudio is None  # the session was never bound

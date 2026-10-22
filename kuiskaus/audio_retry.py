@@ -66,6 +66,15 @@ def microphone_unavailable(last_error: BaseException | None) -> str:
     return format_microphone_error(last_error)
 
 
+# The press that could not start, and the word for why. It lives beside the
+# other microphone text the user reads in the menubar's status line (the two
+# above, and the restart/not-settling verdicts in audio_device_reset) so the
+# three cannot drift into different sentences for one symptom -- the warm
+# path's refusals do not run through press_refusal_reason(), so a shared
+# constant is the only thing keeping them in step.
+MICROPHONE_BUSY = "microphone busy — recording did not start"
+
+
 def attempt_open_once(
     pa_module: ModuleType,
     format: int,
@@ -232,64 +241,6 @@ def terminate_quietly(pa: "pyaudio.PyAudio") -> bool:
     return True
 
 
-# PortAudio's init count is reference-counted: an instance is only reachable
-# by terminate_all() through the registry that built it, so every registered
-# instance carries a back-reference to its owning session. Stamped by
-# PyAudioRegistry.register(), read here so the worker's device reset can find
-# the session from the instance it was handed.
-_OWNER_ATTRIBUTE = "_kuiskaus_registry"
-
-# The stamp failure is said once per process: it is a property of the PyAudio
-# class, not of one instance, and repeating it every press is noise.
-_owner_stamp_logged = False
-
-
-def stamp_owner(pa: "pyaudio.PyAudio", registry: "PyAudioRegistry") -> None:
-    """Record which session registry built ``pa`` (see _OWNER_ATTRIBUTE).
-
-    An instance that cannot carry the stamp is an instance no worker-side
-    reset can ever find its session through, so the failure is said --
-    silently skipping it would leave the frozen-device-list symptom with no
-    trace of why the reset never runs.
-    """
-    global _owner_stamp_logged
-    try:
-        setattr(pa, _OWNER_ATTRIBUTE, registry)
-    except (AttributeError, TypeError) as e:
-        if not _owner_stamp_logged:
-            _owner_stamp_logged = True
-            print(
-                f"Cannot stamp the owning session on a PyAudio instance ({e}); "
-                "device resets will not find it."
-            )
-
-
-def registry_for(pa: "pyaudio.PyAudio | None") -> "PyAudioRegistry | None":
-    """The session registry that built ``pa``, or None.
-
-    None means no registry tracked this instance -- there is no tracked set to
-    drive to zero, so the caller leaves the session alone instead of
-    half-resetting it. The check is an isinstance against the real registry:
-    duck-typing on a private attribute name accepted anything that happened to
-    expose a list called ``_instances``, which is a promise about a field name
-    rather than about the object.
-    """
-    if pa is None:
-        return None
-    owner = getattr(pa, _OWNER_ATTRIBUTE, None)
-    if isinstance(owner, _registry_class()):
-        return owner
-    return None
-
-
-def _registry_class() -> type:
-    """``PyAudioRegistry``, imported on use: audio_device imports this module
-    at module scope, so a top-level import here would be a cycle."""
-    from kuiskaus.audio_device import PyAudioRegistry
-
-    return PyAudioRegistry
-
-
 def _dispose_attempt_instance(
     pa: "pyaudio.PyAudio", registry: "PyAudioRegistry | None"
 ) -> None:
@@ -344,52 +295,6 @@ def check_superseded(
             log_retry_attempt(attempt, max_attempts, attempt_start, None, "abort")
             return True
         return False
-
-
-def refresh_pyaudio_session(
-    pyaudio_instance: "pyaudio.PyAudio | None",
-    input_device_index: int | None,
-    find_default_input_device: Callable[["pyaudio.PyAudio"], int],
-    blocked_workers: "Callable[[], Sequence[threading.Thread | None]] | None" = None,
-) -> tuple["pyaudio.PyAudio | None", int | None]:
-    """Device-change reset (issue #72), called at the top of the recording
-    worker before the retry loop.
-
-    The trigger is a live CoreAudio read, not a PortAudio device-count
-    comparison: PortAudio snapshots the hardware once at Pa_Initialize, so a
-    comparison against a cached instance can never observe a switch. A reset
-    drives PortAudio's init count to zero through the session's registry
-    before rebuilding -- a single untracked live instance is enough to make
-    the next construction replay the frozen device list.
-
-    An instance with no owning registry is left untouched: either the session
-    was never bound (the retry loop builds and registers it) or the instance
-    came from outside this session, and in neither case is there a tracked set
-    to drive to zero.
-
-    ``blocked_workers`` names the threads whose native call this reset must
-    not run under; the names resolve through the callable at GATE time, so a
-    thread named before a long join cannot mask a newer live worker. Busy is
-    reported by leaving the session exactly as it is.
-
-    Returns (pyaudio_instance, input_device_index) -- possibly both replaced.
-    The caller is responsible for any lock scoping.
-    """
-    registry = registry_for(pyaudio_instance)
-    if registry is None:
-        return pyaudio_instance, input_device_index
-    result = registry.refresh(
-        find_default_input_device, blocked_workers=blocked_workers
-    )
-    if result.busy:
-        # The press proceeds against the stale session (the only safe move
-        # while a thread may be inside a native call), but the deferral has to
-        # be visible in the same log stream as the open attempts.
-        print(
-            "[audio.retry] device reset deferred: a worker may still hold "
-            "PortAudio; session stays dirty for the next press."
-        )
-    return result.pyaudio, result.input_device_index
 
 
 def close_stream_quietly(stream: "pyaudio.Stream") -> None:

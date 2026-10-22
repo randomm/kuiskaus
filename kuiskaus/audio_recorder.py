@@ -262,15 +262,6 @@ class AudioRecorder:
             self.stream = None
             self.recording_thread = None
 
-    def _refresh_pyaudio_session(self, blocked: threading.Thread | None = None) -> None:
-        """Live-default device reset (issue #72) at the top of the worker.
-        Native calls run OUTSIDE _lock (issue #60): they can block and
-        stop_recording() needs the lock. The behaviour is in
-        ``audio_warm_arm.refresh_recorder_session``, the seam the warm
-        reopen shares; ``blocked`` is the worker this one just joined.
-        """
-        refresh_recorder_session(self, blocked)
-
     def _rearm_warm(self, usable: bool) -> None:
         """Re-arm the keep-warm capture after a reset replaced its session.
         The rule (and why a busy path must not arm over a wedged reader) is
