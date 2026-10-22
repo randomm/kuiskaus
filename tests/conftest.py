@@ -61,7 +61,7 @@ def pytest_configure(config: pytest.Config) -> None:
 def _clean_kuiskaus_debug_env(monkeypatch: pytest.MonkeyPatch):
     """Reset KUISKAUS_DEBUG for every test.
 
-    The hotkey listeners read it once at import (issue #72); tests that
+    The hotkey listeners read it once at import (issue #22); tests that
     set the env var (e.g. the env-var wiring test) must not leak it into
     other tests' module loads.
     """

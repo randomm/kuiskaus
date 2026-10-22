@@ -1,4 +1,4 @@
-"""test_audio_recorder tests, part 5 of 6 (issue #72)."""
+"""test_audio_recorder tests, part 5 of 6 (issue #70)."""
 
 import threading
 from unittest.mock import MagicMock
@@ -133,8 +133,7 @@ def test_on_capture_started_skipped_when_generation_superseded(
     # (the generation no longer matches my_gen) and its post-loop
     # teardown is generation-gated, so it never clears recording for
     # this generation; the only deterministic observable is the stream
-    # closure below. Wait on that instead of the transient thread handle
-    # .
+    # closure below. Wait on that instead of the transient thread handle.
     assert _wait_until(lambda: stream.close.called, timeout=5.0)
 
     assert callback.call_count == 0
@@ -271,7 +270,7 @@ def test_on_capture_started_fires_after_retry_adoption(audio_recorder_module):
 
 
 # ---------------------------------------------------------------------------
-# Native sample rate (issue #72)
+# Native sample rate (issue #55)
 # ---------------------------------------------------------------------------
 def test_open_stream_uses_native_rate_48000(audio_recorder_module):
     """Issue #55: a device reporting defaultSampleRate=48000.0 must have

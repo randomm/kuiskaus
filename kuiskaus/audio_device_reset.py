@@ -25,7 +25,7 @@ from kuiskaus.audio_coreaudio import (
     session_needs_reset,
 )
 from kuiskaus.audio_rebuild_budget import MAX_RESET_REBUILDS
-from kuiskaus.audio_retry import MICROPHONE_BUSY, microphone_unavailable
+from kuiskaus.audio_retry import MICROPHONE_BUSY
 from kuiskaus.audio_worker_keep import terminate_blocker, worker_may_be_native
 
 if TYPE_CHECKING:
@@ -61,10 +61,11 @@ MICROPHONE_NOT_SETTLING = "Microphone is not settling — try again in a moment"
 # stops implying the microphone might come back (issue #72).
 # Retrying forever is right -- forgetting a live instance would leave
 # PortAudio's init count above zero and make every later rebuild useless --
-# but retrying forever *silently* is what reproduced the issue's own symptom
-# inside the fix: busy on every press, device_id pinned to a dead device,
-# last_error None, the menubar showing Ready. Three is "the storm is not
-# transient", and it still leaves room for one.
+# but retrying forever *silently* is not: with no verdict the press reports
+# busy on every press, device_id stays pinned to a dead device, last_error
+# stays None, and the menubar shows Ready over a microphone that will never
+# come back. Three is "the storm is not transient", and it still leaves room
+# for one.
 MAX_TERMINATE_FAILURES = 3
 
 # How long a session that gave up on its teardown waits before asking
@@ -280,6 +281,48 @@ def reset_session(
         # never as an absence either. Nothing was proved about the session,
         # so nothing here may clear a verdict an earlier press earned.
         return _unchanged(registry)
+    settled = _settled_or_refused(registry, live)
+    if settled is not None:
+        return settled
+    blocked = _native_blocker(registry, warm, blocked_workers)
+    if blocked is not None:
+        print(f"Device reset deferred: {blocked} may still be native.")
+        return _unchanged(registry, busy=True)
+    if not registry.warm.drop(warm):
+        # The stuck read owns a capture whose stop event is already set:
+        # when the read returns the thread exits and THIS capture can never
+        # re-open. Left installed, the next press that needs no reset would
+        # be admitted and record silently into a dead sink, so the hand-back
+        # below tells the recorder to drop it -- later presses take the
+        # worker path.
+        #
+        # Dropped for presses, NOT gone for PortAudio: WarmKeep kept the
+        # only remaining handle on that thread, and that handle is what
+        # gates every later terminate_all() until the thread has actually
+        # exited. The hand-back asks for that SAME object to be dropped
+        # again; WarmKeep.drop() answers with a probe, not a second join.
+        print("Keep-warm capture would not stop; dropping it.")
+        _hand_back_capture(registry, warm, rearm_warm, ask_recovery=False)
+        return _unchanged(registry, busy=True)
+    if not registry.terminate_all():
+        # Busy: the session stays dirty and the next press retries. The
+        # capture was stopped cleanly above and is dead for presses
+        # either way, so hand it back and ask for recovery (see
+        # _hand_back_capture).
+        _hand_back_capture(registry, warm, rearm_warm, ask_recovery=True)
+        return _unchanged(registry, busy=True)
+    return _rebuild(registry, live, warm, rearm_warm, find_default_input_device)
+
+
+def _settled_or_refused(
+    registry: PyAudioRegistry, live: LiveDefaultInput
+) -> SessionRefresh | None:
+    """Whether this press needs a rebuild at all, or None if it does.
+
+    Two refusals, in the order the caller read them: the session already
+    agrees with the system (settle the budget and stand down), or the
+    teardown backoff is still open on evidence this press has not changed.
+    """
     if not session_needs_reset(live, registry.device_id) or (
         live == registry.last_reset
     ):
@@ -317,51 +360,48 @@ def reset_session(
         # being refused for the rest of the window without the device ever
         # having been read.
         return _unchanged(registry, busy=True)
+    return None
 
-    # Never drive PortAudio's init count to zero while another thread may
-    # be inside a native open() or stream.read() on a registered instance:
-    # that is the state cleanup() refuses to terminate in (issue #37
-    # task-c). The ledger (registry.workers / registry.warm) is the
-    # authority -- it names every worker this session started, including an
-    # issue #60 orphan whose name its successor already cleared, and the
-    # capture installed in the arm whether or not this caller handed one
-    # over. blocked_workers is the belt to that braces: the threads the
-    # caller joined and can speak for, resolved through the callable at
-    # GATE time so a finished W1 cannot mask a live W2. The thread running
-    # this reset is never its own blocker. Busy, not half-reset -- nothing
-    # here is torn down, so the session stays dirty and the next press
-    # asks again.
+
+def _native_blocker(
+    registry: PyAudioRegistry,
+    warm: WarmCapture | None,
+    blocked_workers: Callable[[], Sequence[threading.Thread | None]] | None,
+) -> str | None:
+    """Why PortAudio may not be driven to zero on this press, or None.
+
+    Never drive PortAudio's init count to zero while another thread may
+    be inside a native open() or stream.read() on a registered instance:
+    that is the state cleanup() refuses to terminate in (issue #37
+    task-c). The ledger (registry.workers / registry.warm) is the
+    authority -- it names every worker this session started, including an
+    issue #60 orphan whose name its successor already cleared, and the
+    capture installed in the arm whether or not this caller handed one
+    over. blocked_workers is the belt to that braces: the threads the
+    caller joined and can speak for, resolved through the callable at
+    GATE time so a finished W1 cannot mask a live W2. The thread running
+    this reset is never its own blocker.
+    """
     blocked = terminate_blocker(registry.workers, registry.warm, exempt=warm)
     if blocked is None and worker_may_be_native(blocked_workers):
-        blocked = "named recording worker"
-    if blocked is not None:
-        print(f"Device reset deferred: {blocked} may still be native.")
-        return _unchanged(registry, busy=True)
+        return "named recording worker"
+    return blocked
 
-    if not registry.warm.drop(warm):
-        # The stuck read owns a capture whose stop event is already set:
-        # when the read returns the thread exits and THIS capture can never
-        # re-open. Left installed, the next press that needs no reset would
-        # be admitted and record silently into a dead sink, so
-        # rearm_warm(False) tells the recorder to drop it -- later presses
-        # take the worker path.
-        #
-        # Dropped for presses, NOT gone for PortAudio: WarmKeep kept the
-        # only remaining handle on that thread, and that handle is what
-        # gates every later terminate_all() until the thread has actually
-        # exited. The hand-back asks for that SAME object to be dropped
-        # again; WarmKeep.drop() answers with a probe, not a second join.
-        print("Keep-warm capture would not stop; dropping it.")
-        _hand_back_capture(registry, warm, rearm_warm, ask_recovery=False)
-        return _unchanged(registry, busy=True)
 
-    if not registry.terminate_all():
-        # Busy: the session stays dirty and the next press retries. The
-        # capture was stopped cleanly above and is dead for presses
-        # either way, so hand it back and ask for recovery (see
-        # _hand_back_capture).
-        _hand_back_capture(registry, warm, rearm_warm, ask_recovery=True)
-        return _unchanged(registry, busy=True)
+def _rebuild(
+    registry: PyAudioRegistry,
+    live: LiveDefaultInput,
+    warm: WarmCapture | None,
+    rearm_warm: Callable[[bool], None] | None,
+    find_default_input_device: Callable[[pyaudio.PyAudio], int],
+) -> SessionRefresh:
+    """Tear the engine down and build the session again on the live device.
+
+    The caller has proved nothing native is in flight and the keep-warm
+    capture is stopped, so PortAudio's init count can be driven to zero here.
+    Busy, not half-reset: nothing here is torn down on a bail-out, so the
+    session stays dirty and the next press asks again.
+    """
     registry.pyaudio = None
     registry.forget_index()
     rebuilt = registry.open(find_default_input_device)
@@ -416,71 +456,6 @@ def reset_session(
     return _unchanged(registry)
 
 
-def press_is_admissible(
-    registry: PyAudioRegistry,
-    recording: bool,
-    warm: WarmCapture | None,
-    worker: threading.Thread | None,
-    find_default_input_device: Callable[[pyaudio.PyAudio], int],
-    rearm_warm: Callable[[bool], None],
-) -> bool:
-    """The keep-warm press gate (issue #72): run the live-default
-    check, or say why this press must not run it.
-
-    The gate lives next to the reset it protects: a press the recorder is
-    about to refuse (``recording``) must NOT reach the reset -- it would stop
-    the warm capture feeding that live recording and rebuild the session
-    underneath it -- and a press with no warm capture has no press-side reset
-    to run at all (its worker resets at the top of its own loop). Both are
-    admitted (True). An admitted keep-warm press runs the reset itself;
-    False = fail this press, and ``press_refusal_reason`` is what the user is
-    told about it.
-    """
-    if recording or warm is None:
-        return True
-    return not reset_session(
-        registry, find_default_input_device, warm, rearm_warm, lambda: (worker,)
-    ).busy
-
-
-def press_refusal_reason(registry: PyAudioRegistry) -> str:
-    """Why an admitted press was refused (issue #72).
-
-    The two refusals look alike to the press and are not alike. A ledger
-    deferral -- a worker or a warm capture still inside a native call --
-    releases itself, and "busy" is the honest word. A session whose teardown
-    has refused ``MAX_TERMINATE_FAILURES`` in a row never does, and telling
-    that user "busy" is exactly how the #72 symptom survived inside the PR
-    written to remove it: busy on every press, last_error None, menubar
-    Ready.
-    """
-    if registry.needs_restart:
-        return restart_verdict(registry)
-    return MICROPHONE_BUSY
-
-
-def unavailable_reason(
-    registry: PyAudioRegistry, last_error: BaseException | None
-) -> str:
-    """What an exhausted retry loop leaves in ``recorder.last_error``.
-
-    The worker path has no press-side refusal to hang the restart verdict on
-    -- its press is admitted and the retry loop is what fails -- so the same
-    poisoned session surfaces here instead. While the teardown still has
-    budget left this keeps ``microphone_unavailable``'s wording: a storm that
-    clears must not be announced as an app restart. Once it does not, the
-    underlying error still rides along -- "needs a restart" alone tells the
-    user nothing about what the microphone actually did, and the errno is
-    what makes a -9986 storm recognisable in a bug report.
-    """
-    if registry.needs_restart:
-        verdict = restart_verdict(registry)
-        if last_error is None:
-            return verdict
-        return f"{verdict} ({last_error})"
-    return microphone_unavailable(last_error)
-
-
 # Re-exported for callers that name the entry point rather than the module.
 __all__ = [
     "MAX_TERMINATE_FAILURES",
@@ -489,9 +464,6 @@ __all__ = [
     "MICROPHONE_NOT_SETTLING",
     "SessionRefresh",
     "note_terminate_outcome",
-    "press_is_admissible",
-    "press_refusal_reason",
     "reset_session",
     "restart_verdict",
-    "unavailable_reason",
 ]

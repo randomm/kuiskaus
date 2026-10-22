@@ -1,35 +1,30 @@
 """Recorder transitions and gates that must be serialised under _lock.
 
-Split out of ``audio_recorder`` (at its 500-line cap) for issue #72. Every
-helper here decides or mutates recorder state that has more than one caller
-thread, and each hazard was a window where that state could change between
-the check and the act:
+Every helper here decides or mutates recorder state that has more than one
+caller thread, and each hazard is a window where that state can change
+between the check and the act:
 
-* the keep-warm capture was armed by a lock-free check-then-act, and
-  #72 gave arming two extra caller threads (the worker's
-  ``warm.recover(self._rearm_warm)`` hand-back, a hotkey press's
-  ``rearm_warm(True)`` after a device reset). Two threads could both
-  pass the ``_warm is None`` check and both start a capture; the loser
-  is referenced by nobody and absent from ``WarmKeep._blockers``, so
-  ``terminate_all()`` drives PortAudio out from under it. ``WarmArm``
-  makes arm/drop one atomic transition under the recorder's own lock
-  (passed in, not duplicated: the capture is recorder state and every
-  other reader holds that lock), install and thread-spawn included -- a
-  concurrent ``take()`` can never slip in between them.
-* the same re-arm forced keep-warm back ON. A reset runs outside the
-  recorder lock for as long as a full teardown and rebuild, and its
-  hand-back went through ``set_keep_warm(True)``, which records the
-  request as well as satisfying it -- so a menu uncheck landing inside
-  that window was erased, the capture re-armed, and the mic left open
-  behind an unchecked menu item. ``WarmArm.rearm`` satisfies the
-  request the user actually has, read under the same lock as the arm
-  (``set_enabled`` -- the menu's path -- takes that lock too, so the
-  check and the act cannot be split by a click).
-* the reset gate trusted a worker name captured before a join of up to
-  30 s; by gate time that worker may have finished and a live one
-  become current. ``worker_may_be_native`` resolves the names through
-  a callable at gate time, and ``warm_press_gate`` snapshots the press
-  state under the lock instead of reading three fields one by one.
+* arming the keep-warm capture by a check-then-act outside the lock lets two
+  caller threads both pass the ``_warm is None`` check and both start a
+  capture. The loser is referenced by nobody and absent from
+  ``WarmKeep._blockers``, so ``terminate_all()`` drives PortAudio out from
+  under it. ``WarmArm`` makes arm/drop one atomic transition under the
+  recorder's own lock (passed in, not duplicated: the capture is recorder
+  state and every other reader holds that lock), install and thread-spawn
+  included -- a concurrent ``take()`` can never slip in between them.
+* a re-arm must never turn keep-warm back ON. A reset runs outside the
+  recorder lock for as long as a full teardown and rebuild, and a hand-back
+  that goes through ``set_keep_warm(True)`` records the request as well as
+  satisfying it -- so a menu uncheck landing inside that window is erased,
+  the capture re-armed, and the mic left open behind an unchecked menu item.
+  ``WarmArm.rearm`` satisfies the request the user actually has, read under
+  the same lock as the arm (``set_enabled`` -- the menu's path -- takes that
+  lock too, so the check and the act cannot be split by a click).
+* a worker name captured before a join of up to 30 s may be stale by gate
+  time: that worker may have finished and a live one become current.
+  ``worker_may_be_native`` resolves the names through a callable at gate
+  time, and ``warm_press_gate`` snapshots the press state under the lock
+  instead of reading three fields one by one.
 
 Lock discipline (issue #60): no native call -- PortAudio open/terminate,
 ``thread.start()``, ``thread.join()`` -- ever runs under the recorder
@@ -165,13 +160,12 @@ class WarmArm:
     def rearm(self, make_capture: Callable[[], WarmCapture]) -> None:
         """Bring the capture back IF the user still wants keep-warm.
 
-        The reset's and the recovery's hand-back used to go through
-        ``set_enabled(True)``, which also WRITES the request -- so a menu
-        uncheck landing during the reset (which runs outside this lock, for
-        as long as a teardown and rebuild takes) was silently reversed and the
-        microphone left open behind an unchecked menu item (issue #72).
-        This path satisfies the request; it never makes one. The request is
-        read under this same lock, so a concurrent menu
+        This path satisfies the request; it never makes one, and it must not:
+        a hand-back that also WRITES the request would silently reverse a
+        menu uncheck landing during the reset (which runs outside this lock,
+        for as long as a teardown and rebuild takes) and leave the
+        microphone open behind an unchecked menu item (issue #72). The
+        request is read under this same lock, so a concurrent menu
         click cannot land between the check and the arm.
         """
         with self._lock:
@@ -377,10 +371,9 @@ def rearm_warm(recorder: RecorderState, usable: bool) -> None:
 def open_warm_capture_stream(
     recorder: RecorderState, pa_module: ModuleType
 ) -> tuple[pyaudio.Stream, int]:
-    """One open for WarmCapture's thread (moved from the recorder, which
-    is at its 500-line cap): never overlaps a per-press worker's native
-    open on the shared PyAudio (issue #16). ``previous`` is named again
-    by the gate at call time -- see ``worker_may_be_native``.
+    """One open for WarmCapture's thread: never overlaps a per-press
+    worker's native open on the shared PyAudio (issue #16). ``previous`` is
+    named again by the gate at call time -- see ``worker_may_be_native``.
     """
     previous = recorder.recording_thread
     if previous is not None and previous.is_alive():
@@ -412,13 +405,12 @@ def finish_recording(
     start_monotonic: float | None,
     warm: WarmCapture | None,
     capture_rate: int | None,
-):
+) -> np.ndarray:
     """The part of ``stop_recording()`` that runs after the release.
 
-    Joined here rather than kept inline because the recorder is at its
-    500-line cap, not because the two halves are unrelated: this is the
-    worker join plus the drain, and the ``[audio.stop]`` reason it logs is
-    read off observable state (issue #40).
+    The worker join plus the drain, kept as one sequence because the
+    ``[audio.stop]`` reason it logs is read off observable state across all
+    of it (issue #40).
     """
     stuck_open = False
     if thread is not None:
@@ -454,11 +446,9 @@ def finish_recording(
 
 
 def cleanup_recorder_session(recorder: RecorderState) -> None:
-    """Clean up PyAudio resources (moved from the recorder, which is at
-    its 500-line cap). terminate() is skipped -- and logged -- if a
-    worker may still be alive, since terminate() while another thread
-    holds a stream is unsafe (lock-scoped local-capture pattern,
-    issue #37 task-c).
+    """Clean up PyAudio resources. terminate() is skipped -- and logged --
+    if a worker may still be alive, since terminate() while another thread
+    holds a stream is unsafe (lock-scoped local-capture pattern, issue #37).
     """
     if recorder.recording:
         recorder.stop_recording()

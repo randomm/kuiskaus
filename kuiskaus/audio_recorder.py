@@ -37,7 +37,7 @@ from kuiskaus.audio_warm_arm import (
 )
 
 # Aliases for annotations written inside the class body, where the
-# ``pyaudio`` property (issue #72) otherwise shadows the module name.
+# ``pyaudio`` property otherwise shadows the module name.
 _PyAudio = pyaudio.PyAudio
 _Stream = pyaudio.Stream
 
@@ -301,25 +301,23 @@ class AudioRecorder:
     ) -> None:
         """Worker thread for continuous audio recording.
 
-        Every shared-state write here (failure path, adoption,
-        post-loop teardown) is gated on ``self._generation == my_gen``
-        so a late/stale worker can never clobber a newer recording's
-        state. The live-default device reset runs first: it rebuilds the
-        cached PyAudio session when the default input device moved, and
-        constructs on-demand if __init__ failed.
+        Every shared-state write here (failure path, adoption, post-loop
+        teardown) is gated on ``self._generation == my_gen`` so a late/stale
+        worker can never clobber a newer recording's state.
+
+        Nothing in this thread may escape: a raise anywhere in it would leave
+        recording=True with no last_error and no worker -- a recorder that
+        stopped answering, rather than one that failed. Same gate as every
+        other write here.
 
         ``previous`` is an orphaned worker still blocked in a native open
         (issue #60): wait for it first so two opens never overlap on the
         shared PyAudio instance.
         """
-        # Nothing in this thread may escape: a raise anywhere in it would
-        # leave recording=True with no last_error and no worker -- a recorder
-        # that stopped answering, rather than one that failed. Same
-        # generation gate as every other write in this function.
         try:
             self._run_worker_session(my_gen, previous)
         except Exception as worker_error:  # noqa: BLE001 - worker thread boundary
-            print(f"Error in the recording worker: {worker_error}")
+            print(f"Error in the recording worker: {str(worker_error)[:120]}")
             fail_worker_session(self, my_gen, worker_error)
 
     def _run_worker_session(
@@ -337,7 +335,7 @@ class AudioRecorder:
             # Keep-warm does not re-arm itself after a stuck-read drop.
             self._session.warm.recover(self._rearm_warm)
         except Exception as head_error:  # noqa: BLE001 - worker thread boundary
-            print(f"Error preparing the recording session: {head_error}")
+            print(f"Error preparing the recording session: {str(head_error)[:120]}")
             fail_worker_session(self, my_gen, head_error)
             return
         stream = self._open_stream_with_retry(my_gen)

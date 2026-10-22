@@ -27,9 +27,11 @@ from kuiskaus.audio_device_index import DeviceIndexBinding
 from kuiskaus.audio_device_reset import (
     SessionRefresh,
     note_terminate_outcome,
+    reset_session,
+)
+from kuiskaus.audio_press_gate import (
     press_is_admissible,
     press_refusal_reason,
-    reset_session,
     unavailable_reason,
 )
 from kuiskaus.audio_rebuild_budget import RebuildBudget
@@ -94,11 +96,11 @@ class PyAudioRegistry:
         # ``_warm`` at that same moment, so this is the only handle left that
         # can name those threads (see WarmKeep).
         self.warm = WarmKeep()
-        # Every worker this session started. The reset gate used to decide
-        # from the two thread names its caller happened to pass, and the
+        # Every worker this session started. The gate decides from this
+        # ledger, not from the thread names its caller happens to pass: the
         # recorder drops a wedged worker's name as soon as its successor
-        # clears recording_thread -- so the gate could be told "nothing is
-        # alive" by a caller that had simply lost the name.
+        # clears recording_thread, so a caller can honestly report "nothing is
+        # alive" having simply lost the name.
         self.workers = WorkerKeep()
         # Consecutive teardowns an instance refused, and the verdict they add
         # up to. terminate_all() is the one call that knows whether a refusal

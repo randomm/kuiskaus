@@ -19,22 +19,12 @@ of the process.
 from __future__ import annotations
 
 import threading
-from unittest.mock import MagicMock
 
 import pytest
 
-from kuiskaus.audio_device import PyAudioRegistry
 from kuiskaus.audio_worker_keep import WorkerKeep
+from tests.support_audio_device import _registry
 from tests.support_audio_recorder import _cleanup_recorder, _make_recorder
-
-
-def _registry(pa_module=None):
-    """A registry over a stubbed pyaudio module yielding one fresh mock
-    instance per construction."""
-    module = pa_module or MagicMock(name="pyaudio-module")
-    pa = MagicMock(name="PyAudioInstance")
-    module.PyAudio = MagicMock(return_value=pa)
-    return PyAudioRegistry(module), pa, module
 
 
 def _live_thread() -> tuple[threading.Event, threading.Thread]:

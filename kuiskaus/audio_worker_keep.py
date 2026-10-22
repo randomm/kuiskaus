@@ -2,9 +2,9 @@
 
 ``PyAudioRegistry.terminate_all()`` drives PortAudio's init count to zero,
 and doing that while a thread sits inside ``Pa_OpenStream`` is undefined
-behaviour -- it is the state ``cleanup()`` exists to refuse (issue #37
-task-c). The reset gate asked its CALLER to name those threads, and the
-caller only ever had two names to give: the worker it joined and the one it
+behaviour -- it is the state ``cleanup()`` exists to refuse (issue #37). The
+reset gate needs those threads named, and a caller can only name two: the
+worker it joined and the one it
 is starting. A worker wedged inside ``pa.open()`` (issue #60 orphan) stops
 being nameable the moment its successor clears ``recording_thread``, so four
 ordinary presses reached the terminate (issue #72): the wedge outlives the

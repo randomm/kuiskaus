@@ -1,6 +1,6 @@
-"""Shared helpers for the test_audio_recorder test modules (issue #72).
+"""Shared helpers for the test_audio_recorder test modules (issue #70).
 
-Hardware-free unit tests for AudioRecorder (issue #72).
+Hardware-free unit tests for AudioRecorder (issue #16).
 
 A failed microphone open must cost the user one recording, visibly -- not
 the session. These tests exercise the concurrency guard (lock + liveness
@@ -58,7 +58,7 @@ def _assert_stop_log_line(
 ) -> None:
     """Assert exactly one well-formed ``[audio.stop] chunks=<n>
     duration_ms=<m> reason=<value>`` line in captured stdout, with the
-    given reason (issue #72). Optionally pin the chunks count and a
+    given reason (issue #40). Optionally pin the chunks count and a
     duration_ms floor. Shared by the four empty-return reason tests so
     the line shape is asserted in one place."""
     log_lines = [
@@ -115,7 +115,7 @@ def _make_pyaudio_instance(
 ) -> MagicMock:
     """A mock PyAudio() instance with a resolvable default input device.
 
-    ``rate`` adds a native ``defaultSampleRate`` to the device info (issue #72).
+    ``rate`` adds a native ``defaultSampleRate`` to the device info (issue #55).
     """
     device_info: dict = {"index": index}
     if rate is not None:

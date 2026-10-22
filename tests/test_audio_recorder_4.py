@@ -1,4 +1,4 @@
-"""test_audio_recorder tests, part 4 of 6 (issue #72)."""
+"""test_audio_recorder tests, part 4 of 6 (issue #70)."""
 
 import re
 import threading

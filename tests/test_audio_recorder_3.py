@@ -1,4 +1,4 @@
-"""test_audio_recorder tests, part 3 of 6 (issue #72)."""
+"""test_audio_recorder tests, part 3 of 6 (issue #70)."""
 
 import threading
 import time
@@ -190,7 +190,7 @@ def test_press_while_actively_recording_is_still_refused(audio_recorder_module):
 
 def test_refresh_does_not_hold_lock_during_native_calls(audio_recorder_module):
     """stop_recording() (hotkey release) needs _lock; the device reset
-    calls native PortAudio and can block for seconds (issue #72), so it
+    calls native PortAudio and can block for seconds (issue #60), so it
     must run without holding the lock."""
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
