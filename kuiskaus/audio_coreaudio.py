@@ -119,7 +119,7 @@ def _read_uint32(object_id: int, selector: int, scope: int, element: int) -> int
         address = CoreAudio.AudioObjectPropertyAddress(selector, scope, element)
         status, _size, raw = CoreAudio.AudioObjectGetPropertyData(
             object_id, address, 0, _NO_QUALIFIER, _SIZE_BYTES, _OUT_BUFFER
-        )  # fmt: skip
+        )
     except Exception as e:  # noqa: BLE001 - PyObjC/CoreAudio boundary, logged
         # Bounded: a bridge failure can dump a whole property list or an
         # Objective-C description, and this line lands on the press path
@@ -138,12 +138,18 @@ def _read_uint32(object_id: int, selector: int, scope: int, element: int) -> int
                 "treating as no evidence."
             )
         return None
-    if not isinstance(raw, (bytes, bytearray, memoryview)) or len(raw) != _SIZE_BYTES:
+    # ``len`` of a memoryview counts ELEMENTS, not bytes, so the check is on
+    # the bytes the caller needs -- a wider element type would otherwise pass
+    # a length test with the wrong amount of data behind it.
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
         # Not a UInt32 at all: the bridge handed back something the property
         # contract does not describe, which is no evidence rather than a
         # number to guess at.
         return None
-    return int.from_bytes(bytes(raw), sys.byteorder)
+    payload = bytes(raw)
+    if len(payload) != _SIZE_BYTES:
+        return None
+    return int.from_bytes(payload, sys.byteorder)
 
 
 def read_live_default_input() -> LiveDefaultInput | None:

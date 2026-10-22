@@ -246,7 +246,7 @@ def _dispose_attempt_instance(
 ) -> None:
     """Terminate an instance the attempt itself constructed, and untrack it: a
     terminated instance left in the registry would be terminated twice, and an
-    *untracked* live one is what keeps PortAudio's init count above zero."""  # fmt: skip
+    *untracked* live one is what keeps PortAudio's init count above zero."""
     if registry is None:
         terminate_quietly(pa)
     else:

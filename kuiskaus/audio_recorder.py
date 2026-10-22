@@ -27,6 +27,7 @@ from kuiskaus.audio_warm_arm import (
     WarmArm,
     announce_capture,
     cleanup_recorder_session,
+    fail_worker_session,
     finish_recording,
     open_warm_capture_stream,
     rearm_warm,
@@ -146,13 +147,17 @@ class AudioRecorder:
         callee under _lock -- its single arbiter (issue #55)."""
         return lambda: self._generation != my_gen or not self.recording
 
-    def _check_superseded(self, my_gen: int, attempt: int, attempt_start: float) -> bool:  # fmt: skip
+    def _check_superseded(
+        self, my_gen: int, attempt: int, attempt_start: float
+    ) -> bool:
         """True (and logged) if this retry sequence lost its race."""
         return check_superseded(
             self._lock,
             self._stale(my_gen),
-            attempt, self.max_attempts, attempt_start,
-        )  # fmt: skip
+            attempt,
+            self.max_attempts,
+            attempt_start,
+        )
 
     def _adopt_and_dispose_previous(
         self,
@@ -170,8 +175,13 @@ class AudioRecorder:
             self._stale(my_gen),
             lambda rate: setattr(self, "_capture_rate", rate),
             lambda: self.stream is not None,
-            new_pa, stream, capture_rate, attempt, attempt_start, self.max_attempts,
-        )  # fmt: skip
+            new_pa,
+            stream,
+            capture_rate,
+            attempt,
+            attempt_start,
+            self.max_attempts,
+        )
 
     def _open_stream_with_retry(self, my_gen: int) -> "_Stream | None":
         """Open the input stream, retrying with backoff up to
@@ -247,21 +257,6 @@ class AudioRecorder:
                 self.recording_thread = None
         return None
 
-    def _fail_worker_session(self, my_gen: int, error: BaseException | None) -> None:
-        """Generation-gated teardown for a worker that never got a stream.
-
-        Shared by the exhausted retry loop and the worker's own head: either
-        way the press is over, and "recording" must not outlive the thread
-        that was recording it.
-        """
-        with self._lock:
-            if self._generation != my_gen:
-                return
-            self.last_error = self._session.unavailable_reason(error)
-            self.recording = False
-            self.stream = None
-            self.recording_thread = None
-
     def _rearm_warm(self, usable: bool) -> None:
         """Re-arm the keep-warm capture after a reset replaced its session.
         The rule (and why a busy path must not arm over a wedged reader) is
@@ -309,38 +304,63 @@ class AudioRecorder:
         Every shared-state write here (failure path, adoption,
         post-loop teardown) is gated on ``self._generation == my_gen``
         so a late/stale worker can never clobber a newer recording's
-        state. The device-change poll (issue #42) runs first: it
-        rebuilds the cached PyAudio session when the default input
-        device moved, and constructs on-demand if __init__ failed.
+        state. The live-default device reset runs first: it rebuilds the
+        cached PyAudio session when the default input device moved, and
+        constructs on-demand if __init__ failed.
 
         ``previous`` is an orphaned worker still blocked in a native open
         (issue #60): wait for it first so two opens never overlap on the
         shared PyAudio instance.
         """
+        # Nothing in this thread may escape: a raise anywhere in it would
+        # leave recording=True with no last_error and no worker -- a recorder
+        # that stopped answering, rather than one that failed. Same
+        # generation gate as every other write in this function.
+        try:
+            self._run_worker_session(my_gen, previous)
+        except Exception as worker_error:  # noqa: BLE001 - worker thread boundary
+            print(f"Error in the recording worker: {worker_error}")
+            fail_worker_session(self, my_gen, worker_error)
+
+    def _run_worker_session(
+        self, my_gen: int, previous: "threading.Thread | None"
+    ) -> None:
+        """The worker's body: reset the session, open, deliver, tear down."""
         if previous is not None:
             previous.join(timeout=PREVIOUS_WORKER_WAIT_SECONDS)
             with self._lock:
                 if self._generation != my_gen or not self.recording:
                     return  # released again while waiting
-        # The head of this worker reaches CoreAudio and the thread ledgers;
-        # an escaping exception here would leave recording=True with no
-        # last_error and no worker -- a recorder that stopped answering,
-        # rather than one that failed. Same generation gate as every other
-        # write in this function.
+        # The head of this worker reaches CoreAudio and the thread ledgers.
         try:
             refresh_recorder_session(self, previous)
             # Keep-warm does not re-arm itself after a stuck-read drop.
             self._session.warm.recover(self._rearm_warm)
         except Exception as head_error:  # noqa: BLE001 - worker thread boundary
             print(f"Error preparing the recording session: {head_error}")
-            self._fail_worker_session(my_gen, head_error)
+            fail_worker_session(self, my_gen, head_error)
             return
         stream = self._open_stream_with_retry(my_gen)
         if stream is None:
             return  # last_error already set (or generation superseded)
+        try:
+            self._adopt_and_run_loop(my_gen, stream)
+        finally:
+            # The stream this worker owns goes with it, however the body
+            # ended -- including a raise, which the caller's guard turns into
+            # a failed press but cannot close.
+            close_stream_quietly(stream)
+
+        with self._lock:
+            if self._generation == my_gen:
+                self.recording = False
+                self.stream = None
+                self.recording_thread = None
+
+    def _adopt_and_run_loop(self, my_gen: int, stream: "_Stream") -> None:
+        """Adopt the opened stream and read it until the press is released."""
         with self._lock:
             if self._generation != my_gen:
-                close_stream_quietly(stream)
                 return
             self.stream = stream
             # Only clear last_error if this generation's session is
@@ -370,14 +390,6 @@ class AudioRecorder:
             self.audio_queue.put(data)
             if not capture_announced and len(data) > 0:
                 self._announce_capture(my_gen)
-
-        close_stream_quietly(stream)
-
-        with self._lock:
-            if self._generation == my_gen:
-                self.recording = False
-                self.stream = None
-                self.recording_thread = None
 
     def start_recording(self) -> bool:
         """Admit a new recording and spawn its worker (issue #16).
@@ -475,7 +487,7 @@ class AudioRecorder:
 
         return finish_recording(
             self, thread, my_gen, start_monotonic, warm, capture_rate
-        )  # fmt: skip
+        )
 
     def cleanup(self) -> None:
         """Clean up PyAudio resources. terminate() is skipped -- and

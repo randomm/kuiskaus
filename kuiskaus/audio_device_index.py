@@ -65,33 +65,35 @@ class DeviceIndexBinding:
             return None
         return index
 
-    def bind(self, device_index: int, resolved_on: pyaudio.PyAudio) -> None:
+    def bind(
+        self,
+        device_index: int,
+        resolved_on: pyaudio.PyAudio,
+        live: pyaudio.PyAudio | None,
+    ) -> None:
         """Publish an index a caller just resolved against ``resolved_on``.
 
-        The caller (``PyAudioRegistry.bind_index``) checks first that no
-        binding is already serving the live instance -- this class cannot:
-        it holds the owner, but the live instance lives in the registry.
-
-        One store of one tuple: see the class docstring for why the pair has
-        to BE the value rather than two fields written in some order.
+        The first binding wins: ``live`` is the instance the session is on,
+        and a binding already serving it stands -- two attempts in one press
+        can both resolve, and the one against the instance being opened on is
+        the one to keep. The check sits inside the lock with the write, so a
+        binding that arrived in between cannot be overwritten: which binding
+        stands is decided from the same value the write produces.
         """
         with self._lock:
-            self._pair = (device_index, resolved_on)
+            if self._pair[0] is not None and self._pair[1] is live:
+                return
+            self._store((device_index, resolved_on))
 
     def publish(self, device_index: int | None, live: pyaudio.PyAudio | None) -> None:
         """Write a (instance, index) pair a caller holds together (issue #72).
 
         The recorder's session write-back comes through here: the pair it
         holds was read as a pair, so the pairing is recorded as it was read
-        rather than inferred afterwards. One store of one tuple (class
-        docstring); an index of None is no binding at all, so it carries no
-        owner either.
+        rather than inferred afterwards. An index of None is no binding at
+        all, so it carries no owner either.
         """
-        with self._lock:
-            self._pair = (
-                device_index,
-                live if device_index is not None else None,
-            )  # fmt: skip
+        self._write((device_index, live if device_index is not None else None))
 
     def unbind(self, gone: pyaudio.PyAudio) -> None:
         """Forget the index if it came from ``gone``.
@@ -101,11 +103,22 @@ class DeviceIndexBinding:
         An instance that would not terminate is NOT passed here -- it is
         still live, and the binding is still a fact about it.
         """
-        with self._lock:
-            if self._pair[1] is gone:
-                self._pair = (None, None)
+        if self._pair[1] is gone:
+            self._write((None, None))
 
     def clear(self) -> None:
         """No index, no owner: nothing is resolved."""
+        self._write((None, None))
+
+    def _write(self, pair: tuple[int | None, pyaudio.PyAudio | None]) -> None:
+        """Take the lock and store one pair."""
         with self._lock:
-            self._pair = (None, None)
+            self._store(pair)
+
+    def _store(self, pair: tuple[int | None, pyaudio.PyAudio | None]) -> None:
+        """The one assignment to ``_pair``; the caller holds the lock.
+
+        See the class docstring for why the pair has to BE the value rather
+        than two fields written in some order.
+        """
+        self._pair = pair

@@ -61,8 +61,17 @@ def test_a_manual_switch_during_the_backoff_is_picked_up_next_press(
     assert result.busy is False, "the backoff refused a press that needed no teardown"
     assert result.pyaudio is settled
     assert registry.device_id == 250
-    assert registry.needs_restart is False
     assert registry.press_refusal_reason() != MICROPHONE_NEEDS_RESTART
+
+    # The cross-device count is the bound, so this press -- a rebuild --
+    # does not lift a verdict an earlier press earned; the press that does
+    # is the one that finds the session already agreeing with the live
+    # device, once the window it armed has expired.
+    assert registry.needs_restart is True
+    clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
+    assert registry.refresh(_find_device).busy is False
+    assert registry.needs_restart is False
+    assert registry.rebuild.count == 0
 
 
 def test_a_press_that_needs_no_teardown_is_admitted_inside_the_backoff(
@@ -114,10 +123,15 @@ def test_the_streak_survives_a_blink_inside_the_window(coreaudio_stub, monkeypat
     assert module.PyAudio.call_count <= reset_module.MAX_RESET_REBUILDS + 1
 
     # And it is deferred, not abandoned: the window expires, the press runs
-    # the teardown it was being refused, and the settled verdict is gone.
+    # the teardown it was being refused. That press is itself a rebuild, so
+    # the verdict goes with the NEXT press -- the one that finds the session
+    # agreeing with the live device (while the window is open, a press is
+    # not the settling evidence the budget was asking for).
     clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
     _live_default_input(coreaudio_stub, 88, is_alive=True)
-    registry.refresh(_find_device)
+    assert registry.refresh(_find_device).busy is False
+    clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
+    assert registry.refresh(_find_device).busy is False
     assert registry.needs_restart is False
 
 
@@ -208,8 +222,10 @@ def test_an_alternating_default_is_bounded_and_the_backoff_holds(
         # right after the storm that moved the default -- so the reset's
         # fallback records the pair THIS read saw, and the next press
         # legitimately sees the OTHER device.
-        patch.object(device_module, "read_live_default_input", MagicMock(return_value=None)),
-    ):  # fmt: skip
+        patch.object(
+            device_module, "read_live_default_input", MagicMock(return_value=None)
+        ),
+    ):
         for _ in range(reset_module.MAX_RESET_REBUILDS * 10):
             registry.refresh(_find_device)
 
@@ -349,5 +365,12 @@ def test_a_settled_device_is_recovered_by_the_retry_after_the_backoff(
     result = registry.refresh(_find_device)
 
     assert result.pyaudio is fresh
-    assert registry.needs_restart is False
     assert registry.device_id == 88
+    # The rebuild that recovered the session is still a rebuild, so the
+    # verdict it inherits goes when a press finds the session agreeing --
+    # not before, which is what keeps a flapping default from earning the
+    # budget back on every other press.
+    assert registry.needs_restart is True
+    clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
+    assert registry.refresh(_find_device).busy is False
+    assert registry.needs_restart is False

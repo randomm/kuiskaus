@@ -107,9 +107,9 @@ def coreaudio_stub(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     # asked for, so a stub that answers per-selector can tell the two
     # reads apart -- which is what makes "device moved" and "device not
     # alive" separately testable.
-    stub.AudioObjectPropertyAddress.side_effect = lambda selector, scope, element: SimpleNamespace(
-        mSelector=selector, mScope=scope, mElement=element
-    )  # fmt: skip
+    stub.AudioObjectPropertyAddress.side_effect = lambda selector, scope, element: (
+        SimpleNamespace(mSelector=selector, mScope=scope, mElement=element)
+    )
     stub.AudioObjectGetPropertyData.return_value = (1852797029, 0, None)
     monkeypatch.setitem(sys.modules, "CoreAudio", stub)
     # The unavailable-framework latch and the OSStatus log budget are

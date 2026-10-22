@@ -25,6 +25,7 @@ supports no weak reference while it is running.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -99,6 +100,29 @@ def _may_be_native(thread: threading.Thread) -> bool:
     exactly the arming window ``note()`` is called to cover -- treated as
     a blocker, the conservative direction, mirroring the warm side."""
     return thread.ident is None or thread.is_alive()
+
+
+def worker_may_be_native(
+    blocked_workers: Callable[[], Sequence[threading.Thread | None]] | None,
+) -> bool:
+    """True when a named worker may still be inside a native PortAudio
+    call.
+
+    The names are resolved through the callable AT GATE TIME, not
+    captured before the caller's long join: a finished W1 handed in
+    while a live W2 is the recorder's current worker must still read
+    busy. The thread running the reset is never its own blocker.
+
+    Lives beside the worker ledger rather than beside its callers because
+    that is the only question either ledger answers -- the warm side's
+    equivalent reads WarmKeep directly.
+    """
+    if blocked_workers is None:
+        return False
+    me = threading.current_thread()
+    return any(
+        t is not None and t is not me and t.is_alive() for t in blocked_workers()
+    )
 
 
 def terminate_blocker(

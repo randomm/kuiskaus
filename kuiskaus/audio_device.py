@@ -126,10 +126,9 @@ class PyAudioRegistry:
         its stream on the live one; a warm-up may construct its own). An
         instance PortAudio still counts must be findable by name here --
         ``terminate_all()`` is the only thing that can reach it."""
-        if pa not in self._instances:
-            with self._instances_lock:
-                if pa not in self._instances:
-                    self._instances.append(pa)
+        with self._instances_lock:
+            if pa not in self._instances:
+                self._instances.append(pa)
         return pa
 
     def forget(self, pa: pyaudio.PyAudio) -> None:
@@ -222,13 +221,9 @@ class PyAudioRegistry:
         paid a fresh enumeration. It goes with the instance it was resolved
         against, which is what keeps the hand-back from becoming the wedge: an
         index survived its instance once, and every later attempt then opened
-        on a dead device forever. A binding already serving the live instance
-        stands -- two attempts in one press can both resolve, and the one
-        against the instance being opened on is the one to keep.
+        on a dead device forever.
         """
-        if self.input_device_index is not None:
-            return
-        self._indices.bind(device_index, resolved_on)
+        self._indices.bind(device_index, resolved_on, self.pyaudio)
 
     def _dispose(self, pa: pyaudio.PyAudio) -> bool:
         """Terminate one instance and unbind everything that was a fact
@@ -336,7 +331,7 @@ class PyAudioRegistry:
             # failure modes aren't documented as a narrow exception set.
             print(
                 "Warning: PyAudio construction failed "
-                f"({construct_error}); will retry at the next recording."
+                f"({str(construct_error)[:120]}); will retry at the next recording."
             )
             # No instance, no baseline: a previous open's pair left standing
             # would have the dedupe guard vouch for a session that is gone.

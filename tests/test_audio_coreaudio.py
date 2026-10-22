@@ -114,6 +114,23 @@ def test_non_bytes_property_data_is_no_evidence(coreaudio_stub):
     assert audio_coreaudio._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) is None
 
 
+def test_a_memoryview_is_measured_in_bytes_not_elements(coreaudio_stub):
+    """``len`` of a memoryview counts ELEMENTS, so a 2-element view of 2-byte
+    items is 4 long and 2 bytes short of a UInt32. Reading it as a device id
+    would invent one out of a truncated buffer, so the check has to be on the
+    byte length."""
+    from kuiskaus import audio_coreaudio
+
+    short = memoryview(bytearray(b"\x60\x00\x00\x00" + b"\xff" * 28)).cast("Q")
+    assert len(short) == 4  # what a naive length check would accept
+    coreaudio_stub.AudioObjectGetPropertyData.return_value = (0, 4, short)
+    assert audio_coreaudio._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) is None
+
+    whole = memoryview(bytearray((96).to_bytes(4, audio_coreaudio.sys.byteorder)))
+    coreaudio_stub.AudioObjectGetPropertyData.return_value = (0, 4, whole)
+    assert audio_coreaudio._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) == 96
+
+
 def test_no_default_device_at_all_is_no_evidence(coreaudio_stub):
     """kAudioObjectUnknown (0) is CoreAudio's "there is no default input
     device", not a device. As a live read it would rebuild the session on

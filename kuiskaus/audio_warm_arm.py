@@ -40,9 +40,9 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from types import ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
@@ -60,9 +60,63 @@ if TYPE_CHECKING:
     import pyaudio
 
     from kuiskaus.audio_device import PyAudioRegistry
-    from kuiskaus.audio_recorder import AudioRecorder
     from kuiskaus.audio_warm import WarmCapture
     from kuiskaus.audio_warm_keep import WarmKeep
+
+
+class RecorderState(Protocol):
+    """What the warm/press procedures need from the recorder, as a contract.
+
+    These functions are the recorder's own warm-press procedure, moved out
+    of the class so the arming, the takeover and the teardown could be read
+    and tested as one sequence. They reach into the recorder's internals by
+    design -- ``_lock`` IS the recorder's lock, ``_warm_arm`` IS its capture
+    slot -- and naming that surface here is what keeps the arrangement honest:
+    this module no longer spells the concrete class, so what it may touch is
+    the protocol rather than whatever ``AudioRecorder`` happens to grow.
+
+    The names keep their underscores because they ARE the internals: this is
+    one component split across two modules, not a client of the recorder.
+    """
+
+    # Session, lock, and capture slot -- the shared state, owned by the
+    # recorder and driven under its own lock by everything in here.
+    _lock: threading.Lock
+    _session: PyAudioRegistry
+    _warm_arm: WarmArm
+    _generation: int
+    _stuck_open_timeout_seconds: float
+
+    # Public recorder state the takeover and the hand-backs rewrite.
+    recording: bool
+    recording_thread: threading.Thread | None
+    stream: pyaudio.Stream | None
+    last_error: str | None
+    audio_queue: queue.Queue[bytes]
+    pyaudio: pyaudio.PyAudio | None
+
+    # Stream configuration, read once at stream creation.
+    format: int
+    channels: int
+    sample_rate: int
+    chunk_size: int
+
+    # Read-only state: the recorder owns these, set by the open attempt.
+    @property
+    def input_device_index(self) -> int | None: ...
+
+    @property
+    def capture_rate(self) -> int | None: ...
+
+    def _announce_capture(self, my_gen: int) -> None: ...
+
+    def _make_warm_capture(self) -> WarmCapture: ...
+
+    def publish_session(
+        self, pa: pyaudio.PyAudio | None, device_index: int | None
+    ) -> None: ...
+
+    def stop_recording(self) -> np.ndarray | None: ...
 
 
 class WarmArm:
@@ -169,7 +223,7 @@ class WarmArm:
 
 
 def start_press(
-    recorder: AudioRecorder,
+    recorder: RecorderState,
     warm: WarmCapture | None,
     sink: queue.Queue[bytes],
     my_gen: int,
@@ -213,25 +267,6 @@ def start_press(
         raise
 
 
-def worker_may_be_native(
-    blocked_workers: Callable[[], Sequence[threading.Thread | None]] | None,
-) -> bool:
-    """True when a named worker may still be inside a native PortAudio
-    call (issue #72).
-
-    The names are resolved through the callable AT GATE TIME, not
-    captured before the caller's long join: a finished W1 handed in
-    while a live W2 is the recorder's current worker must still read
-    busy. The thread running the reset is never its own blocker.
-    """
-    if blocked_workers is None:
-        return False
-    me = threading.current_thread()
-    return any(
-        t is not None and t is not me and t.is_alive() for t in blocked_workers()
-    )
-
-
 def warm_press_gate(
     lock: threading.Lock,
     session: PyAudioRegistry,
@@ -252,7 +287,7 @@ def warm_press_gate(
     )
 
 
-def current_worker(recorder: AudioRecorder) -> threading.Thread | None:
+def current_worker(recorder: RecorderState) -> threading.Thread | None:
     """The worker named at CALL time, read under _lock: a name captured
     before a long join is stale by gate time -- a finished W1 must not mask a
     live W2 (issue #72).
@@ -262,7 +297,7 @@ def current_worker(recorder: AudioRecorder) -> threading.Thread | None:
 
 
 def refresh_recorder_session(
-    recorder: AudioRecorder, blocked: threading.Thread | None = None
+    recorder: RecorderState, blocked: threading.Thread | None = None
 ) -> None:
     """Live-default device reset (issue #72) at the top of the worker.
 
@@ -296,7 +331,27 @@ def refresh_recorder_session(
     recorder.publish_session(result.pyaudio, result.input_device_index)
 
 
-def rearm_warm(recorder: AudioRecorder, usable: bool) -> None:
+def fail_worker_session(
+    recorder: RecorderState, my_gen: int, error: BaseException | None
+) -> None:
+    """Generation-gated teardown for a worker that never got a stream.
+
+    Shared by the exhausted retry loop and both of the worker's guards: either
+    way the press is over, and "recording" must not outlive the thread that
+    was recording it. The message goes through the registry's wrapper so a
+    device the session already knows is gone reads differently from a busy
+    microphone.
+    """
+    with recorder._lock:
+        if recorder._generation != my_gen:
+            return
+        recorder.last_error = recorder._session.unavailable_reason(error)
+        recorder.recording = False
+        recorder.stream = None
+        recorder.recording_thread = None
+
+
+def rearm_warm(recorder: RecorderState, usable: bool) -> None:
     """Re-arm the keep-warm capture after a reset replaced its session.
 
     usable=False is the busy path: a capture that would not stop is dead for
@@ -320,7 +375,7 @@ def rearm_warm(recorder: AudioRecorder, usable: bool) -> None:
 
 
 def open_warm_capture_stream(
-    recorder: AudioRecorder, pa_module: ModuleType
+    recorder: RecorderState, pa_module: ModuleType
 ) -> tuple[pyaudio.Stream, int]:
     """One open for WarmCapture's thread (moved from the recorder, which
     is at its 500-line cap): never overlaps a per-press worker's native
@@ -335,9 +390,15 @@ def open_warm_capture_stream(
     # that enumerated it (#72).
     pa, device_index = recorder._session.snapshot()
     new_pa, stream, rate = open_warm_stream(
-        pa_module, pa, device_index, recorder.format, recorder.channels,
-        recorder.sample_rate, recorder.chunk_size, recorder._session,
-    )  # fmt: skip
+        pa_module,
+        pa,
+        device_index,
+        recorder.format,
+        recorder.channels,
+        recorder.sample_rate,
+        recorder.chunk_size,
+        recorder._session,
+    )
     if new_pa is not pa:
         with recorder._lock:
             recorder.pyaudio = new_pa
@@ -345,7 +406,7 @@ def open_warm_capture_stream(
 
 
 def finish_recording(
-    recorder: AudioRecorder,
+    recorder: RecorderState,
     thread: threading.Thread | None,
     my_gen: int,
     start_monotonic: float | None,
@@ -392,7 +453,7 @@ def finish_recording(
     return np.array([], dtype=np.float32)
 
 
-def cleanup_recorder_session(recorder: AudioRecorder) -> None:
+def cleanup_recorder_session(recorder: RecorderState) -> None:
     """Clean up PyAudio resources (moved from the recorder, which is at
     its 500-line cap). terminate() is skipped -- and logged -- if a
     worker may still be alive, since terminate() while another thread

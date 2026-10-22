@@ -26,8 +26,7 @@ from kuiskaus.audio_coreaudio import (
 )
 from kuiskaus.audio_rebuild_budget import MAX_RESET_REBUILDS
 from kuiskaus.audio_retry import MICROPHONE_BUSY, microphone_unavailable
-from kuiskaus.audio_warm_arm import worker_may_be_native
-from kuiskaus.audio_worker_keep import terminate_blocker
+from kuiskaus.audio_worker_keep import terminate_blocker, worker_may_be_native
 
 if TYPE_CHECKING:
     import threading
@@ -36,6 +35,11 @@ if TYPE_CHECKING:
 
     from kuiskaus.audio_device import PyAudioRegistry
     from kuiskaus.audio_warm import WarmCapture
+
+    # Annotation alias: the SessionRefresh field below is named ``pyaudio``,
+    # which would otherwise shadow the module inside its own class body (the
+    # same alias audio_retry.py uses for the same reason).
+    _PyAudio = pyaudio.PyAudio
 
 # The one true thing to say once the session has given up on tearing PortAudio
 # down. It lives beside the other press-failure text because both are what the
@@ -178,25 +182,48 @@ class SessionRefresh(NamedTuple):
     be inside a native call, so PortAudio was NOT terminated and the session
     stays dirty for the next press to retry."""
 
-    pyaudio: pyaudio.PyAudio | None
+    pyaudio: _PyAudio | None
     input_device_index: int | None
     busy: bool
 
 
-def _unchanged(
-    registry: PyAudioRegistry, *, busy: bool = False, unbound: bool = False
-) -> SessionRefresh:
+def _unchanged(registry: PyAudioRegistry, *, busy: bool = False) -> SessionRefresh:
     """A refresh result that leaves the session where it is.
 
     The pair is read from ``snapshot()`` as one value: an index is only a
     fact about the instance that enumerated it.
     """
-    if unbound:
-        return SessionRefresh(pyaudio=None, input_device_index=None, busy=busy)
     pyaudio_instance, device_index = registry.snapshot()
     return SessionRefresh(
         pyaudio=pyaudio_instance, input_device_index=device_index, busy=busy
     )
+
+
+def _rearm_after_reset(
+    registry: PyAudioRegistry,
+    rearm_warm: Callable[[bool], None] | None,
+    *,
+    usable: bool,
+) -> None:
+    """Hand the capture back, and keep a failed arming off the press.
+
+    ``WarmArm`` re-raises a capture whose ``start()`` failed, having already
+    undone the install and filed the recovery ask (an installed capture with
+    no thread reads as arming, so the name cannot be left behind). Nothing
+    is gained by carrying that raise up through the reset into the hotkey
+    callback: the press the user just made would die instead of falling back
+    to the worker path, and a later press recovers the capture through the
+    flag the arming already set.
+    """
+    if rearm_warm is None:
+        return
+    try:
+        rearm_warm(usable)
+    except Exception as arm_error:  # noqa: BLE001 - press-path boundary, logged
+        print(
+            f"Keep-warm hand-back failed ({str(arm_error)[:120]}); "
+            "the recording goes on without it."
+        )
 
 
 def _hand_back_capture(
@@ -204,15 +231,13 @@ def _hand_back_capture(
     warm: WarmCapture | None,
     rearm_warm: Callable[[bool], None] | None,
     *,
-    rearmable: bool,
     ask_recovery: bool,
 ) -> None:
     """Tell the recorder what became of the capture this reset stopped.
 
     A capture stop() reported stopped is dead for presses either way -- its
-    stop event is set, so it can never re-open -- so it is handed back
-    (``rearmable=False``) or re-armed (``rearmable=True``) rather than being
-    left installed as a sink that silently swallows the next take.
+    stop event is set, so it can never re-open -- so it is handed back rather
+    than being left installed as a sink that silently swallows the next take.
 
     ``ask_recovery`` is the separate ask for the bail-out paths: stop()
     SUCCEEDED there, so ``drop()`` set no recovery flag and keep-warm would
@@ -220,9 +245,9 @@ def _hand_back_capture(
     """
     if ask_recovery:
         registry.warm.need_recovery()
-    if warm is None or rearm_warm is None:
+    if warm is None:
         return
-    rearm_warm(rearmable)
+    _rearm_after_reset(registry, rearm_warm, usable=False)
 
 
 def reset_session(
@@ -327,9 +352,7 @@ def reset_session(
         # exited. The hand-back asks for that SAME object to be dropped
         # again; WarmKeep.drop() answers with a probe, not a second join.
         print("Keep-warm capture would not stop; dropping it.")
-        _hand_back_capture(
-            registry, warm, rearm_warm, rearmable=False, ask_recovery=False
-        )
+        _hand_back_capture(registry, warm, rearm_warm, ask_recovery=False)
         return _unchanged(registry, busy=True)
 
     if not registry.terminate_all():
@@ -337,9 +360,7 @@ def reset_session(
         # capture was stopped cleanly above and is dead for presses
         # either way, so hand it back and ask for recovery (see
         # _hand_back_capture).
-        _hand_back_capture(
-            registry, warm, rearm_warm, rearmable=False, ask_recovery=True
-        )
+        _hand_back_capture(registry, warm, rearm_warm, ask_recovery=True)
         return _unchanged(registry, busy=True)
     registry.pyaudio = None
     registry.forget_index()
@@ -350,10 +371,10 @@ def reset_session(
         # holding PortAudio open. Nothing is re-armed over a session that
         # does not exist; the recovery ask brings keep-warm back when the
         # engine does.
-        _hand_back_capture(
-            registry, warm, rearm_warm, rearmable=False, ask_recovery=True
-        )
-        return _unchanged(registry, unbound=True)
+        _hand_back_capture(registry, warm, rearm_warm, ask_recovery=True)
+        # Nothing was rebuilt: the session is unbound, and an index into an
+        # instance that no longer exists is not an index.
+        return SessionRefresh(pyaudio=None, input_device_index=None, busy=False)
     if registry.last_reset is None:
         # open()'s own read gave no evidence (transient -- quite possible
         # right after the coreaudiod storm that moved the default). Record
@@ -364,9 +385,9 @@ def reset_session(
         # baseline still unset there costs a second full rebuild inside this
         # same press -- and a second unsynchronised write to the budget.
         registry.last_reset = live
-    if warm is not None and rearm_warm is not None:
+    if warm is not None:
         # Only now does the session exist to arm against.
-        rearm_warm(True)
+        _rearm_after_reset(registry, rearm_warm, usable=True)
     # An AirPod whose liveness flag oscillates makes every read a different
     # pair, and a default that alternates between two devices makes every
     # read a different DEVICE; the dedupe guard above is structurally blind
