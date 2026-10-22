@@ -24,12 +24,11 @@ import sys
 from typing import NamedTuple
 
 kAudioObjectSystemObject = 1
-# The codes below are the PyObjC bridge's own values -- verified against
-# kAudioHardwarePropertyDefaultInputDevice / kAudioDevicePropertyDeviceIsAlive
-# on a real CoreAudio install. The four-char decodings are 'dIn ' and 'livn'
-# (they are NOT 'defi'/'aliv'); the tests mirror the same integers, so a
-# comment-following "fix" that retypes one of these numbers breaks live
-# detection while the suite stays green.
+# The codes below are the PyObjC bridge's own values -- the four-char
+# decodings are 'dIn ' and 'livn' (they are NOT 'defi'/'aliv'). They are
+# bare integers whose names are their only documentation here, so
+# tests/test_audio_coreaudio.py compares all five against the framework
+# itself (that test skips where pyobjc-framework-CoreAudio is absent).
 kAudioHardwarePropertyDefaultInputDevice = 1682533920  # 'dIn '
 kAudioDevicePropertyDeviceIsAlive = 1818850926  # 'livn'
 kAudioObjectPropertyScopeGlobal = 1735159650  # 'glob'

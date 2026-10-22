@@ -243,11 +243,15 @@ class AudioRecorder:
         dead for presses (its stop event is set, so it can never re-open)
         -- drop it and later presses take the worker path, not a dead sink.
         The session keeps the handle on its live thread: see WarmKeep.drop().
+
+        usable=True goes through WarmArm.rearm, NOT set_keep_warm: the reset
+        ran outside the lock long enough for the menu to be unchecked, and
+        re-arming anyway leaves the mic open behind an unchecked item (#72).
         """
         dead = self._warm_arm.take()
         self._session.warm.drop(dead)
         if usable:
-            self.set_keep_warm(True)
+            self._warm_arm.rearm(self._make_warm_capture)
 
     def _announce_capture(self, my_gen: int) -> None:
         """Fire on_capture_started at most once per start_recording() cycle
@@ -262,19 +266,24 @@ class AudioRecorder:
         )
 
     def set_keep_warm(self, enabled: bool) -> None:
-        """Keep the input stream open between recordings (issue #66).
+        """Keep the input stream open between recordings (issue #66) -- the
+        MENU's path, and the only caller that gets to state the request.
 
-        Arming is serialised in WarmArm (issue #72 adversarial finding
-        1): #72 gave it worker- and press-side caller threads, and a
+        Arming is serialised in WarmArm (issue #72 adversarial
+        finding 1): #72 gave it worker- and press-side caller threads, and a
         lock-free check-then-act could start two captures and orphan
         the loser outside WarmKeep, where terminate_all() drives
         PortAudio out from under it.
         """
         self._warm_arm.set_enabled(
-            lambda: WarmCapture(self._open_warm_stream, self.chunk_size),
+            self._make_warm_capture,
             lambda rate: setattr(self, "_capture_rate", rate),
             enabled,
         )
+
+    def _make_warm_capture(self) -> WarmCapture:
+        """The capture both arming paths build (menu and re-arm)."""
+        return WarmCapture(self._open_warm_stream, self.chunk_size)
 
     def _open_warm_stream(self) -> tuple[_Stream, int]:
         """One open for WarmCapture's thread. Never overlaps a per-press

@@ -193,6 +193,40 @@ def test_terminate_all_refuses_while_an_installed_capture_may_be_reading():
     pa.terminate.assert_called_once_with()
 
 
+def test_an_installed_capture_with_no_thread_yet_still_blocks_a_terminate():
+    """ISSUE (issue #72 review, round 2, finding 2): the gate was blind to
+    the one window ``note_installed`` exists to cover.
+
+    ``WarmArm`` names the capture BEFORE ``capture.start()`` assigns its
+    thread, precisely so a terminate racing the arm sees it -- but
+    ``terminate_all()`` takes no recorder lock, so it can read the ledger in
+    that gap, where the predicate's ``thread is not None`` conjunct answered
+    "no blocker" for a capture that is arming, not idle. Measured before the
+    fix: with the capture installed and its thread still unassigned,
+    ``installed_may_be_native()`` said False, ``terminate_blocker()`` said
+    None, and ``Pa_Terminate`` fired.
+    """
+    registry, pa, _module = _registry()
+    registry.open(_find_device)
+    arming = _capture(thread=None)  # installed, not started yet
+    registry.warm.note_installed(arming)
+
+    assert registry.terminate_all() is False
+    pa.terminate.assert_not_called()
+
+    # A gate, not a verdict: once start() has assigned a thread that has
+    # provably finished, the same session terminates.
+    done = threading.Event()
+    reader = threading.Thread(target=done.wait, daemon=True)
+    arming.thread = reader
+    reader.start()
+    done.set()
+    reader.join(timeout=5.0)
+
+    assert registry.terminate_all() is True
+    pa.terminate.assert_called_once_with()
+
+
 def test_installed_capture_is_never_its_own_blocker():
     """The capture's own thread runs the reset from ``_open_warm_stream``. If
     it counted itself the keep-warm session could never reset at all."""

@@ -17,6 +17,15 @@ act:
   (passed in, not duplicated: the capture is recorder state and every
   other reader holds that lock), install and thread-spawn included -- a
   concurrent ``take()`` can never slip in between them.
+* the same re-arm forced keep-warm back ON. A reset runs outside the
+  recorder lock for as long as a full teardown and rebuild, and its
+  hand-back went through ``set_keep_warm(True)``, which records the
+  request as well as satisfying it -- so a menu uncheck landing inside
+  that window was erased, the capture re-armed, and the mic left open
+  behind an unchecked menu item. ``WarmArm.rearm`` satisfies the
+  request the user actually has, read under the same lock as the arm
+  (``set_enabled`` -- the menu's path -- takes that lock too, so the
+  check and the act cannot be split by a click).
 * the reset gate trusted a worker name captured before a join of up to
   30 s; by gate time that worker may have finished and a live one
   become current. ``worker_may_be_native`` resolves the names through
@@ -78,22 +87,15 @@ class WarmArm:
         note_capture_rate: Callable[[int | None], None],
         enabled: bool,
     ) -> None:
-        """Record the menu's request and bring the capture to match it.
-        At most one capture is ever started per call, and a capture that
-        lost the slot to a concurrent take() is never started at all."""
+        """The menu's request (issue #66): record it, then bring the capture
+        to match it. At most one capture is ever started per call, and a
+        capture that lost the slot to a concurrent take() is never started
+        at all."""
         self._keep.want(enabled)
         dropped: WarmCapture | None = None
         with self._lock:
             if enabled and self.capture is None:
-                capture = make_capture()
-                self.capture = capture
-                # Named for the session BEFORE it is started (issue #72
-                # review, finding 2): a terminate racing this transition must
-                # see the capture whose thread it is about to read on, and
-                # after the release there is no such window -- WarmKeep holds
-                # the name either way.
-                self._keep.note_installed(capture)
-                capture.start()
+                self._arm_locked(make_capture)
             elif not enabled and self.capture is not None:
                 dropped, self.capture = self.capture, None
                 note_capture_rate(dropped.capture_rate)
@@ -101,6 +103,51 @@ class WarmArm:
             # drop() is what clears the installed name, in the same step that
             # decides whether the thread still blocks a terminate.
             self._keep.drop(dropped)
+
+    def rearm(self, make_capture: Callable[[], WarmCapture]) -> None:
+        """Bring the capture back IF the user still wants keep-warm.
+
+        The reset's and the recovery's hand-back used to go through
+        ``set_enabled(True)``, which also WRITES the request -- so a menu
+        uncheck landing during the reset (which runs outside this lock, for
+        as long as a teardown and rebuild takes) was silently reversed and the
+        microphone left open behind an unchecked menu item (issue #72 review,
+        round 2, finding 1). This path satisfies the request; it never makes
+        one. The request is read under this same lock, so a concurrent menu
+        click cannot land between the check and the arm.
+        """
+        with self._lock:
+            if self.capture is not None:
+                # Already armed for the request: any pending recovery is
+                # satisfied by the capture that is installed.
+                self._keep.note_armed()
+            elif self._keep.wanted():
+                self._arm_locked(make_capture)
+
+    def _arm_locked(self, make_capture: Callable[[], WarmCapture]) -> None:
+        """Install and start one capture. Caller holds ``_lock``."""
+        capture = make_capture()
+        self.capture = capture
+        # Named for the session BEFORE it is started (issue #72
+        # review, finding 2): a terminate racing this transition must
+        # see the capture whose thread it is about to read on, and
+        # after the release there is no such window -- WarmKeep holds
+        # the name either way.
+        self._keep.note_installed(capture)
+        try:
+            capture.start()
+        except BaseException:
+            # A capture that never started can never read, so it must not
+            # stay named as a blocker: installed_may_be_native() treats an
+            # installed capture with no thread as arming, and a leaked name
+            # here would refuse every later terminate_all() for the life of
+            # the process (thread creation does fail -- RuntimeError under a
+            # thread-limit storm). Undo the install and let the caller see
+            # the failure, as it always has.
+            self.capture = None
+            self._keep.note_installed(None)
+            raise
+        self._keep.note_armed()
 
     def take(self) -> WarmCapture | None:
         """Clear the slot and hand the capture to the caller (rearm /
@@ -233,7 +280,11 @@ def cleanup_recorder_session(recorder: AudioRecorder) -> None:
 
     # Issue #72: every registered instance goes -- a single instance
     # anywhere keeps PortAudio's init count above zero and frozen.
-    recorder._session.terminate_all()
+    if not recorder._session.terminate_all():
+        # The registry says why (a blocker it named, or an instance that
+        # would not terminate); this line says WHEN, so a log of a quit that
+        # left PortAudio initialised can be traced to the quit.
+        print("PyAudio instances remained at cleanup; PortAudio may still be up.")
 
 
 def announce_capture(

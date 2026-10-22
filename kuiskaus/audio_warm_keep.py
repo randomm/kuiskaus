@@ -74,7 +74,8 @@ class WarmKeep:
             self._installed = warm
 
     def installed_may_be_native(self, exempt: WarmCapture | None = None) -> bool:
-        """True while the installed keep-warm capture has a live thread.
+        """True while the installed keep-warm capture has a live thread -- or
+        has not been started yet.
 
         Two names are excused. The capture's own thread is never its own
         blocker: WarmCapture opens and reads on that thread, and it is also
@@ -82,17 +83,26 @@ class WarmKeep:
         counting it would refuse every reset the capture ever asked for. And
         ``exempt`` is the capture a caller is on its way to stop, which the
         warm press hands over before this is asked.
+
+        No thread yet means ARMING, not idle (issue #72 review, round 2,
+        finding 2): ``WarmArm`` names the capture here precisely so a
+        terminate racing the arm sees it, and it does so BEFORE
+        ``capture.start()`` assigns the thread. Requiring a non-None thread
+        made this predicate blind to the one window ``note_installed`` exists
+        to cover, so ``terminate_all()`` -- which takes no recorder lock --
+        could read the ledger in that gap and drive PortAudio's init count to
+        zero underneath a capture about to open on it. The conservative
+        direction is the safe one: an installed capture nobody has dropped is
+        a blocker until its thread is provably not running.
         """
         with self._lock:
             warm = self._installed
         if warm is None or warm is exempt:
             return False
         thread = warm.thread
-        return (
-            thread is not None
-            and thread is not threading.current_thread()
-            and thread.is_alive()
-        )
+        if thread is None:
+            return True
+        return thread is not threading.current_thread() and thread.is_alive()
 
     def drop(self, warm: WarmCapture | None) -> bool:
         """Stop a capture the caller is letting go of. True = nothing of it
@@ -186,6 +196,30 @@ class WarmKeep:
             self.enabled = enabled
             if enabled:
                 self._recover_pending = False
+
+    def wanted(self) -> bool:
+        """The user's keep-warm request AS IT STANDS NOW (issue #72 review,
+        round 2, finding 1).
+
+        Read under the lock, not as a bare attribute read, because the
+        question is asked by a thread that has been busy for as long as a
+        full device reset -- terminate-all + ``Pa_Initialize`` + re-enumerate,
+        hundreds of milliseconds -- during which the menu thread may have
+        unchecked the item. A reset that then armed unconditionally resurrected
+        the mic behind an unchecked menu.
+        """
+        with self._lock:
+            return self.enabled
+
+    def note_armed(self) -> None:
+        """Record that a capture is now installed for the current request.
+
+        A pending recovery is spent by it: leaving the flag set would have
+        the next worker press re-arm a SECOND capture over a working one (the
+        pre-fix callers reached this through ``want(True)``, which cleared it).
+        """
+        with self._lock:
+            self._recover_pending = False
 
     def need_recovery(self) -> None:
         """Ask for keep-warm to be brought back later (issue #72 review).

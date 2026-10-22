@@ -4,8 +4,14 @@ The live CoreAudio read and the change predicate; the registry /
 session-reset half stays in test_audio_device.py. No hardware and no
 CoreAudio framework: the autouse ``coreaudio_stub`` fixture owns the
 bridge, so a developer's real default input device can never leak into
-these assertions.
+these assertions -- with the one exception at the foot of this file, which
+sets the stub aside to check the mirrored constants against the framework.
 """
+
+import importlib
+import sys
+
+import pytest
 
 from kuiskaus.audio_coreaudio import (
     LiveDefaultInput,
@@ -14,10 +20,54 @@ from kuiskaus.audio_coreaudio import (
 )
 from tests.support_audio_recorder import _live_default_input
 
-# 'dIn ' / 'livn' as the stubbed bridge reports them (same ints the module
-# uses -- a test that retypes them here would catch a constant typo).
+# 'dIn ' / 'livn' as the stubbed bridge reports them. These are the SAME
+# integers the module mirrors, so they pin nothing on their own: a typo that
+# kept the comment and retyped the number left the whole suite green (issue
+# #72 review, round 2). test_constants_are_the_framework_s_own_values is the
+# guard; these two stay because they are readable in the stub's plumbing.
 DEFAULT_INPUT_SELECTOR = 1682533920
 ALIVE_SELECTOR = 1818850926
+
+
+@pytest.fixture
+def real_coreaudio():
+    """The genuine PyObjC CoreAudio bridge, with the autouse stub set aside.
+
+    The stub lives in ``sys.modules`` for every test, so the real module has
+    to be re-imported around it -- and the stub put back afterwards, or the
+    next test would be reading this developer's microphone.
+    """
+    saved = sys.modules.pop("CoreAudio", None)
+    try:
+        try:
+            return importlib.import_module("CoreAudio")
+        except Exception as e:  # noqa: BLE001 - optional framework boundary
+            pytest.skip(f"pyobjc-framework-CoreAudio unavailable: {e}")
+    finally:
+        sys.modules.pop("CoreAudio", None)
+        if saved is not None:
+            sys.modules["CoreAudio"] = saved
+
+
+def test_constants_are_the_framework_s_own_values(real_coreaudio):
+    """MINOR (issue #72 review, round 2): every constant in this module is a
+    bare integer whose name is its only documentation, and the tests mirror
+    the same integers -- so a retyped number survived the suite and broke
+    live detection on real hardware. This is the one place the digits are
+    compared to CoreAudio itself; it skips where the framework is absent.
+    """
+    from kuiskaus import audio_coreaudio
+
+    for name in (
+        "kAudioObjectSystemObject",
+        "kAudioHardwarePropertyDefaultInputDevice",
+        "kAudioDevicePropertyDeviceIsAlive",
+        "kAudioObjectPropertyScopeGlobal",
+        "kAudioObjectPropertyElementMain",
+    ):
+        assert getattr(audio_coreaudio, name) == getattr(real_coreaudio, name), (
+            f"{name} is not what CoreAudio reports"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -31,9 +31,15 @@ class DeviceIndexBinding:
     """The session's device index, paired with its instance.
 
     Owned by ``PyAudioRegistry``, which owns the live instance it pairs
-    against. Single-word writes from whichever thread owns the session's
-    lifecycle, so there is no lock here: a reader may observe a binding one
-    press late, never a torn one.
+    against. No lock here: whichever thread owns the session's lifecycle is
+    the only writer, and the two fields are written in the ONE order the
+    reader can tolerate -- ``_index`` first, ``_owner`` last (see ``bind`` /
+    ``publish``). ``resolve`` gates on the owner, so a concurrent reader
+    either sees the old owner (and answers "unresolved", the correct answer
+    for an index it cannot vouch for) or the new owner together with the new
+    index. A reader may observe a binding one press late; it cannot observe a
+    new index attributed to an owner that never resolved it. Reversing that
+    write order would break it.
     """
 
     def __init__(self) -> None:
@@ -57,6 +63,9 @@ class DeviceIndexBinding:
         The caller (``PyAudioRegistry.bind_index``) checks first that no
         binding is already serving the live instance -- this class cannot:
         it holds the owner, but the live instance lives in the registry.
+
+        Index first, owner last: see the class docstring for why the order
+        is what makes the lock-free read safe.
         """
         self._index = device_index
         self._owner = resolved_on
@@ -66,7 +75,8 @@ class DeviceIndexBinding:
 
         The recorder's session write-back comes through here: the pair it
         holds was read as a pair, so the pairing is recorded as it was read
-        rather than inferred afterwards.
+        rather than inferred afterwards. Index first, owner last (class
+        docstring).
         """
         self._index = device_index
         self._owner = live if device_index is not None else None
