@@ -26,8 +26,11 @@ from kuiskaus.audio_coreaudio import LiveDefaultInput, read_live_default_input
 from kuiskaus.audio_device_index import DeviceIndexBinding
 from kuiskaus.audio_device_reset import (
     SessionRefresh,
+    note_terminate_outcome,
     press_is_admissible,
+    press_refusal_reason,
     reset_session,
+    unavailable_reason,
 )
 from kuiskaus.audio_retry import (
     close_stream_quietly,
@@ -100,6 +103,16 @@ class PyAudioRegistry:
         # so the gate could be told "nothing is alive" by a caller that had
         # simply lost the name. The session keeps the list instead.
         self.workers = WorkerKeep()
+        # Consecutive teardowns that an instance refused (issue #72 review,
+        # round 1), and the verdict they add up to. Counted by
+        # terminate_all() -- the one call that knows whether a refusal came
+        # from an instance that would not die (counts) or from the ledger
+        # gate excusing a thread that may still be native (does not: that is
+        # a deferral which releases itself, and blaming it on a dead
+        # microphone would send the user to quit the app over a read that was
+        # about to return).
+        self.terminate_failures = 0
+        self.needs_restart = False
         self._instances: list[pyaudio.PyAudio] = []
         # Guards only the _instances list mutations -- never held across a
         # native call, so it cannot be the lock a blocking terminate waits on.
@@ -146,25 +159,6 @@ class PyAudioRegistry:
         process. See ``audio_warm_arm.start_press``, the only caller.
         """
         self.workers.forget(worker)
-
-    def start_worker(self, worker: threading.Thread) -> None:
-        """Start a noted worker; on a failed start, drop it from the
-        ledger and re-raise (issue #72 review).
-
-        ``thread.start()`` does fail -- RuntimeError under a thread-limit
-        storm -- and a thread that never ran can never enter PortAudio,
-        so it must not stay named as one. Used by
-        ``audio_warm_arm.start_press``.
-        """
-        try:
-            worker.start()
-        except BaseException:
-            self.workers.forget(worker)
-            raise
-
-    def any_worker_may_be_native(self) -> bool:
-        """Whether a worker this session started may be inside a native call."""
-        return self.workers.any_may_be_native()
 
     @property
     def input_device_index(self) -> int | None:
@@ -255,11 +249,16 @@ class PyAudioRegistry:
         registered, because forgetting a live instance is how it becomes
         permanently unreachable -- the next attempt gets another shot.
 
-        False also means refused: something this session can name may still
-        be inside a native call on one of these instances -- a worker it
-        started (whether or not any caller still holds its name) or a
-        keep-warm capture it installed or dropped. Callers treat False as
-        busy rather than as a clean session.
+        Two different False answers live here, and only one of them is
+        counted. A refusal from the ledger gate -- a worker this session
+        started, or a keep-warm capture it installed or dropped, may still be
+        inside a native call -- is a deferral that releases itself, so callers
+        treat it as busy and nothing is claimed. A refusal from an instance
+        that would not terminate is a different matter: it is retried (an
+        untracked live instance is exactly what this class exists to reach)
+        but it is also counted, and past ``MAX_TERMINATE_FAILURES`` in a row
+        the session says so through ``needs_restart`` rather than leaving the
+        app reporting Ready over a dead microphone (issue #72 review, r1).
         """
         blocker = terminate_blocker(self.workers, self.warm)
         if blocker is not None:
@@ -268,11 +267,25 @@ class PyAudioRegistry:
             )
             return False
         incomplete = False
+        disposed = 0
         with self._instances_lock:
             pending = list(self._instances)
         for pa in pending:
-            if not self._dispose(pa):
+            if self._dispose(pa):
+                disposed += 1
+            else:
                 incomplete = True
+        if incomplete and disposed:
+            # Say so when the pass was only half a teardown: the session can
+            # be left pointing at an instance this call DID terminate (a press
+            # then opens on it and gets "microphone unavailable" on healthy
+            # hardware until the next press re-binds), and without this line
+            # that press has no trace of why (#72 review, minor 5).
+            print(
+                f"Terminated {disposed} of {len(pending)} PyAudio instances; "
+                "the session may still name one of them."
+            )
+        note_terminate_outcome(self, clean=not incomplete)
         return not incomplete
 
     def open(self, find_default_input_device: Callable[[pyaudio.PyAudio], int]) -> bool:
@@ -446,6 +459,17 @@ class PyAudioRegistry:
         return press_is_admissible(
             self, recording, warm, worker, find_default_input_device, rearm_warm
         )
+
+    def press_refusal_reason(self) -> str:
+        """What a refused press is called -- "busy" while a retry is still
+        possible, the restart verdict once a teardown has spent the budget
+        (``audio_device_reset.press_refusal_reason``)."""
+        return press_refusal_reason(self)
+
+    def unavailable_reason(self, last_error: BaseException | None) -> str:
+        """What an exhausted retry loop is called for this session
+        (``audio_device_reset.unavailable_reason``)."""
+        return unavailable_reason(self, last_error)
 
     def forget_index(self) -> None:
         """Drop the device-index binding entirely (the reset does it once

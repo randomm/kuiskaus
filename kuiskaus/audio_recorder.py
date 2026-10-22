@@ -18,7 +18,6 @@ from kuiskaus.audio_retry import (
     find_default_input_device,
     log_retry_attempt,
     log_stop,
-    microphone_unavailable,
     validate_retry_config,
     worker_alive,
 )
@@ -223,7 +222,7 @@ class AudioRecorder:
 
         with self._lock:
             if self._generation == my_gen:
-                self.last_error = microphone_unavailable(last_error)
+                self.last_error = self._session.unavailable_reason(last_error)
                 self.recording = False
                 self.stream = None
                 self.recording_thread = None
@@ -377,7 +376,7 @@ class AudioRecorder:
             self._rearm_warm,
         ):
             with self._lock:  # every last_error write holds _lock (issue #55)
-                self.last_error = "microphone busy — recording did not start"
+                self.last_error = self._session.press_refusal_reason()
             return False
 
         with self._lock:
@@ -409,25 +408,26 @@ class AudioRecorder:
             self.last_error = None
             self.audio_queue = queue.Queue()  # Clear any old data
             sink = self.audio_queue
+            worker: threading.Thread | None = None
             if warm is None:
-                self.recording_thread = threading.Thread(
+                worker = threading.Thread(
                     target=self._recording_worker,
                     args=(my_gen, previous),
                     daemon=True,
                 )
-                thread = self.recording_thread
+                self.recording_thread = worker
                 # The session records the worker BEFORE it runs (issue #72
                 # adversarial review, finding 1): from here on the registry
                 # can answer "may a worker be inside PortAudio?" for itself,
                 # so a later press cannot terminate the engine underneath this
                 # one after it is displaced from recording_thread by its own
                 # successor.
-                self._session.note_worker(thread)
+                self._session.note_worker(worker)
 
         # Warm: route the ring, no open and no worker (issue #66). Worker:
         # launched through the helper, whose failure path keeps the worker
         # ledger and the recorder's view honest (issue #72 review).
-        start_press(self, warm, sink, my_gen)
+        start_press(self, warm, sink, my_gen, worker)
         return True
 
     def stop_recording(self) -> np.ndarray:

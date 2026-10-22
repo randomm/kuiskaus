@@ -20,7 +20,7 @@ of the process.
 from __future__ import annotations
 
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -118,46 +118,6 @@ def test_a_started_and_finished_worker_prunes_and_releases_the_gate():
 # ---------------------------------------------------------------------------
 # The failed launch: a start() that raised must not linger as a blocker
 # ---------------------------------------------------------------------------
-
-
-def test_start_worker_releases_the_ledger_when_start_raises():
-    """thread.start() does fail (RuntimeError under a thread-limit storm).
-    The thread can then never enter PortAudio, so it leaves the ledger on
-    the way out -- and the failure still surfaces to the caller."""
-    registry, pa, _module = _registry()
-    registry.open(lambda _pa: 3)
-    worker = threading.Thread(target=lambda: None, daemon=True)
-    registry.note_worker(worker)
-    assert registry.terminate_all() is False  # arming blocks (rule above)
-
-    with (
-        patch.object(
-            worker,
-            "start",
-            side_effect=RuntimeError("can't start new thread"),
-        ),
-        pytest.raises(RuntimeError),
-    ):
-        registry.start_worker(worker)
-
-    assert registry.workers._workers == []
-    assert registry.terminate_all() is True
-    pa.terminate.assert_called_once()
-
-
-def test_start_worker_starts_a_noted_worker_and_keeps_it_named():
-    registry, _pa, _module = _registry()
-    registry.open(lambda _pa: 3)
-    hold = threading.Event()
-    worker = threading.Thread(target=hold.wait, daemon=True)
-    registry.note_worker(worker)
-    try:
-        registry.start_worker(worker)
-        assert worker.is_alive()
-        assert worker in registry.workers._workers
-    finally:
-        hold.set()
-        worker.join(timeout=5.0)
 
 
 def test_start_recording_rolls_back_a_worker_whose_start_raised(

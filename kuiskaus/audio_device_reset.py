@@ -19,12 +19,9 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 from kuiskaus.audio_coreaudio import read_live_default_input, session_needs_reset
+from kuiskaus.audio_retry import microphone_unavailable
 from kuiskaus.audio_warm_arm import worker_may_be_native
 from kuiskaus.audio_worker_keep import terminate_blocker
-
-if TYPE_CHECKING:
-    import pyaudio
-
 
 if TYPE_CHECKING:
     import threading
@@ -33,6 +30,54 @@ if TYPE_CHECKING:
 
     from kuiskaus.audio_device import PyAudioRegistry
     from kuiskaus.audio_warm import WarmCapture
+
+# The one true thing to say once the session has given up on tearing PortAudio
+# down. It lives beside the other press-failure text because both are what the
+# user reads in the menubar's 🔴 line, and the difference between them is the
+# point.
+MICROPHONE_NEEDS_RESTART = (
+    "Microphone needs an app restart — PortAudio would not release the device"
+)
+
+MICROPHONE_BUSY = "microphone busy — recording did not start"
+
+# How many consecutive teardowns an instance may refuse before the session
+# stops implying the microphone might come back (issue #72 review, round 1).
+# Retrying forever is right -- forgetting a live instance would leave
+# PortAudio's init count above zero and make every later rebuild useless --
+# but retrying forever *silently* is what reproduced the issue's own symptom
+# inside the fix: busy on every press, device_id pinned to a dead device,
+# last_error None, the menubar showing Ready. Three is "the storm is not
+# transient", and it still leaves room for one.
+MAX_TERMINATE_FAILURES = 3
+
+
+def note_terminate_outcome(registry: PyAudioRegistry, clean: bool) -> None:
+    """Book one teardown attempt against the budget (issue #72 review, r1).
+
+    Called by ``PyAudioRegistry.terminate_all()`` for the outcome of a teardown
+    it actually ran -- a refusal from the ledger gate (a thread that may still
+    be native) never gets here, because that is a deferral which releases
+    itself and blaming it on a dead microphone would send the user to quit the
+    app over a read that was about to return.
+
+    A clean teardown means the instance that would not die is gone, so the
+    verdict goes back to nothing and a later storm pays for itself from zero:
+    the claim must describe the teardown as it is now, not the worst it ever
+    was.
+    """
+    if clean:
+        registry.terminate_failures = 0
+        registry.needs_restart = False
+        return
+    registry.terminate_failures += 1
+    if registry.needs_restart or registry.terminate_failures < MAX_TERMINATE_FAILURES:
+        return
+    registry.needs_restart = True
+    print(
+        f"PyAudio refused to terminate {registry.terminate_failures} times "
+        "running; the microphone needs an app restart."
+    )
 
 
 class SessionRefresh(NamedTuple):
@@ -209,7 +254,8 @@ def press_is_admissible(
     underneath it -- and a press with no warm capture has no press-side reset
     to run at all (its worker resets at the top of its own loop). Both are
     admitted (True). An admitted keep-warm press runs the reset itself;
-    False = fail this press "microphone busy".
+    False = fail this press, and ``press_refusal_reason`` is what the user is
+    told about it.
     """
     if recording or warm is None:
         return True
@@ -218,5 +264,47 @@ def press_is_admissible(
     ).busy
 
 
+def press_refusal_reason(registry: PyAudioRegistry) -> str:
+    """Why an admitted press was refused (issue #72 review, round 1).
+
+    The two refusals look alike to the press and are not alike. A ledger
+    deferral -- a worker or a warm capture still inside a native call --
+    releases itself, and "busy" is the honest word. A session whose teardown
+    has refused ``MAX_TERMINATE_FAILURES`` in a row never does, and telling
+    that user "busy" is exactly how the #72 symptom survived inside the PR
+    written to remove it: busy on every press, last_error None, menubar
+    Ready.
+    """
+    if registry.needs_restart:
+        return MICROPHONE_NEEDS_RESTART
+    return MICROPHONE_BUSY
+
+
+def unavailable_reason(
+    registry: PyAudioRegistry, last_error: BaseException | None
+) -> str:
+    """What an exhausted retry loop leaves in ``recorder.last_error``.
+
+    The worker path has no press-side refusal to hang the restart verdict on
+    -- its press is admitted and the retry loop is what fails -- so the same
+    poisoned session surfaces here instead. While the teardown still has
+    budget left this keeps ``microphone_unavailable``'s wording: a storm that
+    clears must not be announced as an app restart.
+    """
+    if registry.needs_restart:
+        return MICROPHONE_NEEDS_RESTART
+    return microphone_unavailable(last_error)
+
+
 # Re-exported for callers that name the entry point rather than the module.
-__all__ = ["SessionRefresh", "press_is_admissible", "reset_session"]
+__all__ = [
+    "MAX_TERMINATE_FAILURES",
+    "MICROPHONE_BUSY",
+    "MICROPHONE_NEEDS_RESTART",
+    "SessionRefresh",
+    "note_terminate_outcome",
+    "press_is_admissible",
+    "press_refusal_reason",
+    "reset_session",
+    "unavailable_reason",
+]

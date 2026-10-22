@@ -171,9 +171,17 @@ def start_press(
     warm: WarmCapture | None,
     sink: queue.Queue[bytes],
     my_gen: int,
+    worker: threading.Thread | None,
 ) -> None:
     """Launch the admitted press: route the ring to the warm capture, or
     start the worker (issue #66 / #72).
+
+    ``worker`` is the thread the press built and noted, handed in by the
+    caller rather than re-read from ``recorder.recording_thread`` here: the
+    ledger counts a noted-but-never-started thread as a blocker, so a press
+    that lost the name and raised before ``start()`` would leave that blocker
+    for the life of the process, refusing every later terminate_all() over a
+    thread that can never enter PortAudio (#72 review, minor 2).
 
     The worker's ``start()`` can fail -- RuntimeError under a thread-limit
     storm, the same failure ``WarmArm._arm_locked`` handles for captures.
@@ -190,15 +198,14 @@ def start_press(
         # Keep-warm (issue #66): no open, no worker; route the ring.
         warm.begin(sink, lambda: recorder._announce_capture(my_gen))
         return
-    thread = recorder.recording_thread
-    if thread is None:
-        raise RuntimeError("recorder lost its worker before start")
+    if worker is None:
+        raise RuntimeError("worker press admitted with no worker")
     try:
-        thread.start()
+        worker.start()
     except BaseException:
-        recorder._session.forget_worker(thread)
+        recorder._session.forget_worker(worker)
         with recorder._lock:
-            if recorder.recording_thread is thread:
+            if recorder.recording_thread is worker:
                 recorder.recording = False
                 recorder.recording_thread = None
         raise

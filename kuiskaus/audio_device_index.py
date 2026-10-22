@@ -31,20 +31,21 @@ class DeviceIndexBinding:
     """The session's device index, paired with its instance.
 
     Owned by ``PyAudioRegistry``, which owns the live instance it pairs
-    against. No lock here: whichever thread owns the session's lifecycle is
-    the only writer, and the two fields are written in the ONE order the
-    reader can tolerate -- ``_index`` first, ``_owner`` last (see ``bind`` /
-    ``publish``). ``resolve`` gates on the owner, so a concurrent reader
-    either sees the old owner (and answers "unresolved", the correct answer
-    for an index it cannot vouch for) or the new owner together with the new
-    index. A reader may observe a binding one press late; it cannot observe a
-    new index attributed to an owner that never resolved it. Reversing that
-    write order would break it.
+    against. No lock here, and no pair of fields either: the (index, owner)
+    pair is stored as ONE tuple, so a reader takes both halves from the same
+    value in a single load (issue #72 review, minor 4).
+
+    That distinction is the whole contract. Two fields cannot make it true in
+    any write order: a reader that sampled the owner (still the old one, so it
+    matches) and then loaded the index would see the NEW index attributed to
+    an owner that never resolved it -- which is precisely the wedge this class
+    exists to close, arrived at through the read. Storing one tuple makes the
+    claim structural rather than a comment about write ordering, and keeps
+    ``resolve`` a plain identity test against the live instance.
     """
 
     def __init__(self) -> None:
-        self._index: int | None = None
-        self._owner: pyaudio.PyAudio | None = None
+        self._pair: tuple[int | None, pyaudio.PyAudio | None] = (None, None)
 
     def resolve(self, live: pyaudio.PyAudio | None) -> int | None:
         """The index for ``live``, or None when it does not describe it.
@@ -53,9 +54,10 @@ class DeviceIndexBinding:
         means "re-resolve", which is the only correct response to an index
         that names a device list nobody here has.
         """
-        if live is None or self._owner is not live:
+        index, owner = self._pair
+        if live is None or owner is not live:
             return None
-        return self._index
+        return index
 
     def bind(self, device_index: int, resolved_on: pyaudio.PyAudio) -> None:
         """Publish an index a caller just resolved against ``resolved_on``.
@@ -64,22 +66,24 @@ class DeviceIndexBinding:
         binding is already serving the live instance -- this class cannot:
         it holds the owner, but the live instance lives in the registry.
 
-        Index first, owner last: see the class docstring for why the order
-        is what makes the lock-free read safe.
+        One store of one tuple: see the class docstring for why the pair has
+        to BE the value rather than two fields written in some order.
         """
-        self._index = device_index
-        self._owner = resolved_on
+        self._pair = (device_index, resolved_on)
 
     def publish(self, device_index: int | None, live: pyaudio.PyAudio | None) -> None:
         """Write a (instance, index) pair a caller holds together (issue #72).
 
         The recorder's session write-back comes through here: the pair it
         holds was read as a pair, so the pairing is recorded as it was read
-        rather than inferred afterwards. Index first, owner last (class
-        docstring).
+        rather than inferred afterwards. One store of one tuple (class
+        docstring); an index of None is no binding at all, so it carries no
+        owner either.
         """
-        self._index = device_index
-        self._owner = live if device_index is not None else None
+        self._pair = (
+            device_index,
+            live if device_index is not None else None,
+        )  # fmt: skip
 
     def unbind(self, gone: pyaudio.PyAudio) -> None:
         """Forget the index if it came from ``gone``.
@@ -89,10 +93,9 @@ class DeviceIndexBinding:
         An instance that would not terminate is NOT passed here -- it is
         still live, and the binding is still a fact about it.
         """
-        if self._owner is gone:
+        if self._pair[1] is gone:
             self.clear()
 
     def clear(self) -> None:
         """No index, no owner: nothing is resolved."""
-        self._index = None
-        self._owner = None
+        self._pair = (None, None)
