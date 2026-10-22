@@ -23,7 +23,7 @@ from tests.support_audio_recorder import _live_default_input
 
 
 def test_snapshot_never_pairs_the_live_instance_with_another_one_s_index():
-    """the retry attempt used to read
+    """The retry attempt used to read
     ``registry.pyaudio`` and ``registry.input_device_index`` as two separate
     property accesses, so a reset landing between them handed the attempt a
     live instance and an index into some other instance's frozen device list -
@@ -161,7 +161,7 @@ def test_a_disposed_attempt_instance_forces_the_next_attempt_to_re_resolve(
 def test_a_rebuild_records_its_pair_when_open_could_not_read_the_default(
     coreaudio_stub,
 ):
-    """the dedupe baseline was set from
+    """The dedupe baseline was set from
     the refresh's own read, but ``device_id`` -- which the dedupe guard
     requires to be non-None -- came only from ``open()``'s second read. A
     CoreAudio read that failed inside ``open()`` (quite possible right

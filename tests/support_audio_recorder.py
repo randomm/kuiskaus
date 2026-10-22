@@ -84,7 +84,7 @@ def _live_default_input(stub: MagicMock, device_id: int, is_alive: bool = True) 
 
     The autouse stub's default is "every read fails" -- no evidence, so
     ``read_live_default_input()`` returns None and the recorder takes the
-    no-reset fast path, which is what the pre-#72ecorder tests were
+    no-reset fast path, which is what the pre-#72 recorder tests were
     written against. A test that exercises the device-change reset has to
     say what the system default actually is; call this again with a
     different id to move it.
@@ -240,7 +240,8 @@ def _capture_callback_recorder(
 
 
 def _blocking_read_then_block(read_data: bytes, release_event: threading.Event):
-    """side_effect callable: first call returns read_data, every later call
+    """A ``stream.read`` side_effect callable: first call returns read_data,
+    every later call
     blocks on release_event then raises OSError("stop the loop"). The
     "already returned once" state lives in a local list (a function
     attribute would not be ty-resolvable, so a one-element list keeps the

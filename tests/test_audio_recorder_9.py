@@ -81,7 +81,8 @@ def test_a_refused_press_says_busy_while_a_retry_is_still_possible(
 def test_the_press_that_learns_the_engine_will_not_come_down_says_restart(
     audio_recorder_module, coreaudio_stub
 ):
-    """at the press boundary. The press is refused either way,
+    """The verdict is read at the press boundary. The press is refused
+    either way,
     so all that changes is whether anything tells the user the microphone is
     not coming back: the presses before the budget say "busy", the one that
     spends it says restart."""

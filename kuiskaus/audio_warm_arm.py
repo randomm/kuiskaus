@@ -115,8 +115,9 @@ class WarmArm:
         ``set_enabled(True)``, which also WRITES the request -- so a menu
         uncheck landing during the reset (which runs outside this lock, for
         as long as a teardown and rebuild takes) was silently reversed and the
-        microphone left open behind an unchecked menu item (issue #72). This path satisfies the request; it never makes
-        one. The request is read under this same lock, so a concurrent menu
+        microphone left open behind an unchecked menu item (issue #72).
+        This path satisfies the request; it never makes one. The request is
+        read under this same lock, so a concurrent menu
         click cannot land between the check and the arm.
         """
         with self._lock:
@@ -238,7 +239,8 @@ def warm_press_gate(
     find_default_input_device: Callable[[pyaudio.PyAudio], int],
     rearm_warm: Callable[[bool], None],
 ) -> bool:
-    """The keep-warm press gate on a lock-consistent snapshot (issue #72): the three fields the gate decides on
+    """The keep-warm press gate on a lock-consistent snapshot (issue #72):
+    the three fields the gate decides on
     (recording, capture, worker) are read under the recorder lock -- a
     worker may rewrite them between three lock-free reads -- and the
     live-default reset itself runs outside it (native calls, issue #60).
@@ -416,7 +418,8 @@ def announce_capture(
     mark_announced: Callable[[], None],
     callback: Callable[[], None] | None,
 ) -> None:
-    """Fire on_capture_started at most once per recording cycle (issue #43): the flag check-and-set is one atomic step under the caller's
+    """Fire on_capture_started at most once per recording cycle (issue #43):
+    the flag check-and-set is one atomic step under the caller's
     lock; the callback runs after the lock is released so it never
     blocks the capture, and a raising callback never kills the thread.
     """

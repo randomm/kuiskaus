@@ -7,7 +7,8 @@ task-c). The reset gate asked its CALLER to name those threads, and the
 caller only ever had two names to give: the worker it joined and the one it
 is starting. A worker wedged inside ``pa.open()`` (issue #60 orphan) stops
 being nameable the moment its successor clears ``recording_thread``, so four
-ordinary presses reached the terminate (issue #72): the wedge outlives the join budget, the successor completes, the
+ordinary presses reached the terminate (issue #72): the wedge outlives the
+join budget, the successor completes, the
 next press is told nothing is alive, and ``Pa_Terminate`` frees the state
 the wedged worker is still entering.
 
@@ -54,7 +55,8 @@ class WorkerKeep:
         participate in the answer, so keeping it would only grow a list
         that every terminate has to walk.
 
-        A thread that has NEVER started is not pruned (issue #72): ``start_recording()`` notes under the
+        A thread that has NEVER started is not pruned (issue #72):
+        ``start_recording()`` notes under the
         recorder lock and starts after the release, and a not-yet-started
         thread is ARMING, not finished -- its ``pa.open()`` may be the
         next native call. Mirror of the warm-side rule

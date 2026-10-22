@@ -110,7 +110,8 @@ class WarmKeep:
         ``exempt`` is the capture a caller is on its way to stop, which the
         warm press hands over before this is asked.
 
-        No thread yet means ARMING, not idle (issue #72): ``WarmArm`` names the capture here precisely so a
+        No thread yet means ARMING, not idle (issue #72): ``WarmArm`` names
+        the capture here precisely so a
         terminate racing the arm sees it, and it does so BEFORE
         ``capture.start()`` assigns the thread. Requiring a non-None thread
         made this predicate blind to the one window ``note_installed`` exists
@@ -148,7 +149,8 @@ class WarmKeep:
         menu thread reported a safe-to-terminate session while the reader was
         still parked on it.
 
-        Dropping the same capture twice is idempotent about the JOIN (issue #72): a capture already on the blockers list has been
+        Dropping the same capture twice is idempotent about the JOIN (issue
+        #72): a capture already on the blockers list has been
         joined once and is proven parked, so the second caller gets the
         non-blocking probe. Without that, ``refresh()`` dropping a wedged
         capture and then handing the same object to ``rearm_warm(False)`` --

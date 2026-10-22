@@ -65,7 +65,7 @@ def test_retry_reuses_the_live_session_and_constructs_nothing(
 def test_retry_runtime_error_from_device_lookup_sets_last_error(
     audio_recorder_module,
 ):
-    """if the retry's own
+    """Cover the case where the retry's own
     _find_default_input_device() call exhausts its fallback loop and
     raises RuntimeError (no input device at all -- e.g. the mic was
     unplugged between the two attempts), the worker must not die
@@ -97,7 +97,7 @@ def test_retry_runtime_error_from_device_lookup_sets_last_error(
 def test_late_successful_open_does_not_clobber_already_surfaced_last_error(
     audio_recorder_module,
 ):
-    """if stop_recording()'s stuck-open
+    """Cover the case where stop_recording()'s stuck-open
     detection already set last_error for this generation (worker still
     blocked in open() past the join timeout) and the worker's open()
     subsequently succeeds late, it must not clear that already-surfaced

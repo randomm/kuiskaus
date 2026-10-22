@@ -71,7 +71,7 @@ def test_a_construction_failure_clears_the_stale_baseline(coreaudio_stub):
 def test_split_reads_that_disagree_do_not_pin_the_dedupe_baseline(
     coreaudio_stub,
 ):
-    """as the two independent reads produce it.
+    """The torn pair, as the two independent reads produce it.
 
     The reset's own read says the live default is 77; ``open()``'s second
     read says 88 (a storm makes the two disagree -- exactly the moment

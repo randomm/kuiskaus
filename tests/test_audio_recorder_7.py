@@ -142,7 +142,7 @@ def test_busy_warm_press_keeps_a_capture_that_still_works(
 def test_press_after_a_dropped_warm_capture_does_not_terminate_under_it(
     audio_recorder_module, coreaudio_stub
 ):
-    """dropping the stuck capture from the
+    """Dropping the stuck capture from the
     recorder must not orphan its live thread.
 
     The abandoned thread is alive by definition -- that is exactly why
@@ -278,7 +278,7 @@ def test_worker_path_does_not_rearm_warm_when_the_user_switched_it_off(
 def test_refused_warm_press_joins_a_wedged_capture_only_once(
     audio_recorder_module, coreaudio_stub
 ):
-    """Issue #72(measured regression): ONE refused press
+    """Issue #72 (measured regression): ONE refused press
     joined the wedged keep-warm thread TWICE -- refresh() dropped the capture,
     then handed the same object to rearm_warm(False), which dropped it again.
     Each stop() is a 2.0s join of a thread proven parked in stream.read(), so

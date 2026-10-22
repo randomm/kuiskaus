@@ -37,7 +37,7 @@ from tests.support_audio_recorder import (
 def test_four_presses_cannot_terminate_under_a_worker_that_lost_its_name(
     audio_recorder_module, coreaudio_stub, monkeypatch
 ):
-    """the reset gate named the two threads its caller passed,
+    """The reset gate named the two threads its caller passed,
     and step 3 takes the wedged worker out of that inventory. Busy, not
     terminated -- and the press still runs."""
     module = audio_recorder_module

@@ -50,7 +50,7 @@ def real_coreaudio():
 
 
 def test_constants_are_the_framework_s_own_values(real_coreaudio):
-    """every constant in this module is a
+    """Every constant in this module is a
     bare integer whose name is its only documentation, and the tests mirror
     the same integers -- so a retyped number survived the suite and broke
     live detection on real hardware. This is the one place the digits are

@@ -130,7 +130,7 @@ def test_the_worker_running_a_reset_is_never_its_own_blocker(coreaudio_stub):
 def test_terminate_all_refuses_while_a_dropped_capture_may_still_be_reading(
     coreaudio_stub,
 ):
-    """the recorder forgets a capture it could
+    """The recorder forgets a capture it could
     not stop, so the session's handle on it is the only thing that can make
     this refusal. Without it the quit path drives PortAudio's init count to
     zero under a thread parked inside stream.read()."""
@@ -274,7 +274,7 @@ def _terminate_refusing_registry(coreaudio_stub):
 def test_busy_reset_after_a_stopped_capture_hands_it_back_and_asks_recovery(
     coreaudio_stub,
 ):
-    """the terminate_all()-failure
+    """The terminate_all()-failure
     branch stopped the warm capture and then returned busy WITHOUT the
     hand-back its sibling branch does. Observed consequence: press 1
     refused, press 2 (default settled back, or one transient no-evidence

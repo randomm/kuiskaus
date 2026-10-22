@@ -159,7 +159,7 @@ def test_worker_reset_reports_busy_for_a_worker_no_caller_named(coreaudio_stub):
 
 
 def test_terminate_all_refuses_while_an_installed_capture_may_be_reading():
-    """ISSUE: ``WarmKeep._blockers`` only ever
+    """``WarmKeep._blockers`` only ever
     held captures that had been *dropped*. The worker path hands no capture
     at all, resting on "with keep-warm on there is no worker" -- a race, not
     an invariant: a capture armed from the menu during a press reads on a
@@ -180,7 +180,7 @@ def test_terminate_all_refuses_while_an_installed_capture_may_be_reading():
 
 
 def test_an_installed_capture_with_no_thread_yet_still_blocks_a_terminate():
-    """ISSUE: the gate was blind to
+    """The gate was blind to
     the one window ``note_installed`` exists to cover.
 
     ``WarmArm`` names the capture BEFORE ``capture.start()`` assigns its

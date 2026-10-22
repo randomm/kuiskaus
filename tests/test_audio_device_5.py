@@ -113,7 +113,7 @@ def test_the_reset_keeps_trying_and_never_rebuilds_while_the_instance_stays_up(
 def test_a_teardown_that_never_succeeds_ends_in_a_surfaced_restart_need(
     coreaudio_stub,
 ):
-    """past the budget the session has to admit it. The user
+    """Past the budget the session has to admit it. The user
     gets a dead microphone either way; the only question is whether anything
     says so."""
     registry, _pa, _module = _poison_registry(coreaudio_stub)

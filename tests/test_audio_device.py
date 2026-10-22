@@ -140,7 +140,7 @@ def test_moved_default_rebuilds_exactly_one_instance(coreaudio_stub):
 
 def test_reset_resolves_the_device_index_on_the_fresh_instance(coreaudio_stub):
     """Issue #72 AC: index resolved on the fresh instance ONLY. The
-    pre-#72efresh resolved against the stale cached instance (whose
+    pre-#72 refresh resolved against the stale cached instance (whose
     PortAudio snapshot was the bug) -- so the resolver must be handed the
     newly constructed PyAudio, never the displaced one."""
     registry, stale, module = _registry()
@@ -264,7 +264,7 @@ def _adopt(registry, new_pa, stream, superseded, stream_open, capture_rate=16000
 
 
 def test_superseded_adopt_closes_the_abandoned_stream_outside_the_lock():
-    """closing a stream is a native call and this
+    """Closing a stream is a native call and this
     lock is the one stop_recording() needs on the hotkey release. The close is
     deferred past the release (the #60 discipline the rest of the file follows
     for terminate()); running it inside would let a wedged Pa_CloseStream hold

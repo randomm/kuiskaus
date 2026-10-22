@@ -1,4 +1,4 @@
-"""The #72s, as failing-then-passing pairs.
+"""The #72 adversarial findings, as failing-then-passing pairs.
 
 Round 1:
 
@@ -99,7 +99,7 @@ def test_concurrent_arming_from_two_threads_starts_exactly_one_capture(
             errors.append(exc)
 
     # Thread A (the menu) enters the arm first and is held in the
-    # constructor; Thread B (a #72e-arm caller) then runs its whole
+    # constructor; Thread B (a #72 re-arm caller) then runs its whole
     # _rearm_warm against the still-unassigned slot.
     t_menu = threading.Thread(
         target=_run, args=(lambda: recorder.set_keep_warm(True),), daemon=True
@@ -145,7 +145,7 @@ def _arm_fixture():
 
 
 def test_rearm_never_states_a_keep_warm_request_the_user_never_made():
-    """the re-arm hand-back must satisfy the
+    """The re-arm hand-back must satisfy the
     request, not make one. Only ``set_enabled`` -- the menu's path -- writes
     ``WarmKeep.enabled``."""
     keep, arm, built, make = _arm_fixture()
@@ -168,7 +168,7 @@ def test_rearm_never_states_a_keep_warm_request_the_user_never_made():
 
 
 def test_rearm_on_an_installed_capture_spends_the_pending_recovery():
-    """of ``want(True)``'s flag clearing:
+    """The counterpart of ``want(True)``'s flag clearing:
     ``rearm`` no longer routes through ``want``, so it must consume the
     recovery itself or the next worker press re-arms a SECOND capture over a
     working one."""
@@ -185,7 +185,7 @@ def test_rearm_on_an_installed_capture_spends_the_pending_recovery():
 
 
 def test_a_capture_whose_thread_could_not_start_is_not_left_installed():
-    """'s companion: the gate now treats an installed
+    """The companion case: the gate now treats an installed
     capture with no thread as arming, so a ``start()`` that failed (thread
     creation does fail under a thread-limit storm) must undo the install --
     otherwise a capture that can never read would refuse every later
@@ -239,7 +239,8 @@ def _keep_warm_stays_off(recorder) -> bool:
 def test_a_reset_does_not_resurrect_keep_warm_the_user_unchecked_during_it(
     audio_recorder_module, coreaudio_stub
 ):
-    """, end to end through the public API.
+    """The reset's re-arm against a menu uncheck, end to end through the
+    public API.
 
     The uncheck is fired from inside the reset's own ``PyAudio()``
     construction -- a moment genuinely inside the window a menu click can
