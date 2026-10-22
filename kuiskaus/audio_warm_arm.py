@@ -96,13 +96,6 @@ class RecorderState(Protocol):
     sample_rate: int
     chunk_size: int
 
-    # Read-only state: the recorder owns these, set by the open attempt.
-    @property
-    def input_device_index(self) -> int | None: ...
-
-    @property
-    def capture_rate(self) -> int | None: ...
-
     def _announce_capture(self, my_gen: int) -> None: ...
 
     def _make_warm_capture(self) -> WarmCapture: ...

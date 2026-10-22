@@ -44,6 +44,66 @@ def test_snapshot_never_pairs_the_live_instance_with_another_one_s_index():
     assert registry.snapshot() == (second, None)
 
 
+def test_an_unbind_never_clears_a_binding_a_concurrent_bind_landed_during_it(
+    monkeypatch,
+):
+    """The one thing ``DeviceIndexBinding``'s lock exists for, asserted at the
+    step it exists for it.
+
+    The class docstring says the lock "exists for ``unbind`` alone -- 'forget
+    the index if it came from this instance' is a test and a clear that have
+    to be one step". ``bind`` had its check moved inside the lock; ``unbind``
+    tested ``_pair[1]`` OUTSIDE it and only took the lock to write, so a bind
+    landing in between -- a worker's ``registry.bind_index()`` from the retry
+    loop, while a press runs ``terminate_all -> _dispose -> unbind`` (which
+    deliberately holds no lock across the native terminate) -- had its fresh
+    binding erased by the clear. The failure direction is benign (``resolve``
+    identity-checks the owner, so the next attempt re-resolves), but the
+    redundant enumeration is exactly what the pairing exists to avoid.
+
+    The interleaving is forced with a lock stand-in whose first entry runs the
+    competing bind: with the test outside the lock the clear lands on top of
+    it; with the test and the clear one locked step, the bind happens first
+    and the test then says "not mine to forget".
+    """
+    from kuiskaus.audio_device_index import DeviceIndexBinding
+
+    class _FirstEntryHookLock:
+        """Lock stand-in that runs ``on_enter`` once, on first entry."""
+
+        def __init__(self, on_enter) -> None:
+            self._hook = on_enter
+
+        def __enter__(self):
+            if self._hook is not None:
+                hook, self._hook = self._hook, None
+                hook()
+            return self
+
+        def __exit__(self, *_exc: object) -> bool:
+            return False
+
+    binding = DeviceIndexBinding()
+    gone = MagicMock(name="PyAudioInstance-gone")
+    live = MagicMock(name="PyAudioInstance-live")
+    binding.bind(3, gone, gone)  # index 3 came from the instance being disposed
+
+    racing: list[str] = []
+
+    def _competing_bind() -> None:
+        racing.append("bound")
+        binding.bind(9, live, live)  # a retry attempt resolved against the new one
+
+    monkeypatch.setattr(binding, "_lock", _FirstEntryHookLock(_competing_bind))
+    binding.unbind(gone)
+
+    assert racing == ["bound"]  # the interleaving really did run
+    assert binding.resolve(live) == 9, (
+        "unbind cleared a binding that had already moved on to a live "
+        "instance: its test was taken outside the lock it exists for"
+    )
+
+
 def test_snapshot_pairs_the_index_with_the_instance_that_resolved_it():
     """The happy path of the same read: a pair written as a pair reads back as
     one, which is what lets an attempt skip re-resolution safely."""

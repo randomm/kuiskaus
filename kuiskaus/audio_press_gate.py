@@ -97,5 +97,9 @@ def unavailable_reason(
         verdict = restart_verdict(registry)
         if last_error is None:
             return verdict
-        return f"{verdict} ({last_error})"
+        # Bounded like every other piece of foreign text in this area
+        # (``str(arm_error)[:120]`` in the reset's hand-back): this string
+        # lands in the menubar status item, and a native exception can carry
+        # an arbitrarily long PortAudio/CoreAudio description.
+        return f"{verdict} ({str(last_error)[:120]})"
     return microphone_unavailable(last_error)

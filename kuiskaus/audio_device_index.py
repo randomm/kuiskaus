@@ -102,9 +102,14 @@ class DeviceIndexBinding:
         no longer exists, so an index into it must not survive as if it did.
         An instance that would not terminate is NOT passed here -- it is
         still live, and the binding is still a fact about it.
+
+        The test and the clear are ONE locked step (mirroring ``bind``): a
+        bind landing between them would be erased by the clear, and the next
+        attempt would pay a fresh enumeration for an index it already had.
         """
-        if self._pair[1] is gone:
-            self._write((None, None))
+        with self._lock:
+            if self._pair[1] is gone:
+                self._store((None, None))
 
     def clear(self) -> None:
         """No index, no owner: nothing is resolved."""

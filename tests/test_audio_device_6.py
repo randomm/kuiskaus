@@ -22,6 +22,7 @@ from kuiskaus.audio_coreaudio import (
     kAudioHardwarePropertyDefaultInputDevice,
 )
 from kuiskaus.audio_device_reset import (
+    MAX_TERMINATE_FAILURES,
     MICROPHONE_BUSY,
     MICROPHONE_NEEDS_RESTART,
     MICROPHONE_NOT_SETTLING,
@@ -374,3 +375,24 @@ def test_a_settled_device_is_recovered_by_the_retry_after_the_backoff(
     clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
     assert registry.refresh(_find_device).busy is False
     assert registry.needs_restart is False
+
+
+def test_the_exhausted_retry_message_bounds_the_foreign_error_text(coreaudio_stub):
+    """The menubar's red line is a status item, not a log.
+
+    Every other piece of foreign text this PR puts on screen is bounded
+    (``str(arm_error)[:120]`` in the reset's hand-back, the ``[:120]`` on the
+    CoreAudio bridge failures) because a native exception can carry an
+    arbitrarily long PortAudio/CoreAudio description. This one went through
+    unbounded, so a 10 KB PortAudio string landed in the status item verbatim.
+    """
+    registry, _pa, _module = _registry()
+    registry.needs_restart = True
+    registry.terminate_failures = MAX_TERMINATE_FAILURES  # the PortAudio verdict
+
+    message = registry.unavailable_reason(OSError("x" * 10_000))
+
+    assert message.startswith(MICROPHONE_NEEDS_RESTART)
+    assert len(message) < len(MICROPHONE_NEEDS_RESTART) + 200, (
+        f"unbounded native error text in the menubar status item: {len(message)} chars"
+    )
