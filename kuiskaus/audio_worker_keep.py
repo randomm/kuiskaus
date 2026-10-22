@@ -49,14 +49,36 @@ class WorkerKeep:
     def note(self, worker: threading.Thread) -> None:
         """Record a worker the caller is about to start.
 
-        Finished threads are pruned on the way in rather than left to
-        accumulate: the ledger exists to answer one question -- is anybody
-        still inside PortAudio -- and a completed worker does not participate
-        in the answer, so keeping it would only grow a list that every
-        terminate has to walk."""
+        Started-and-finished threads are pruned on the way in rather than
+        left to accumulate: the ledger exists to answer one question -- is
+        anybody still inside PortAudio -- and a completed worker does not
+        participate in the answer, so keeping it would only grow a list
+        that every terminate has to walk.
+
+        A thread that has NEVER started is not pruned (issue #72
+        adversarial review): ``start_recording()`` notes under the
+        recorder lock and starts after the release, and a not-yet-started
+        thread is ARMING, not finished -- its ``pa.open()`` may be the
+        next native call. Mirror of the warm-side rule
+        (``WarmKeep.installed_may_be_native``: no thread yet == may be
+        native); pruning a pending worker there would erase it from the
+        very list that exists to name it in that window.
+        """
         with self._lock:
-            self._workers = [t for t in self._workers if t.is_alive()]
+            self._workers = [t for t in self._workers if _may_be_native(t)]
             self._workers.append(worker)
+
+    def forget(self, worker: threading.Thread) -> None:
+        """Remove a worker that can never run (its ``start()`` raised).
+
+        The conservative arming rule makes a never-started thread a
+        blocker; one whose spawn failed can provably never enter a native
+        call, so it leaves the ledger by this explicit route -- or every
+        later terminate would be refused for the life of the process by a
+        thread that cannot exist inside PortAudio.
+        """
+        with self._lock:
+            self._workers = [t for t in self._workers if t is not worker]
 
     def any_may_be_native(self) -> bool:
         """True when a recorded worker may still be inside a native call.
@@ -67,7 +89,16 @@ class WorkerKeep:
         me = threading.current_thread()
         with self._lock:
             pending = list(self._workers)
-        return any(t is not me and t.is_alive() for t in pending)
+        return any(t is not me and _may_be_native(t) for t in pending)
+
+
+def _may_be_native(thread: threading.Thread) -> bool:
+    """Whether this thread may be inside (or about to enter) a native call.
+
+    ``ident`` is None until ``start()`` runs, so "not yet started" is
+    exactly the arming window ``note()`` is called to cover -- treated as
+    a blocker, the conservative direction, mirroring the warm side."""
+    return thread.ident is None or thread.is_alive()
 
 
 def terminate_blocker(

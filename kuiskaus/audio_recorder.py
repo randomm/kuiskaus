@@ -29,6 +29,7 @@ from kuiskaus.audio_warm_arm import (
     cleanup_recorder_session,
     open_warm_capture_stream,
     refresh_recorder_session,
+    start_press,
     warm_press_gate,
 )
 
@@ -423,11 +424,10 @@ class AudioRecorder:
                 # successor.
                 self._session.note_worker(thread)
 
-        if warm is not None:
-            # Keep-warm (issue #66): no open, no worker; route the ring.
-            warm.begin(sink, lambda: self._announce_capture(my_gen))
-        else:
-            thread.start()
+        # Warm: route the ring, no open and no worker (issue #66). Worker:
+        # launched through the helper, whose failure path keeps the worker
+        # ledger and the recorder's view honest (issue #72 review).
+        start_press(self, warm, sink, my_gen)
         return True
 
     def stop_recording(self) -> np.ndarray:

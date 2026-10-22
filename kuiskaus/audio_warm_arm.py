@@ -39,6 +39,7 @@ lock from this module.
 
 from __future__ import annotations
 
+import queue
 import threading
 from collections.abc import Callable, Sequence
 from types import ModuleType
@@ -156,6 +157,44 @@ class WarmArm:
         with self._lock:
             dead, self.capture = self.capture, None
             return dead
+
+
+def start_press(
+    recorder: AudioRecorder,
+    warm: WarmCapture | None,
+    sink: queue.Queue[bytes],
+    my_gen: int,
+) -> None:
+    """Launch the admitted press: route the ring to the warm capture, or
+    start the worker (issue #66 / #72).
+
+    The worker's ``start()`` can fail -- RuntimeError under a thread-limit
+    storm, the same failure ``WarmArm._arm_locked`` handles for captures.
+    The worker ledger counts a never-started thread as a blocker (the
+    arming window between ``note_worker`` and ``start()`` is exactly what
+    it exists to cover), so the failure path must take it back out -- or
+    every later terminate_all() is refused for the life of the process by
+    a thread that can never enter PortAudio. The recorder-side view rolls
+    back with it: recording/recording_thread must not name a launch that
+    never happened (stop_recording() would JOIN an unstarted thread, which
+    raises). Then the error surfaces to the press caller as it always has.
+    """
+    if warm is not None:
+        # Keep-warm (issue #66): no open, no worker; route the ring.
+        warm.begin(sink, lambda: recorder._announce_capture(my_gen))
+        return
+    thread = recorder.recording_thread
+    if thread is None:
+        raise RuntimeError("recorder lost its worker before start")
+    try:
+        thread.start()
+    except BaseException:
+        recorder._session.forget_worker(thread)
+        with recorder._lock:
+            if recorder.recording_thread is thread:
+                recorder.recording = False
+                recorder.recording_thread = None
+        raise
 
 
 def worker_may_be_native(
