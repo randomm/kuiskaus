@@ -405,7 +405,9 @@ class PyAudioRegistry:
             # Dropped for presses, NOT gone for PortAudio: WarmKeep kept
             # the only remaining handle on that thread, and that handle is
             # what gates every later terminate_all() until the thread has
-            # actually exited.
+            # actually exited. The hand-back below asks for that SAME object
+            # to be dropped again; WarmKeep.drop() answers with a probe, not
+            # a second join (#72 review, round 2).
             print("Keep-warm capture would not stop; dropping it.")
             if rearm_warm is not None:
                 rearm_warm(False)

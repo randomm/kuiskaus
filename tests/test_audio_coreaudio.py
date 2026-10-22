@@ -94,6 +94,17 @@ def test_a_raising_address_constructor_is_no_evidence(coreaudio_stub):
     assert read_live_default_input() is None
 
 
+def test_a_raising_bridge_logs_a_bounded_message(coreaudio_stub, capsys):
+    """The bridge can raise carrying an Objective-C description or a whole
+    property list, and this line prints on the press path -- so the logged
+    text is bounded, like audio_retry bounds its own boundary text."""
+    coreaudio_stub.AudioObjectGetPropertyData.side_effect = OSError("x" * 5000)
+    assert read_live_default_input() is None
+    printed = capsys.readouterr().out
+    assert "CoreAudio property read failed" in printed
+    assert len(printed) < 300, f"unbounded bridge text on the press path: {printed}"
+
+
 # ---------------------------------------------------------------------------
 # The change predicate
 # ---------------------------------------------------------------------------

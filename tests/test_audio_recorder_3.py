@@ -196,7 +196,7 @@ def test_refresh_does_not_hold_lock_during_native_calls(audio_recorder_module):
     recorder = _make_recorder(module, init_probe=pa1)
     lock_free_during_native_call: list[bool] = []
 
-    def fake_refresh(_module, pa, idx, _find, _blocked=None):
+    def fake_refresh(pa, idx, _find, _blocked=None):
         acquired = recorder._lock.acquire(blocking=False)
         lock_free_during_native_call.append(acquired)
         if acquired:

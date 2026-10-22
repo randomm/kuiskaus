@@ -72,13 +72,27 @@ class WarmKeep:
         -- with the capture invisible, so a ``clear()`` racing in from the
         menu thread reported a safe-to-terminate session while the reader was
         still parked on it.
+
+        Dropping the same capture twice is idempotent about the JOIN (issue
+        #72 review, round 2): a capture already on the blockers list has been
+        joined once and is proven parked, so the second caller gets the
+        non-blocking probe. Without that, ``refresh()`` dropping a wedged
+        capture and then handing the same object to ``rearm_warm(False)`` --
+        which drops it again -- cost TWO 2.0s joins of a thread that cannot
+        answer, on the hotkey dispatcher's own thread (~4s for one refused
+        press, measured): the press-path stall class issue #60 exists to keep
+        off this thread.
         """
         if warm is None:
             return True
         with self._lock:
-            if warm not in self._blockers:
+            hand_back = warm in self._blockers
+            if not hand_back:
                 self._blockers.append(warm)
-        if warm.stop():
+        # An unlisted capture has never been joined here, so ask it to stop
+        # for real; a listed one is being handed back -- probe, never re-join.
+        stopped = warm.stop(0.0) if hand_back else warm.stop()
+        if stopped:
             with self._lock:
                 if warm in self._blockers:
                     self._blockers.remove(warm)
@@ -141,7 +155,7 @@ class WarmKeep:
         with self._lock:
             self._recover_pending = True
 
-    def recover(self, rearm_warm: Callable[[bool], None] | None) -> None:
+    def recover(self, rearm_warm: Callable[[bool], None]) -> None:
         """Bring keep-warm back after a stuck-read drop (issue #72 review).
 
         ``rearm_warm(True)`` is otherwise reachable only from a warm press
@@ -151,8 +165,6 @@ class WarmKeep:
         committed to a worker: the new capture's own open joins that worker
         before opening, so the two native opens never overlap (issue #16).
         """
-        if rearm_warm is None:
-            return
         with self._lock:
             requested = self.enabled and self._recover_pending
         if requested and self.clear():

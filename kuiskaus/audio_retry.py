@@ -336,7 +336,6 @@ def log_retry_attempt(
 
 
 def refresh_pyaudio_session(
-    pa_module: ModuleType,
     pyaudio_instance: "pyaudio.PyAudio | None",
     input_device_index: int | None,
     find_default_input_device: Callable[["pyaudio.PyAudio"], int],
@@ -354,12 +353,10 @@ def refresh_pyaudio_session(
     registry before rebuilding: a single untracked live instance is enough
     to make the next construction replay the frozen device list.
 
-    ``pa_module`` is kept for call-site symmetry; the owning registry
-    holds the module it constructs from. An instance with no owning
-    registry is left untouched -- either the session was never bound (the
-    retry loop builds and registers it) or the instance came from outside
-    this session, and in neither case is there a tracked set to drive to
-    zero.
+    An instance with no owning registry is left untouched -- either the
+    session was never bound (the retry loop builds and registers it) or the
+    instance came from outside this session, and in neither case is there a
+    tracked set to drive to zero.
 
     Returns (pyaudio_instance, input_device_index) -- possibly both
     replaced. The caller is responsible for any lock scoping.

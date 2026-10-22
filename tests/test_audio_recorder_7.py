@@ -272,6 +272,70 @@ def test_worker_path_does_not_rearm_warm_when_the_user_switched_it_off(
         _cleanup_recorder(recorder)
 
 
+def test_refused_warm_press_joins_a_wedged_capture_only_once(
+    audio_recorder_module, coreaudio_stub
+):
+    """Issue #72 review, round 2 (measured regression): ONE refused press
+    joined the wedged keep-warm thread TWICE -- refresh() dropped the capture,
+    then handed the same object to rearm_warm(False), which dropped it again.
+    Each stop() is a 2.0s join of a thread proven parked in stream.read(), so
+    a press that records nothing stalled the hotkey dispatcher for ~4s: the
+    press-path stall class issue #60 exists to keep off this thread. The press
+    now joins once and every later ask is a non-blocking probe.
+    """
+    module = audio_recorder_module
+    release = threading.Event()
+    pa = _make_pyaudio_instance(0, rate=16000.0)
+    pa.open.return_value = _blocking_stream(OSError("stream closed by test"), release)
+    recorder = _make_recorder(module, init_probe=pa)
+    recorder.set_keep_warm(True)
+    assert _wait_until(lambda: recorder._warm.ready)
+    warm = recorder._warm
+    timeouts: list[float] = []
+
+    def _stuck_stop(timeout: float = 2.0) -> bool:
+        # What the real stop() reports while the thread is parked in the
+        # read. The join itself is skipped -- the assertion is about how many
+        # BLOCKING joins one refused press asks for.
+        timeouts.append(timeout)
+        warm._stop.set()
+        return False
+
+    warm.stop = _stuck_stop
+    _live_default_input(coreaudio_stub, 77)  # the default moved
+
+    try:
+        assert recorder.start_recording() is False  # refused: microphone busy
+        blocking = [t for t in timeouts if t != 0.0]
+        assert blocking == [2.0], f"blocking joins for one refused press: {blocking}"
+        assert recorder._warm is None  # the dead capture was handed back
+        pa.terminate.assert_not_called()  # ... and the engine stayed up
+    finally:
+        release.set()
+        _cleanup_recorder(recorder)
+
+
+def test_warm_keep_a_second_drop_of_a_wedged_capture_probes_never_rejoins():
+    """WarmKeep unit (issue #72 review, round 2): the busy reset path drops a
+    wedged capture and then hands the SAME object to rearm_warm(False), which
+    drops it again. A capture already on the blockers list has been joined and
+    is proven parked, so the second ask is answered by the probe -- two joins
+    of a thread that cannot answer is 2s of stall per ask, on the press path.
+    """
+    keep = WarmKeep()
+    wedged = MagicMock(name="wedged")
+    wedged.stop.return_value = False  # never stops: parked in the native read
+
+    assert keep.drop(wedged) is False
+    assert keep.drop(wedged) is False  # the rearm_warm(False) hand-back
+
+    # First ask: the real stop() with WarmCapture's own default timeout; the
+    # hand-back: the non-blocking probe. A regression shows up as [2.0, 2.0].
+    timeouts = [c.args[0] if c.args else 2.0 for c in wedged.stop.call_args_list]
+    assert timeouts == [2.0, 0.0], f"a wedged capture was joined twice: {timeouts}"
+    assert keep.clear() is False  # still a blocker: terminate stays refused
+
+
 def test_warm_keep_recovers_only_once_its_thread_is_gone():
     """WarmKeep unit: the handle is what makes the invariant checkable, and it
     is released by a non-blocking probe -- never by a join that could park the

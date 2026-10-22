@@ -214,7 +214,7 @@ class AudioRecorder:
         with self._lock:
             pa, device_index = self.pyaudio, self.input_device_index
         pa, device_index = refresh_pyaudio_session(
-            pyaudio, pa, device_index, find_default_input_device, blocked
+            pa, device_index, find_default_input_device, blocked
         )
         with self._lock:
             self.pyaudio, self.input_device_index = pa, device_index

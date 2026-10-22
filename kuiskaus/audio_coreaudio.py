@@ -68,7 +68,11 @@ def _read_uint32(object_id: int, selector: int, scope: int, element: int) -> int
             object_id, address, 0, _NO_QUALIFIER, _SIZE_BYTES, _OUT_BUFFER
         )  # fmt: skip
     except Exception as e:  # noqa: BLE001 - PyObjC/CoreAudio boundary, logged
-        print(f"CoreAudio property read failed ({e}); treating as no evidence.")
+        # Bounded: a bridge failure can dump a whole property list or an
+        # Objective-C description, and this line lands on the press path
+        # (same discipline as audio_retry's [:120] truncation).
+        detail = str(e)[:120]
+        print(f"CoreAudio property read failed ({detail}); treating as no evidence.")
         return None
     if status != 0 or not isinstance(raw, (bytes, bytearray)):
         return None
