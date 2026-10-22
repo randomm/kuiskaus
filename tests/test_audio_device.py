@@ -243,7 +243,7 @@ def test_reset_reports_busy_rather_than_terminating_under_a_live_worker(
     worker = threading.Thread(target=release.wait, daemon=True)
     worker.start()
     try:
-        result = registry.refresh(_find_device, None, None, worker)
+        result = registry.refresh(_find_device, None, None, lambda: (worker,))
     finally:
         release.set()
         worker.join(timeout=5.0)

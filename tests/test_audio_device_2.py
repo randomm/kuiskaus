@@ -127,7 +127,9 @@ def test_the_worker_running_a_reset_is_never_its_own_blocker(coreaudio_stub):
     fresh = MagicMock(name="PyAudioInstance-fresh")
     module.PyAudio = MagicMock(return_value=fresh)
 
-    result = registry.refresh(_find_device, None, None, threading.current_thread())
+    result = registry.refresh(
+        _find_device, None, None, lambda: (threading.current_thread(),)
+    )
 
     assert result.busy is False
     stale.terminate.assert_called_once()

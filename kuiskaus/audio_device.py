@@ -16,7 +16,7 @@ reaching zero is the only definition of clean.
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from types import ModuleType
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -33,8 +33,8 @@ from kuiskaus.audio_retry import (
     log_retry_attempt,
     stamp_owner,
     terminate_quietly,
-    worker_alive,
 )
+from kuiskaus.audio_warm_arm import worker_may_be_native
 from kuiskaus.audio_warm_keep import WarmKeep
 
 if TYPE_CHECKING:
@@ -338,7 +338,7 @@ class PyAudioRegistry:
         find_default_input_device: Callable[[pyaudio.PyAudio], int],
         warm: WarmCapture | None = None,
         rearm_warm: Callable[[bool], None] | None = None,
-        blocked_worker: threading.Thread | None = None,
+        blocked_workers: Callable[[], Sequence[threading.Thread | None]] | None = None,
     ) -> SessionRefresh:
         """Reset the session when the live default moved (issue #72).
 
@@ -382,15 +382,14 @@ class PyAudioRegistry:
         # instance: that is the state cleanup() refuses to terminate in
         # (issue #37 task-c), and the pre-#72 poll never reached it because
         # the reset never ran. The worker and the warm reopen each name the
-        # thread they joined and may still be alive -- issue #60's orphan --
-        # and a keep-warm press names the worker it can never speak for.
-        # The thread running this reset is never the blocker: it joined its
-        # predecessor first. Busy, not half-reset -- nothing here is torn
-        # down, so the session stays dirty and the next press asks again.
-        if (
-            worker_alive(blocked_worker)
-            and blocked_worker is not threading.current_thread()
-        ) or not self.warm.clear():
+        # thread they joined -- issue #60's orphan -- and a keep-warm press
+        # names the worker it can never speak for; the names resolve at
+        # GATE time, so a finished W1 cannot mask a live W2 (issue #72
+        # review, finding 2). The thread running this reset is never the
+        # blocker: it joined its predecessor first. Busy, not half-reset --
+        # nothing here is torn down, so the session stays dirty and the
+        # next press asks again.
+        if worker_may_be_native(blocked_workers) or not self.warm.clear():
             return SessionRefresh(self.pyaudio, self.input_device_index, True)
 
         warm_stopped = self.warm.drop(warm)
@@ -475,7 +474,7 @@ class PyAudioRegistry:
         if recording or warm is None:
             return True
         return not self.refresh(
-            find_default_input_device, warm, rearm_warm, worker
+            find_default_input_device, warm, rearm_warm, lambda: (worker,)
         ).busy
 
 

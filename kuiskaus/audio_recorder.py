@@ -19,12 +19,18 @@ from kuiskaus.audio_retry import (
     log_retry_attempt,
     log_stop,
     microphone_unavailable,
-    open_warm_stream,
     refresh_pyaudio_session,
     validate_retry_config,
     worker_alive,
 )
 from kuiskaus.audio_warm import WarmCapture
+from kuiskaus.audio_warm_arm import (
+    WarmArm,
+    announce_capture,
+    cleanup_recorder_session,
+    open_warm_capture_stream,
+    warm_press_gate,
+)
 
 # Aliases for annotations written inside the class body, where the
 # ``pyaudio`` property (issue #72) otherwise shadows the module name.
@@ -60,9 +66,11 @@ class AudioRecorder:
         self.recording = False
         self.audio_queue: queue.Queue[bytes] = queue.Queue()
         self.recording_thread: threading.Thread | None = None
-        self._warm: WarmCapture | None = None  # issue #66
         self.last_error: str | None = None
         self._lock = threading.Lock()
+        # The keep-warm capture (issue #66), armed only through WarmArm
+        # so the transition is atomic across the #72 caller threads.
+        self._warm_arm = WarmArm(self._session.warm, self._lock)
         self._generation = 0
         self._capture_rate: int | None = None  # issue #55 (adoption)
         self._start_monotonic: float | None = None  # issue #40
@@ -116,11 +124,22 @@ class AudioRecorder:
         before any open succeeds."""
         return self._capture_rate
 
+    @property
+    def _warm(self) -> WarmCapture | None:
+        """The keep-warm capture slot; it lives in WarmArm, where every
+        transition is serialised (issue #72 finding 1)."""
+        return self._warm_arm.capture
+
+    def _stale(self, my_gen: int) -> Callable[[], bool]:
+        """Supersession predicate for one generation, evaluated by the
+        callee under _lock -- its single arbiter (issue #55)."""
+        return lambda: self._generation != my_gen or not self.recording
+
     def _check_superseded(self, my_gen: int, attempt: int, attempt_start: float) -> bool:  # fmt: skip
         """True (and logged) if this retry sequence lost its race."""
         return check_superseded(
             self._lock,
-            lambda: self._generation != my_gen or not self.recording,
+            self._stale(my_gen),
             attempt, self.max_attempts, attempt_start,
         )  # fmt: skip
 
@@ -129,7 +148,7 @@ class AudioRecorder:
         owns the live instance (issue #72). False = superseded."""
         return self._session.adopt(
             self._lock,
-            lambda: self._generation != my_gen or not self.recording,
+            self._stale(my_gen),
             lambda rate: setattr(self, "_capture_rate", rate),
             lambda: self.stream is not None,
             new_pa, stream, capture_rate, attempt, attempt_start, self.max_attempts,
@@ -209,15 +228,26 @@ class AudioRecorder:
         """Live-default device reset (issue #72) at the top of the worker.
         Native calls run OUTSIDE _lock (issue #60): they can block and
         stop_recording() needs the lock. One worker runs this at a time;
-        ``blocked`` is the worker just joined -- still alive means busy.
+        ``blocked`` is the worker just joined, and the gate also consults
+        the recorder's CURRENT worker at gate time (finding 2).
         """
         with self._lock:
             pa, device_index = self.pyaudio, self.input_device_index
         pa, device_index = refresh_pyaudio_session(
-            pa, device_index, find_default_input_device, blocked
+            pa,
+            device_index,
+            find_default_input_device,
+            lambda: (blocked, self._current_worker()),
         )
         with self._lock:
             self.pyaudio, self.input_device_index = pa, device_index
+
+    def _current_worker(self) -> threading.Thread | None:
+        """The worker named at CALL time, read under _lock: a name
+        captured before a long join is stale by gate time -- a finished
+        W1 must not mask a live W2 (issue #72 finding 2)."""
+        with self._lock:
+            return self.recording_thread
 
     def _rearm_warm(self, usable: bool) -> None:
         """Re-arm the keep-warm capture after a reset replaced its session.
@@ -226,58 +256,42 @@ class AudioRecorder:
         -- drop it and later presses take the worker path, not a dead sink.
         The session keeps the handle on its live thread: see WarmKeep.drop().
         """
-        dead, self._warm = self._warm, None
+        dead = self._warm_arm.take()
         self._session.warm.drop(dead)
         if usable:
             self.set_keep_warm(True)
 
     def _announce_capture(self, my_gen: int) -> None:
         """Fire on_capture_started at most once per start_recording() cycle
-        (issue #43); the generation/recording gate is the staleness defence."""
-        with self._lock:
-            if (
-                self._capture_announced
-                or self._generation != my_gen
-                or not self.recording
-            ):
-                return
-            self._capture_announced = True
-        callback = self.on_capture_started
-        if callback is not None:
-            try:
-                callback()
-            except Exception:  # noqa: BLE001 - callback boundary
-                # A raising callback must not stop the capture thread.
-                print("on_capture_started callback raised")
+        (issue #43); the generation/recording gate is the staleness defence.
+        """
+        announce_capture(
+            self._lock,
+            lambda: self._capture_announced,
+            self._stale(my_gen),
+            lambda: setattr(self, "_capture_announced", True),
+            self.on_capture_started,
+        )
 
     def set_keep_warm(self, enabled: bool) -> None:
-        """Keep the input stream open between recordings (issue #66)."""
-        self._session.warm.want(enabled)
-        if enabled and self._warm is None:
-            self._warm = WarmCapture(self._open_warm_stream, self.chunk_size)
-            self._warm.start()
-        elif not enabled and self._warm is not None:
-            warm, self._warm = self._warm, None
-            self._capture_rate = warm.capture_rate  # for an in-flight recording
-            self._session.warm.drop(warm)
+        """Keep the input stream open between recordings (issue #66).
 
-    def _open_warm_stream(self) -> tuple["_Stream", int]:
+        Arming is serialised in WarmArm (issue #72 adversarial finding
+        1): #72 gave it worker- and press-side caller threads, and a
+        lock-free check-then-act could start two captures and orphan
+        the loser outside WarmKeep, where terminate_all() drives
+        PortAudio out from under it.
+        """
+        self._warm_arm.set_enabled(
+            lambda: WarmCapture(self._open_warm_stream, self.chunk_size),
+            lambda rate: setattr(self, "_capture_rate", rate),
+            enabled,
+        )
+
+    def _open_warm_stream(self) -> tuple[_Stream, int]:
         """One open for WarmCapture's thread. Never overlaps a per-press
         worker's native open on the shared PyAudio (issue #16)."""
-        previous = self.recording_thread
-        if previous is not None and previous.is_alive():
-            previous.join(timeout=PREVIOUS_WORKER_WAIT_SECONDS)
-        self._refresh_pyaudio_session(previous)
-        with self._lock:
-            pa, device_index = self.pyaudio, self.input_device_index
-        new_pa, stream, rate = open_warm_stream(
-            pyaudio, pa, device_index, self.format, self.channels,
-            self.sample_rate, self.chunk_size, self._session,
-        )  # fmt: skip
-        if new_pa is not pa:
-            with self._lock:
-                self.pyaudio = new_pa
-        return stream, rate
+        return open_warm_capture_stream(self, pyaudio)
 
     def _recording_worker(
         self, my_gen: int, previous: "threading.Thread | None" = None
@@ -357,10 +371,13 @@ class AudioRecorder:
         worker gets the orphan and joins it before opening; the session
         gate runs a keep-warm press's live-default check (#72).
         """
-        if not self._session.press_check_if_admissible(
-            self.recording, self._warm, self.recording_thread,
-            find_default_input_device, self._rearm_warm,
-        ):  # fmt: skip
+        if not warm_press_gate(
+            self._lock,
+            self._session,
+            lambda: (self.recording, self._warm, self.recording_thread),
+            find_default_input_device,
+            self._rearm_warm,
+        ):
             with self._lock:  # every last_error write holds _lock (issue #55)
                 self.last_error = "microphone busy — recording did not start"
             return False
@@ -473,28 +490,7 @@ class AudioRecorder:
         another thread holds a stream is unsafe (lock-scoped local-capture
         pattern, issue #37 task-c).
         """
-        if self.recording:
-            self.stop_recording()
-
-        warm, self._warm = self._warm, None
-        if not self._session.warm.drop(warm) or not self._session.warm.clear():
-            print("Warm capture still active at cleanup; skipping PyAudio.terminate()")
-            return
-
-        worker_thread = self.recording_thread
-        with self._lock:
-            if self.recording or worker_alive(worker_thread):
-                print(
-                    "Recording worker still active at cleanup; skipping "
-                    "PyAudio.terminate()"
-                )
-                return
-            self.pyaudio = None
-            self.input_device_index = None
-
-        # Issue #72: every registered instance goes -- a single instance
-        # anywhere keeps PortAudio's init count above zero and frozen.
-        self._session.terminate_all()
+        cleanup_recorder_session(self)
 
     def __del__(self):
         self.cleanup()
