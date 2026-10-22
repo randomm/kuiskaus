@@ -238,10 +238,13 @@ def test_keep_warm_returns_after_a_dropped_capture_thread_leaves_the_read(
         )
         # Nothing blocks the deferred reset any more either: the abandoned
         # thread is gone, so terminating and rebuilding is what the session
-        # is supposed to do here.
-        worker = recorder.recording_thread
-        assert worker is not None
-        assert _wait_until(lambda: not worker.is_alive(), timeout=8.0)
+        # is supposed to do here. The worker may have finished by the time
+        # this reads the name (every read in this test releases instantly
+        # once `release` is set), so the assertion covers "ran and cleared
+        # its own state", not "is still running".
+        assert _wait_until(lambda: not recorder.recording, timeout=8.0), (
+            "the worker press never completed its own teardown"
+        )
     finally:
         release.set()
         _cleanup_recorder(recorder)

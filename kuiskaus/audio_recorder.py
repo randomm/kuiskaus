@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import pyaudio
 
-from kuiskaus.audio_device import PyAudioRegistry, check_superseded
+from kuiskaus.audio_device import PyAudioRegistry
 from kuiskaus.audio_resample import TARGET_RATE, assemble_audio
 from kuiskaus.audio_retry import (
     MAX_ATTEMPTS,
@@ -14,6 +14,7 @@ from kuiskaus.audio_retry import (
     PREVIOUS_WORKER_WAIT_SECONDS,
     RETRY_BACKOFF_SECONDS,
     attempt_open_once,
+    check_superseded,
     close_stream_quietly,
     find_default_input_device,
     log_retry_attempt,
@@ -104,9 +105,17 @@ class AudioRecorder:
         """Device index resolved against ``pyaudio`` (issue #42)."""
         return self._session.input_device_index
 
-    @input_device_index.setter
-    def input_device_index(self, index: int | None) -> None:
-        self._session.set_index(index)
+    def publish_session(self, pa: "_PyAudio | None", device_index: int | None) -> None:
+        """Publish the (instance, index) pair a reset just built.
+
+        Both halves go under one lock acquisition and the index is recorded
+        against the instance handed in here, not whatever happens to be live
+        when the write lands: an index is only a fact about the instance that
+        enumerated it.
+        """
+        with self._lock:
+            self._session.pyaudio = pa
+            self._session.set_index(device_index, pa)
 
     @property
     def current_generation(self) -> int:
@@ -143,7 +152,15 @@ class AudioRecorder:
             attempt, self.max_attempts, attempt_start,
         )  # fmt: skip
 
-    def _adopt_and_dispose_previous(self, new_pa, stream, capture_rate, my_gen, attempt, attempt_start) -> bool:  # fmt: skip
+    def _adopt_and_dispose_previous(
+        self,
+        new_pa: "_PyAudio",
+        stream: "_Stream",
+        capture_rate: int | None,
+        my_gen: int,
+        attempt: int,
+        attempt_start: float,
+    ) -> bool:
         """Lock-scoped ownership transfer into the device session, which
         owns the live instance (issue #72). False = superseded."""
         return self._session.adopt(
@@ -228,6 +245,21 @@ class AudioRecorder:
                 self.recording_thread = None
         return None
 
+    def _fail_worker_session(self, my_gen: int, error: BaseException | None) -> None:
+        """Generation-gated teardown for a worker that never got a stream.
+
+        Shared by the exhausted retry loop and the worker's own head: either
+        way the press is over, and "recording" must not outlive the thread
+        that was recording it.
+        """
+        with self._lock:
+            if self._generation != my_gen:
+                return
+            self.last_error = self._session.unavailable_reason(error)
+            self.recording = False
+            self.stream = None
+            self.recording_thread = None
+
     def _refresh_pyaudio_session(self, blocked: threading.Thread | None = None) -> None:
         """Live-default device reset (issue #72) at the top of the worker.
         Native calls run OUTSIDE _lock (issue #60): they can block and
@@ -246,12 +278,18 @@ class AudioRecorder:
 
         usable=True goes through WarmArm.rearm, NOT set_keep_warm: the reset
         ran outside the lock long enough for the menu to be unchecked, and
-        re-arming anyway leaves the mic open behind an unchecked item (#72).
+        re-arming anyway leaves the mic open behind an unchecked item.
+
+        A drop() that reports False names a thread still parked in a native
+        read on the session being replaced: arming a fresh capture over it
+        puts two readers on PortAudio at once, so the arm is skipped and the
+        recovery flag (which drop() set) brings keep-warm back once the
+        ledger clears.
         """
         dead = self._warm_arm.take()
-        self._session.warm.drop(dead)
-        if usable:
-            self._warm_arm.rearm(self._make_warm_capture)
+        if not self._session.warm.drop(dead) or not usable:
+            return
+        self._warm_arm.rearm(self._make_warm_capture)
 
     def _announce_capture(self, my_gen: int) -> None:
         """Fire on_capture_started at most once per start_recording() cycle
@@ -311,9 +349,19 @@ class AudioRecorder:
             with self._lock:
                 if self._generation != my_gen or not self.recording:
                     return  # released again while waiting
-        refresh_recorder_session(self, previous)
-        # Keep-warm does not re-arm itself after a stuck-read drop (issue #72).
-        self._session.warm.recover(self._rearm_warm)
+        # The head of this worker reaches CoreAudio and the thread ledgers;
+        # an escaping exception here would leave recording=True with no
+        # last_error and no worker -- a recorder that stopped answering,
+        # rather than one that failed. Same generation gate as every other
+        # write in this function.
+        try:
+            refresh_recorder_session(self, previous)
+            # Keep-warm does not re-arm itself after a stuck-read drop.
+            self._session.warm.recover(self._rearm_warm)
+        except Exception as head_error:  # noqa: BLE001 - worker thread boundary
+            print(f"Error preparing the recording session: {head_error}")
+            self._fail_worker_session(my_gen, head_error)
+            return
         stream = self._open_stream_with_retry(my_gen)
         if stream is None:
             return  # last_error already set (or generation superseded)

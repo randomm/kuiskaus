@@ -287,10 +287,10 @@ def test_open_stream_uses_native_rate_48000(audio_recorder_module):
     assert recorder.start_recording() is True
     thread = recorder.recording_thread
     assert thread is not None
-    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
-
-    # The native rate must be used, not the hardcoded 16000.
-    assert recorder.capture_rate == 48000
+    # The native rate must be used, not the hardcoded 16000. The wait is on
+    # the rate itself: pyaudio names pa1 from __init__, so waiting on it
+    # would not prove the open had been adopted yet.
+    assert _wait_until(lambda: recorder.capture_rate == 48000, timeout=5.0)
     pa1.open.assert_called_once_with(
         format=pa1.open.call_args.kwargs["format"],
         channels=pa1.open.call_args.kwargs["channels"],
@@ -318,9 +318,7 @@ def test_open_stream_uses_native_rate_24000(audio_recorder_module):
     assert recorder.start_recording() is True
     thread = recorder.recording_thread
     assert thread is not None
-    assert _wait_until(lambda: recorder.pyaudio is pa1, timeout=5.0)
-
-    assert recorder.capture_rate == 24000
+    assert _wait_until(lambda: recorder.capture_rate == 24000, timeout=5.0)
 
     release_event.set()
     thread.join(timeout=10.0)

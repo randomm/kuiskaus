@@ -85,11 +85,24 @@ def coreaudio_stub(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     tests.support_audio_recorder._live_default_input(stub, device_id).
     """
     stub = MagicMock(name="CoreAudio")
-    stub.kAudioObjectSystemObject = 1
-    stub.kAudioObjectPropertyScopeGlobal = 1735159650  # 'glob'
-    stub.kAudioObjectPropertyElementMain = 0
-    stub.kAudioHardwarePropertyDefaultInputDevice = 1682533920  # 'dIn '
-    stub.kAudioDevicePropertyDeviceIsAlive = 1818850926  # 'livn'
+    from kuiskaus import audio_coreaudio
+
+    # The selector constants are the contract between this stub and the
+    # reader; restating the literals here meant a test could pass against a
+    # number the module no longer uses.
+    stub.kAudioObjectSystemObject = audio_coreaudio.kAudioObjectSystemObject
+    stub.kAudioObjectPropertyScopeGlobal = (
+        audio_coreaudio.kAudioObjectPropertyScopeGlobal
+    )
+    stub.kAudioObjectPropertyElementMain = (
+        audio_coreaudio.kAudioObjectPropertyElementMain
+    )
+    stub.kAudioHardwarePropertyDefaultInputDevice = (
+        audio_coreaudio.kAudioHardwarePropertyDefaultInputDevice
+    )
+    stub.kAudioDevicePropertyDeviceIsAlive = (
+        audio_coreaudio.kAudioDevicePropertyDeviceIsAlive
+    )
     # A real AudioObjectPropertyAddress carries the selector the reader
     # asked for, so a stub that answers per-selector can tell the two
     # reads apart -- which is what makes "device moved" and "device not
@@ -99,6 +112,10 @@ def coreaudio_stub(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     )  # fmt: skip
     stub.AudioObjectGetPropertyData.return_value = (1852797029, 0, None)
     monkeypatch.setitem(sys.modules, "CoreAudio", stub)
+    # The unavailable-framework latch and the OSStatus log budget are
+    # process-lifetime state; a test that tripped either must not hand the
+    # verdict to the rest of the suite.
+    audio_coreaudio._reset_diagnostics_for_tests()
     return stub
 
 

@@ -72,24 +72,22 @@ class PyAudioRegistry:
     def __init__(self, pa_module: ModuleType) -> None:
         self._pa_module = pa_module
         self.pyaudio: pyaudio.PyAudio | None = None
-        # The device index lives in ``_indices``, paired with the instance it
-        # was resolved against (issue #72 review, round 1): a PortAudio index
-        # is a fact about ONE instance's frozen enumeration, so an index
-        # whose instance is gone is not an index at all -- reading it back
-        # opens a stream on a device that instance never had. Read it
-        # through the property below, never through a copy.
+        # A PortAudio index is a fact about ONE instance's frozen
+        # enumeration, so an index whose instance is gone is not an index at
+        # all -- reading it back opens a stream on a device that instance
+        # never had. It lives in ``_indices``, paired with its instance, and
+        # is read through the property below, never through a copy.
         self._indices = DeviceIndexBinding()
-        self.device_id: int | None = None
         # The (device_id, is_alive) pair the CURRENT session was opened
-        # against (issue #72 review): a default that stays reported
-        # not-alive must cost one rebuild, not one per press -- see the
-        # dedupe check in the reset. ONE read writes this together with
-        # ``device_id`` (open(), or the reset's fallback when open()'s
-        # read gave no evidence): the guard compares both fields, and
-        # pinning them from two independent CoreAudio reads is what let
-        # it suppress a still-needed reset forever. A failed open clears
-        # both -- no instance, no baseline, nothing to dedupe against --
-        # so failed resets stay retryable.
+        # against: a default that stays reported not-alive must cost one
+        # rebuild, not one per press -- see the dedupe check in the reset.
+        # It is ONE fact from ONE read (open(), or the reset's fallback when
+        # open()'s read gave no evidence); ``device_id`` below is derived
+        # from it rather than stored beside it, because a baseline split
+        # across two fields written by two CoreAudio reads is what let the
+        # guard suppress a still-needed reset forever. A failed open clears
+        # it -- no instance, no baseline, nothing to dedupe against -- so
+        # failed resets stay retryable.
         self.last_reset: LiveDefaultInput | None = None
         # The keep-warm request, plus any capture this session dropped while
         # its thread was parked in a native read: the recorder clears its own
@@ -113,6 +111,15 @@ class PyAudioRegistry:
         # about to return).
         self.terminate_failures = 0
         self.needs_restart = False
+        # Rebuilds this session has run against the same device in a row. A
+        # pair CoreAudio reports differently on every read defeats the dedupe
+        # guard legitimately, so the count -- not the guard -- is what stops
+        # a flapping device costing a full teardown on every press.
+        self.rebuild_streak = 0
+        self.rebuild_device: int | None = None
+        # Monotonic instant the next press may retry a teardown, once
+        # ``needs_restart`` has been declared (see ``RESTART_RETRY_SECONDS``).
+        self.restart_retry_after = 0.0
         self._instances: list[pyaudio.PyAudio] = []
         # Guards only the _instances list mutations -- never held across a
         # native call, so it cannot be the lock a blocking terminate waits on.
@@ -161,6 +168,16 @@ class PyAudioRegistry:
         self.workers.forget(worker)
 
     @property
+    def device_id(self) -> int | None:
+        """The device the live session was opened against, or None.
+
+        Read-only, and derived from ``last_reset``: the device id and the
+        liveness the reset dedupes on are the same CoreAudio read, and two
+        fields would be two chances to disagree.
+        """
+        return None if self.last_reset is None else self.last_reset.device_id
+
+    @property
     def input_device_index(self) -> int | None:
         """The session's device index, while it describes the live instance
         (issue #72 review, round 1; see ``DeviceIndexBinding``).
@@ -184,14 +201,18 @@ class PyAudioRegistry:
         pa = self.pyaudio
         return pa, self._indices.resolve(pa)
 
-    def set_index(self, device_index: int | None) -> None:
-        """Record a (live instance, index) pair the caller holds together.
+    def set_index(
+        self, device_index: int | None, resolved_on: pyaudio.PyAudio | None
+    ) -> None:
+        """Record the (instance, index) pair the caller just read together.
 
-        The recorder's session write-back comes through here: it read the
-        pair together, so the pairing is recorded as it was read rather than
-        inferred afterwards (issue #72 review, round 1).
+        The instance is a parameter, not read back from the session: an index
+        is only ever a fact about the instance that enumerated it, so the
+        caller that holds the pair states whose pair it is. Inferring the
+        owner at write time was the bug -- a session that moved between the
+        read and this write recorded the index against the wrong instance.
         """
-        self._indices.publish(device_index, self.pyaudio)
+        self._indices.publish(device_index, resolved_on)
 
     def bind_index(self, device_index: int, resolved_on: pyaudio.PyAudio) -> None:
         """Publish the device index a retry attempt resolved (issue #72).
@@ -260,16 +281,18 @@ class PyAudioRegistry:
         the session says so through ``needs_restart`` rather than leaving the
         app reporting Ready over a dead microphone (issue #72 review, r1).
         """
-        blocker = terminate_blocker(self.workers, self.warm)
-        if blocker is not None:
-            print(
-                f"{blocker.capitalize()} may still be native; not terminating PyAudio."
-            )
+        if self._refuse_teardown():
             return False
         incomplete = False
         disposed = 0
         with self._instances_lock:
             pending = list(self._instances)
+        # The ledger gains names on other threads (a press notes its worker
+        # under the recorder's lock, not this one), so the gate is asked
+        # again immediately before anything is disposed: the snapshot above
+        # is a list of instances, not a promise about the threads on them.
+        if self._refuse_teardown():
+            return False
         for pa in pending:
             if self._dispose(pa):
                 disposed += 1
@@ -280,13 +303,30 @@ class PyAudioRegistry:
             # be left pointing at an instance this call DID terminate (a press
             # then opens on it and gets "microphone unavailable" on healthy
             # hardware until the next press re-binds), and without this line
-            # that press has no trace of why (#72 review, minor 5).
+            # that press has no trace of why.
             print(
                 f"Terminated {disposed} of {len(pending)} PyAudio instances; "
                 "the session may still name one of them."
             )
+        if self.pyaudio is not None and self.pyaudio not in self._instances:
+            # The session names an instance this pass terminated. Left bound,
+            # the retry loop opens on a corpse and cannot get a replacement
+            # (registry_for() finds no session to rebuild), so the name goes
+            # with the instance and the next press rebuilds.
+            self.pyaudio = None
+            self._indices.clear()
         note_terminate_outcome(self, clean=not incomplete)
         return not incomplete
+
+    def _refuse_teardown(self) -> bool:
+        """True (and logged) while something this session started may still
+        be inside a native PortAudio call.
+        """
+        blocker = terminate_blocker(self.workers, self.warm)
+        if blocker is None:
+            return False
+        print(f"{blocker.capitalize()} may still be native; not terminating PyAudio.")
+        return True
 
     def open(self, find_default_input_device: Callable[[pyaudio.PyAudio], int]) -> bool:
         """Construct the persistent cached session (issue #42) and record
@@ -306,24 +346,17 @@ class PyAudioRegistry:
             )
             # No instance, no baseline: a previous open's pair left
             # standing would have the dedupe guard vouch for a session
-            # that does not exist (issue #72 review).
-            self.device_id = None
+            # that does not exist.
             self.last_reset = None
             return False
         self.register(pa)
         self.pyaudio = pa
-        # ONE read writes both halves of the dedupe baseline (issue #72
-        # review, CRITICAL): device_id and last_reset used to come from
-        # two independent CoreAudio reads (this one and the reset's own),
-        # and when they disagreed the guard compared a live read against
-        # a pair from another one -- suppressing a still-needed reset
-        # forever. A reset whose open() read gave no evidence fills both
-        # from its own read instead (see audio_device_reset).
-        live = read_live_default_input()
-        self.device_id = None if live is None else live.device_id
-        self.last_reset = live
+        # ONE read writes the whole dedupe baseline, liveness and device id
+        # together: a reset whose read gave no evidence fills it from its
+        # own read instead (see audio_device_reset).
+        self.last_reset = read_live_default_input()
         # A fresh instance re-enumerates, so whatever was resolved before
-        # describes another instance's device list (issue #72 review, r1).
+        # describes another instance's device list.
         self._indices.clear()
         try:
             self.bind_index(find_default_input_device(pa), pa)
@@ -475,23 +508,3 @@ class PyAudioRegistry:
         """Drop the device-index binding entirely (the reset does it once
         every instance the index was resolved against is gone)."""
         self._indices.clear()
-
-
-def check_superseded(
-    lock: threading.Lock,
-    is_superseded: Callable[[], bool],
-    attempt: int,
-    max_attempts: int,
-    attempt_start: float,
-) -> bool:
-    """True (and logged) when this retry sequence lost its race: a newer
-    generation took over, or recording was released. Shared by the
-    pre-sleep and post-sleep abort sites (issue #37 lens review MEDIUM
-    #7: previously duplicated). The predicate is evaluated under the
-    caller's lock, which is the single arbiter of that state (issue #55).
-    """
-    with lock:
-        if is_superseded():
-            log_retry_attempt(attempt, max_attempts, attempt_start, None, "abort")
-            return True
-        return False

@@ -277,8 +277,7 @@ def refresh_recorder_session(
         find_default_input_device,
         lambda: (blocked, current_worker(recorder)),
     )
-    with recorder._lock:
-        recorder.pyaudio, recorder.input_device_index = pa, device_index
+    recorder.publish_session(pa, device_index)
 
 
 def open_warm_capture_stream(
@@ -328,8 +327,7 @@ def cleanup_recorder_session(recorder: AudioRecorder) -> None:
                 "Recording worker still active at cleanup; skipping PyAudio.terminate()"
             )
             return
-        recorder.pyaudio = None
-        recorder.input_device_index = None
+    recorder.publish_session(None, None)
 
     # Issue #72: every registered instance goes -- a single instance
     # anywhere keeps PortAudio's init count above zero and frozen.

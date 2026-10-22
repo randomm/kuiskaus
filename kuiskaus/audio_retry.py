@@ -278,13 +278,29 @@ def terminate_quietly(pa: "pyaudio.PyAudio") -> bool:
 # device reset can find the session from the instance it was handed.
 _OWNER_ATTRIBUTE = "_kuiskaus_registry"
 
+# Imported lazily inside registry_for(): audio_device imports this module at
+# module scope, so a top-level import here would be a cycle.
+_owner_stamp_logged = False
+
 
 def stamp_owner(pa: "pyaudio.PyAudio", registry: "PyAudioRegistry") -> None:
-    """Record which session registry built ``pa`` (see _OWNER_ATTRIBUTE)."""
+    """Record which session registry built ``pa`` (see _OWNER_ATTRIBUTE).
+
+    An instance that cannot carry the stamp is an instance no worker-side
+    reset can ever find its session through, so the failure is said once --
+    silently skipping it would leave the frozen-device-list symptom with no
+    trace of why the reset never runs.
+    """
+    global _owner_stamp_logged
     try:
         setattr(pa, _OWNER_ATTRIBUTE, registry)
-    except (AttributeError, TypeError):  # pragma: no cover - frozen instance
-        pass
+    except (AttributeError, TypeError) as e:
+        if not _owner_stamp_logged:
+            _owner_stamp_logged = True
+            print(
+                f"Cannot stamp the owning session on a PyAudio instance ({e}); "
+                "device resets will not find it."
+            )
 
 
 def registry_for(pa: "pyaudio.PyAudio | None") -> "PyAudioRegistry | None":
@@ -292,15 +308,24 @@ def registry_for(pa: "pyaudio.PyAudio | None") -> "PyAudioRegistry | None":
 
     None means no registry tracked this instance -- there is no tracked
     set to drive to zero, so the caller leaves the session alone instead
-    of half-resetting it. The _instances check is what tells a stamped
-    registry apart from a mock object's auto-created attribute.
+    of half-resetting it. The check is an isinstance against the real
+    registry: duck-typing on a private attribute name accepted anything
+    that happened to expose a list called ``_instances``, which is a
+    promise about a field name rather than about the object.
     """
     if pa is None:
         return None
     owner = getattr(pa, _OWNER_ATTRIBUTE, None)
-    if isinstance(getattr(owner, "_instances", None), list):
+    if isinstance(owner, _registry_class()):
         return owner
     return None
+
+
+def _registry_class() -> type:
+    """``PyAudioRegistry``, imported on first use (see _OWNER_ATTRIBUTE)."""
+    from kuiskaus.audio_device import PyAudioRegistry
+
+    return PyAudioRegistry
 
 
 def _dispose_attempt_instance(
@@ -391,6 +416,27 @@ def refresh_pyaudio_session(
             "PortAudio; session stays dirty for the next press."
         )
     return result.pyaudio, result.input_device_index
+
+
+def check_superseded(
+    lock: threading.Lock,
+    is_superseded: Callable[[], bool],
+    attempt: int,
+    max_attempts: int,
+    attempt_start: float,
+) -> bool:
+    """True (and logged) when this retry sequence lost its race.
+
+    A newer generation took over, or recording was released. Shared by the
+    pre-sleep and post-sleep abort sites so the two cannot drift apart. The
+    predicate is evaluated under the caller's lock, which is the single
+    arbiter of that state.
+    """
+    with lock:
+        if is_superseded():
+            log_retry_attempt(attempt, max_attempts, attempt_start, None, "abort")
+            return True
+        return False
 
 
 def close_stream_quietly(stream: "pyaudio.Stream") -> None:

@@ -26,6 +26,32 @@ if TYPE_CHECKING:
     from kuiskaus.audio_warm import WarmCapture
 
 
+def _stop(warm: WarmCapture) -> bool:
+    """``warm.stop()`` with the foreign-call failure handled.
+
+    ``WarmCapture.stop()`` joins a thread this session does not control, and
+    a raising join is exactly as much evidence of "still reading" as a False
+    return: the caller must assume the thread is live and keep PortAudio up.
+    Reporting success here would be the unsafe direction.
+    """
+    try:
+        return warm.stop()
+    except Exception as e:  # noqa: BLE001 - foreign capture boundary, logged
+        print(f"Keep-warm capture stop raised ({str(e)[:120]}); treating as stuck.")
+        return False
+
+
+def _probe_stop(warm: WarmCapture) -> bool:
+    """``warm.stop(0.0)`` with the same rule as ``_stop``: a raise means it
+    may still be reading, so it stays on the ledger.
+    """
+    try:
+        return warm.stop(0.0)
+    except Exception as e:  # noqa: BLE001 - foreign capture boundary, logged
+        print(f"Keep-warm capture probe raised ({str(e)[:120]}); treating as stuck.")
+        return False
+
+
 class WarmKeep:
     """The keep-warm request, and the captures dropped while reading it.
 
@@ -147,7 +173,7 @@ class WarmKeep:
                 self._installed = None
         # An unlisted capture has never been joined here, so ask it to stop
         # for real; a listed one is being handed back -- probe, never re-join.
-        stopped = warm.stop(0.0) if hand_back else warm.stop()
+        stopped = _probe_stop(warm) if hand_back else _stop(warm)
         if stopped:
             with self._lock:
                 if warm in self._blockers:
@@ -176,7 +202,7 @@ class WarmKeep:
         """
         with self._lock:
             pending = list(self._blockers)
-        dead = [warm for warm in pending if warm.stop(0.0)]
+        dead = [warm for warm in pending if _probe_stop(warm)]
         if not dead:
             with self._lock:
                 return not self._blockers

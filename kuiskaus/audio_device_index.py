@@ -6,13 +6,12 @@ fact about ONE ``PyAudio`` instance's frozen device list. A value resolved
 on instance A names a device that instance B may not have; carrying it over
 opens the stream somewhere that does not exist.
 
-That is the shape of the wedge this class closes (issue #72 review, round 1):
-a retry attempt on an unbound session resolved the default input device,
-published it, and then failed and disposed the very instance the index came
-from. The published value survived, every later attempt trusted it, skipped
-re-resolution, and opened on a dead index until the process restarted -- the
-mic unavailable with no recovery path, inside the exact failure domain
-issue #72 is about.
+That is the shape of the wedge this class closes: a retry attempt on an
+unbound session resolved the default input device, published it, and then
+failed and disposed the very instance the index came from. The published
+value survived, every later attempt trusted it, skipped re-resolution, and
+opened on a dead index until the process restarted -- the mic unavailable
+with no recovery path, inside the exact failure domain issue #72 is about.
 
 So an index is stored WITH its instance, and read only while that instance is
 the live one. A binding whose instance is gone reads back as "unresolved",
@@ -21,6 +20,7 @@ which is precisely the state that makes the next attempt enumerate again.
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -31,21 +31,27 @@ class DeviceIndexBinding:
     """The session's device index, paired with its instance.
 
     Owned by ``PyAudioRegistry``, which owns the live instance it pairs
-    against. No lock here, and no pair of fields either: the (index, owner)
-    pair is stored as ONE tuple, so a reader takes both halves from the same
-    value in a single load (issue #72 review, minor 4).
+    against. The (index, owner) pair is stored as ONE tuple, so a reader
+    takes both halves from the same value in a single load. Two fields could
+    not make that true in any write order: a reader that sampled the owner
+    and then loaded the index would see a NEW index attributed to an owner
+    that never resolved it -- the wedge this class exists to close, arrived
+    at through the read. Storing one tuple makes the claim structural rather
+    than a comment about write ordering, and keeps ``resolve`` a plain
+    identity test against the live instance.
 
-    That distinction is the whole contract. Two fields cannot make it true in
-    any write order: a reader that sampled the owner (still the old one, so it
-    matches) and then loaded the index would see the NEW index attributed to
-    an owner that never resolved it -- which is precisely the wedge this class
-    exists to close, arrived at through the read. Storing one tuple makes the
-    claim structural rather than a comment about write ordering, and keeps
-    ``resolve`` a plain identity test against the live instance.
+    Threading: one small lock makes the read-modify-writes atomic. It exists
+    for ``unbind`` alone -- "forget the index if it came from this instance"
+    is a test and a clear that have to be one step, or a release racing a
+    bind clears a binding that had already moved on to a live instance.
+    ``resolve`` stays lock-free: a single tuple load is already atomic, and
+    taking the lock there would put a wait on the path every retry attempt
+    reads through.
     """
 
     def __init__(self) -> None:
         self._pair: tuple[int | None, pyaudio.PyAudio | None] = (None, None)
+        self._lock = threading.Lock()
 
     def resolve(self, live: pyaudio.PyAudio | None) -> int | None:
         """The index for ``live``, or None when it does not describe it.
@@ -69,7 +75,8 @@ class DeviceIndexBinding:
         One store of one tuple: see the class docstring for why the pair has
         to BE the value rather than two fields written in some order.
         """
-        self._pair = (device_index, resolved_on)
+        with self._lock:
+            self._pair = (device_index, resolved_on)
 
     def publish(self, device_index: int | None, live: pyaudio.PyAudio | None) -> None:
         """Write a (instance, index) pair a caller holds together (issue #72).
@@ -80,10 +87,11 @@ class DeviceIndexBinding:
         docstring); an index of None is no binding at all, so it carries no
         owner either.
         """
-        self._pair = (
-            device_index,
-            live if device_index is not None else None,
-        )  # fmt: skip
+        with self._lock:
+            self._pair = (
+                device_index,
+                live if device_index is not None else None,
+            )  # fmt: skip
 
     def unbind(self, gone: pyaudio.PyAudio) -> None:
         """Forget the index if it came from ``gone``.
@@ -93,9 +101,11 @@ class DeviceIndexBinding:
         An instance that would not terminate is NOT passed here -- it is
         still live, and the binding is still a fact about it.
         """
-        if self._pair[1] is gone:
-            self.clear()
+        with self._lock:
+            if self._pair[1] is gone:
+                self._pair = (None, None)
 
     def clear(self) -> None:
         """No index, no owner: nothing is resolved."""
-        self._pair = (None, None)
+        with self._lock:
+            self._pair = (None, None)

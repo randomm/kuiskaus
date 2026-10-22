@@ -8,8 +8,8 @@ never leak into these assertions.
 import threading
 from unittest.mock import MagicMock
 
-from kuiskaus.audio_device import PyAudioRegistry, check_superseded
-from kuiskaus.audio_retry import registry_for
+from kuiskaus.audio_device import PyAudioRegistry
+from kuiskaus.audio_retry import check_superseded, registry_for
 from tests.support_audio_recorder import _live_default_input
 
 
