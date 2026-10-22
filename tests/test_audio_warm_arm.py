@@ -204,6 +204,28 @@ def test_a_capture_whose_thread_could_not_start_is_not_left_installed():
     assert keep.drop(broken) is True  # nothing left holding the engine open
 
 
+def test_a_capture_whose_start_raised_leaves_keep_warm_reachable_again():
+    """Issue #72 review, minor: undoing the install without asking for
+    recovery left keep-warm OFF for the life of the process behind a
+    checked menu item. The user's request is still live, the slot is now
+    empty, and nothing else ever re-arms from this state (the reset's
+    hand-back only fires after a reset) -- the failed spawn must leave the
+    ``recover()`` flag set so a later worker press brings the capture back."""
+    keep, arm, _built, _make = _arm_fixture()
+    broken = MagicMock(name="capture")
+    broken.capture_rate = 16000
+    broken.start.side_effect = RuntimeError("can't start new thread")
+
+    with pytest.raises(RuntimeError):
+        arm.set_enabled(lambda: broken, lambda _rate: None, True)
+
+    assert arm.capture is None
+    assert keep.wanted() is True  # the request survives the failed spawn
+    recovery = MagicMock(name="rearm-warm")
+    keep.recover(recovery)  # the worker path's recovery call
+    recovery.assert_called_once_with(True)
+
+
 def _keep_warm_stays_off(recorder) -> bool:
     """No capture appeared in the moments after the press (a late recovery
     or a re-arm landing out of order would arm one)."""

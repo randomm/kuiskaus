@@ -147,6 +147,13 @@ class WarmArm:
             # the failure, as it always has.
             self.capture = None
             self._keep.note_installed(None)
+            # ... and ask for recovery: the user's request is still live
+            # and the slot is empty, and nothing else ever re-arms from
+            # this state (the reset's hand-back only fires after a reset),
+            # so without the ask keep-warm stayed OFF behind a checked
+            # menu for the life of the process (issue #72 review, minor).
+            # The worker path's recover() picks it up on a later press.
+            self._keep.need_recovery()
             raise
         self._keep.note_armed()
 
