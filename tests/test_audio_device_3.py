@@ -32,6 +32,46 @@ def _find_device(_pa):
 
 
 # ---------------------------------------------------------------------------
+# The (instance, index) pair is read as one value
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_never_pairs_the_live_instance_with_another_one_s_index():
+    """MINOR (issue #72 review): the retry attempt used to read
+    ``registry.pyaudio`` and ``registry.input_device_index`` as two separate
+    property accesses, so a reset landing between them handed the attempt a
+    live instance and an index into some other instance's frozen device list -
+    exactly the wedge this module exists to close, arrived at through the read
+    instead of the write. ``snapshot()`` reads the instance ONCE and resolves
+    the index against it, so the pair cannot be torn at the call site."""
+    registry, first, _module = _registry()
+    registry.open(_find_device)
+    assert registry.snapshot() == (first, 3)
+
+    # The session moves to another instance without rebinding: what a reset
+    # leaves behind before the next attempt resolves again.
+    second = MagicMock(name="PyAudioInstance-second")
+    registry.register(second)
+    registry.pyaudio = second
+
+    # Not (second, 3): 3 indexes a device list only the first instance has.
+    assert registry.snapshot() == (second, None)
+
+
+def test_snapshot_pairs_the_index_with_the_instance_that_resolved_it():
+    """The happy path of the same read: a pair written as a pair reads back as
+    one, which is what lets an attempt skip re-resolution safely."""
+    registry, _first, _module = _registry()
+    registry.open(_find_device)
+    second = MagicMock(name="PyAudioInstance-second")
+    registry.register(second)
+    registry.pyaudio = second
+    registry.bind_index(9, second)  # resolved against the instance now live
+
+    assert registry.snapshot() == (second, 9)
+
+
+# ---------------------------------------------------------------------------
 # An index belongs to the instance that enumerated it
 # ---------------------------------------------------------------------------
 

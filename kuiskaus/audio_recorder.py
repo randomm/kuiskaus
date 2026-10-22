@@ -19,7 +19,6 @@ from kuiskaus.audio_retry import (
     log_retry_attempt,
     log_stop,
     microphone_unavailable,
-    refresh_pyaudio_session,
     validate_retry_config,
     worker_alive,
 )
@@ -29,6 +28,7 @@ from kuiskaus.audio_warm_arm import (
     announce_capture,
     cleanup_recorder_session,
     open_warm_capture_stream,
+    refresh_recorder_session,
     warm_press_gate,
 )
 
@@ -182,6 +182,13 @@ class AudioRecorder:
                 if self._check_superseded(my_gen, attempt, attempt_start):
                     return None
 
+            # Issue #72: reuse the live instance and the index resolved
+            # against it (a None index re-resolves on that same instance) --
+            # never a second live instance alongside one. The pair comes from
+            # one snapshot(): an index is only a fact about the instance that
+            # enumerated it, so the two must not be read across an instance
+            # swap (#72 review, minor 1).
+            live_pa, live_device_index = self._session.snapshot()
             pa, stream, error, capture_rate = attempt_open_once(
                 pyaudio,
                 self.format,
@@ -192,11 +199,8 @@ class AudioRecorder:
                 self.max_attempts,
                 attempt,
                 attempt_start,
-                # Issue #72: reuse the live instance and the index resolved
-                # against it (a None index re-resolves on that same
-                # instance) -- never a second live instance alongside one.
-                existing_pa=self.pyaudio,
-                existing_device_index=self.input_device_index,
+                existing_pa=live_pa,
+                existing_device_index=live_device_index,
                 registry=self._session,
             )
             if stream is None:
@@ -227,27 +231,11 @@ class AudioRecorder:
     def _refresh_pyaudio_session(self, blocked: threading.Thread | None = None) -> None:
         """Live-default device reset (issue #72) at the top of the worker.
         Native calls run OUTSIDE _lock (issue #60): they can block and
-        stop_recording() needs the lock. One worker runs this at a time;
-        ``blocked`` is the worker just joined, and the gate also consults
-        the recorder's CURRENT worker at gate time (finding 2).
+        stop_recording() needs the lock. The behaviour is in
+        ``audio_warm_arm.refresh_recorder_session``, the seam the warm
+        reopen shares; ``blocked`` is the worker this one just joined.
         """
-        with self._lock:
-            pa, device_index = self.pyaudio, self.input_device_index
-        pa, device_index = refresh_pyaudio_session(
-            pa,
-            device_index,
-            find_default_input_device,
-            lambda: (blocked, self._current_worker()),
-        )
-        with self._lock:
-            self.pyaudio, self.input_device_index = pa, device_index
-
-    def _current_worker(self) -> threading.Thread | None:
-        """The worker named at CALL time, read under _lock: a name
-        captured before a long join is stale by gate time -- a finished
-        W1 must not mask a live W2 (issue #72 finding 2)."""
-        with self._lock:
-            return self.recording_thread
+        refresh_recorder_session(self, blocked)
 
     def _rearm_warm(self, usable: bool) -> None:
         """Re-arm the keep-warm capture after a reset replaced its session.
@@ -314,7 +302,7 @@ class AudioRecorder:
             with self._lock:
                 if self._generation != my_gen or not self.recording:
                     return  # released again while waiting
-        self._refresh_pyaudio_session(previous)
+        refresh_recorder_session(self, previous)
         # Keep-warm does not re-arm itself after a stuck-read drop (issue #72).
         self._session.warm.recover(self._rearm_warm)
         stream = self._open_stream_with_retry(my_gen)
@@ -418,6 +406,13 @@ class AudioRecorder:
                     daemon=True,
                 )
                 thread = self.recording_thread
+                # The session records the worker BEFORE it runs (issue #72
+                # adversarial review, finding 1): from here on the registry
+                # can answer "may a worker be inside PortAudio?" for itself,
+                # so a later press cannot terminate the engine underneath this
+                # one after it is displaced from recording_thread by its own
+                # successor.
+                self._session.note_worker(thread)
 
         if warm is not None:
             # Keep-warm (issue #66): no open, no worker; route the ring.

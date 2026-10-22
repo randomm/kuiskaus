@@ -227,6 +227,30 @@ def test_terminate_all_keeps_an_instance_it_could_not_terminate(
     assert good.terminate.call_count == 1  # the terminated one was forgotten
 
 
+def test_terminate_all_survives_a_terminate_that_raises_a_non_oserror(
+    coreaudio_stub,
+):
+    """MINOR (issue #72 review): Pa_Terminate runs its own cleanup and the
+    PyAudio wrapper raises whatever it produces -- a RuntimeError from a
+    SwigPyObject teardown, not an OSError. Catching only OSError let it escape
+    the loop mid-list, so the instances after it were never reached: still
+    registered, never terminated, and the init count stays above zero with
+    nobody able to get at them -- the frozen-snapshot state this whole class
+    exists to clear.
+    """
+    registry, bad, _module = _registry()
+    registry.open(_find_device)
+    # ``bad`` is the instance open() built, so it is first in the list: an
+    # escaping exception here costs ``good`` the terminate it needs.
+    bad.terminate.side_effect = RuntimeError("SwigPyObject teardown")
+    good = MagicMock(name="PyAudioInstance-good")
+    registry.register(good)
+
+    assert registry.terminate_all() is False
+    good.terminate.assert_called_once()  # the loop reached it, not aborted
+    assert bad in registry._instances  # ... and stays reachable for a retry
+
+
 def test_terminate_single_keeps_an_instance_it_could_not_terminate(
     coreaudio_stub,
 ):

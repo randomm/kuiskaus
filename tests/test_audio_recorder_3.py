@@ -203,7 +203,11 @@ def test_refresh_does_not_hold_lock_during_native_calls(audio_recorder_module):
             recorder._lock.release()
         return pa, idx
 
-    with mock.patch.object(module, "refresh_pyaudio_session", fake_refresh):
+    # The worker's reset lives in audio_warm_arm (the seam the warm reopen
+    # shares), which is where the native call is actually made from.
+    from kuiskaus import audio_warm_arm
+
+    with mock.patch.object(audio_warm_arm, "refresh_pyaudio_session", fake_refresh):
         recorder._refresh_pyaudio_session()
     assert lock_free_during_native_call == [True]
 

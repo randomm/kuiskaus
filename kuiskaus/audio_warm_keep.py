@@ -50,9 +50,49 @@ class WarmKeep:
         # dropped on a stuck read can be brought back.
         self.enabled = False
         self._blockers: list[WarmCapture] = []
+        # The capture the recorder has INSTALLED right now (issue #72
+        # adversarial review, finding 2). ``_blockers`` only ever held
+        # captures somebody had already handed over to drop(), so a capture
+        # armed and never dropped was invisible to terminate_all(): the
+        # worker-side reset passed no capture at all, resting on "with
+        # keep-warm on there is no worker" -- a race, not an invariant, since
+        # WarmArm.set_enabled() arms from the menu thread. The name lives
+        # here as well as in WarmArm so the session can answer the question
+        # without a caller handing it the answer.
+        self._installed: WarmCapture | None = None
         self._recover_pending = False
-        # Guards the three fields above. Never held across warm.stop().
+        # Guards the fields above. Never held across warm.stop().
         self._lock = threading.Lock()
+
+    def note_installed(self, warm: WarmCapture | None) -> None:
+        """Mirror the capture the recorder just installed (or cleared).
+
+        Called from ``WarmArm`` under the recorder lock; the name is taken
+        BEFORE the capture's thread starts, so a terminate racing the arm
+        sees the capture it must not terminate underneath."""
+        with self._lock:
+            self._installed = warm
+
+    def installed_may_be_native(self, exempt: WarmCapture | None = None) -> bool:
+        """True while the installed keep-warm capture has a live thread.
+
+        Two names are excused. The capture's own thread is never its own
+        blocker: WarmCapture opens and reads on that thread, and it is also
+        the thread that runs the keep-warm session reset (issue #72) --
+        counting it would refuse every reset the capture ever asked for. And
+        ``exempt`` is the capture a caller is on its way to stop, which the
+        warm press hands over before this is asked.
+        """
+        with self._lock:
+            warm = self._installed
+        if warm is None or warm is exempt:
+            return False
+        thread = warm.thread
+        return (
+            thread is not None
+            and thread is not threading.current_thread()
+            and thread.is_alive()
+        )
 
     def drop(self, warm: WarmCapture | None) -> bool:
         """Stop a capture the caller is letting go of. True = nothing of it
@@ -89,6 +129,12 @@ class WarmKeep:
             hand_back = warm in self._blockers
             if not hand_back:
                 self._blockers.append(warm)
+            # It is no longer the installed capture either way: stopped, it
+            # is gone; wedged, _blockers now carries the name. Leaving it in
+            # both places would have installed_may_be_native() refuse every
+            # later terminate on a capture the recorder has forgotten.
+            if self._installed is warm:
+                self._installed = None
         # An unlisted capture has never been joined here, so ask it to stop
         # for real; a listed one is being handed back -- probe, never re-join.
         stopped = warm.stop(0.0) if hand_back else warm.stop()

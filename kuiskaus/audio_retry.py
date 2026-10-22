@@ -260,7 +260,12 @@ def terminate_quietly(pa: "pyaudio.PyAudio") -> bool:
     """
     try:
         pa.terminate()
-    except OSError as e:
+    except Exception as e:  # noqa: BLE001 - PortAudio teardown boundary, logged
+        # Not just OSError: Pa_Terminate runs its own cleanup and PyAudio
+        # raises whatever its wrapper produces, and an escaping exception
+        # here would abort terminate_all() before it reached the remaining
+        # instances -- a live instance nobody can reach any more, which is
+        # the exact frozen-snapshot state this class exists to clear.
         print(f"Error terminating PyAudio instance: {e}")
         return False
     return True

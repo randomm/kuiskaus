@@ -276,6 +276,44 @@ def _adopt(registry, new_pa, stream, superseded, stream_open, capture_rate=16000
     return ok, published
 
 
+def test_superseded_adopt_closes_the_abandoned_stream_outside_the_lock():
+    """MINOR (issue #72 review): closing a stream is a native call and this
+    lock is the one stop_recording() needs on the hotkey release. The close is
+    deferred past the release (the #60 discipline the rest of the file follows
+    for terminate()); running it inside would let a wedged Pa_CloseStream hold
+    the release hostage."""
+    registry, live, _ = _registry()
+    registry.open(_find_device)
+    lock = threading.Lock()
+    free_at_close: list[bool] = []
+
+    stream = MagicMock(name="stream")
+
+    def close() -> None:
+        acquired = lock.acquire(blocking=False)
+        free_at_close.append(acquired)
+        if acquired:
+            lock.release()
+
+    stream.close.side_effect = close
+    ok = registry.adopt(
+        lock,
+        lambda: True,  # superseded: the stream is abandoned, so it gets closed
+        lambda _rate: None,
+        lambda: False,
+        live,
+        stream,
+        16000,
+        2,
+        0.0,
+        4,
+    )
+
+    assert ok is False
+    assert stream.close.call_count == 1  # it did run...
+    assert free_at_close == [True]  # ... with the lock released
+
+
 def test_adopt_publishes_instance_and_rate():
     registry, live, _ = _registry()
     registry.open(_find_device)

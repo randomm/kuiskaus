@@ -48,6 +48,15 @@ class WarmCapture:
         return self._ready
 
     @property
+    def thread(self) -> threading.Thread | None:
+        """The capture's reader thread, for the session's terminate gate
+        (issue #72 review): ``PyAudio.terminate()`` under a thread that may
+        be inside ``stream.read()`` is undefined behaviour, and the thread is
+        the only evidence of that. ``WarmKeep`` holds the capture, so it asks
+        the capture rather than trusting a caller to still know the name."""
+        return self._thread
+
+    @property
     def capture_rate(self) -> int | None:
         return self._rate
 

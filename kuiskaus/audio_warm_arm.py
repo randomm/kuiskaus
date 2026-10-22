@@ -37,7 +37,9 @@ from typing import TYPE_CHECKING
 
 from kuiskaus.audio_retry import (
     PREVIOUS_WORKER_WAIT_SECONDS,
+    find_default_input_device,
     open_warm_stream,
+    refresh_pyaudio_session,
     worker_alive,
 )
 
@@ -85,11 +87,19 @@ class WarmArm:
             if enabled and self.capture is None:
                 capture = make_capture()
                 self.capture = capture
+                # Named for the session BEFORE it is started (issue #72
+                # review, finding 2): a terminate racing this transition must
+                # see the capture whose thread it is about to read on, and
+                # after the release there is no such window -- WarmKeep holds
+                # the name either way.
+                self._keep.note_installed(capture)
                 capture.start()
             elif not enabled and self.capture is not None:
                 dropped, self.capture = self.capture, None
                 note_capture_rate(dropped.capture_rate)
         if dropped is not None:
+            # drop() is what clears the installed name, in the same step that
+            # decides whether the thread still blocks a terminate.
             self._keep.drop(dropped)
 
     def take(self) -> WarmCapture | None:
@@ -140,6 +150,37 @@ def warm_press_gate(
     )
 
 
+def current_worker(recorder: AudioRecorder) -> threading.Thread | None:
+    """The worker named at CALL time, read under _lock: a name captured
+    before a long join is stale by gate time -- a finished W1 must not mask a
+    live W2 (issue #72 review, finding 2).
+    """
+    with recorder._lock:
+        return recorder.recording_thread
+
+
+def refresh_recorder_session(
+    recorder: AudioRecorder, blocked: threading.Thread | None = None
+) -> None:
+    """Live-default device reset (issue #72) at the top of the worker.
+
+    Native calls run OUTSIDE _lock (issue #60): they can block and
+    stop_recording() needs the lock. One worker runs this at a time;
+    ``blocked`` is the worker just joined, and the gate also consults the
+    recorder's CURRENT worker at gate time (finding 2) -- which is why the
+    name travels as a callable rather than as the thread.
+    """
+    pa, device_index = recorder._session.snapshot()
+    pa, device_index = refresh_pyaudio_session(
+        pa,
+        device_index,
+        find_default_input_device,
+        lambda: (blocked, current_worker(recorder)),
+    )
+    with recorder._lock:
+        recorder.pyaudio, recorder.input_device_index = pa, device_index
+
+
 def open_warm_capture_stream(
     recorder: AudioRecorder, pa_module: ModuleType
 ) -> tuple[pyaudio.Stream, int]:
@@ -151,9 +192,10 @@ def open_warm_capture_stream(
     previous = recorder.recording_thread
     if previous is not None and previous.is_alive():
         previous.join(timeout=PREVIOUS_WORKER_WAIT_SECONDS)
-    recorder._refresh_pyaudio_session(previous)
-    with recorder._lock:
-        pa, device_index = recorder.pyaudio, recorder.input_device_index
+    refresh_recorder_session(recorder, previous)
+    # One snapshot for the pair: the index is only a fact about the instance
+    # that enumerated it (#72 review, minor 1).
+    pa, device_index = recorder._session.snapshot()
     new_pa, stream, rate = open_warm_stream(
         pa_module, pa, device_index, recorder.format, recorder.channels,
         recorder.sample_rate, recorder.chunk_size, recorder._session,
