@@ -46,7 +46,7 @@ _NO_QUALIFIER = b""
 # it fails, that is permanent for the life of the process, and a read that
 # will never work should not print once per press (or twice -- this module
 # does two reads per live check). Latched by _coreaudio() on the first
-# ImportError; separate from a per-read failure, which IS transient and is
+# failed import; separate from a per-read failure, which IS transient and is
 # logged as one.
 _coreaudio_unavailable = False
 
@@ -61,15 +61,22 @@ _osstatus_logged = 0
 def _coreaudio():
     """The CoreAudio bridge, or None when this machine has no importable one.
 
-    A missing framework is not a property read that failed: there is nothing
-    to retry, so it is latched and reported once instead of once per read.
+    A framework this machine cannot import is not a property read that
+    failed: there is nothing to retry, so it is latched and reported once
+    instead of once per read.
     """
     global _coreaudio_unavailable
     if _coreaudio_unavailable:
         return None
     try:
         import CoreAudio
-    except ImportError as import_error:
+    except Exception as import_error:  # noqa: BLE001 - PyObjC import boundary, logged
+        # Not just ImportError: a PyObjC dylib / pyobjc-core version skew
+        # raises OSError or ValueError out of the same import, and nothing
+        # may raise from this read -- it runs on the AudioRecorder.__init__
+        # and press paths, where an escaping exception is an app that never
+        # launches (the same widening terminate_quietly() applies to
+        # Pa_Terminate).
         _coreaudio_unavailable = True
         print(
             f"CoreAudio unavailable ({str(import_error)[:120]}); "

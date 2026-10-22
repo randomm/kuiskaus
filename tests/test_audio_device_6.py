@@ -11,10 +11,13 @@ thread. Nothing bounded that, so the "one rebuild" property issue #72 is
 about was only ever true for a well-behaved CoreAudio.
 """
 
-from unittest.mock import MagicMock
+from itertools import cycle
+from unittest.mock import MagicMock, patch
 
+import kuiskaus.audio_device as device_module
 import kuiskaus.audio_device_reset as reset_module
 from kuiskaus.audio_coreaudio import (
+    LiveDefaultInput,
     kAudioDevicePropertyDeviceIsAlive,
     kAudioHardwarePropertyDefaultInputDevice,
 )
@@ -170,6 +173,67 @@ def test_a_flapping_device_with_clean_teardowns_does_not_blame_portaudio(
     assert MICROPHONE_NEEDS_RESTART not in message
 
 
+def test_an_alternating_default_is_bounded_and_the_backoff_holds(
+    coreaudio_stub, monkeypatch
+):
+    """Both churn guards were keyed on ONE device, and both missed the
+    canonical AirPod shape. With the default reported A,B,A,B... on each
+    press (open()'s own read transiently giving no evidence, so the reset's
+    fallback records the press's pair -- the shape that makes every rebuild
+    target a DIFFERENT device), the same-device streak restarts on every
+    press and never fires: measured, 30 presses cost 30 full
+    ``Pa_Terminate``-to-zero passes and 31 ``Pa_Initialize`` constructions,
+    ``needs_restart`` False, no verdict ever surfaced -- and with a verdict
+    on the record, presses inside the still-open window keep paying the
+    futile teardown, because "different from the last device counted" is
+    true forever for a pair bouncing back. The budget now also counts
+    consecutive rebuilds whatever device they name, and the exemption wants
+    a device the session has not rebuilt against during this run -- not the
+    counted pair bouncing.
+    """
+    registry, _pa, module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    clock = [0.0]
+    monkeypatch.setattr(reset_module, "_now", lambda: clock[0])
+    presses = cycle([LiveDefaultInput(88, True), LiveDefaultInput(77, True)])
+
+    with (
+        patch.object(
+            reset_module,
+            "read_live_default_input",
+            MagicMock(side_effect=presses),
+        ),
+        # open()'s own read transiently gives no evidence -- quite possible
+        # right after the storm that moved the default -- so the reset's
+        # fallback records the pair THIS read saw, and the next press
+        # legitimately sees the OTHER device.
+        patch.object(device_module, "read_live_default_input", MagicMock(return_value=None)),
+    ):  # fmt: skip
+        for _ in range(reset_module.MAX_RESET_REBUILDS * 10):
+            registry.refresh(_find_device)
+
+        assert registry.needs_restart is True, (
+            "the alternating default never earned a verdict: the budget is "
+            "still keyed on one device"
+        )
+        assert registry.terminate_failures == 0  # every teardown released
+        assert registry.press_refusal_reason() == MICROPHONE_NOT_SETTLING
+        builds = module.PyAudio.call_count
+        assert builds <= reset_module.MAX_RESET_REBUILDS + 2, (
+            f"the alternating default churned PortAudio {builds} times"
+        )
+
+        # ... and inside the still-open window the flap costs nothing more:
+        # the exemption is for a moved default, not for the counted pair.
+        for _ in range(10):
+            registry.refresh(_find_device)
+        assert module.PyAudio.call_count == builds, (
+            "the backoff honoured a flapping default as new evidence on "
+            "every press: the futile teardown still runs inside the window"
+        )
+
+
 def _oscillating_liveness(stub, device_id: int) -> None:
     """Report ``device_id`` as the default, with ``isAlive`` alternating on
     every read -- the storm shape that defeats the dedupe guard."""
@@ -206,10 +270,10 @@ def test_an_engine_verdict_holds_the_window_even_when_the_device_changed(
     coreaudio_stub, monkeypatch
 ):
     """The exemption the manual switch gets is for the verdict that is ABOUT
-    a device. ``rebuild_device`` records the device the rebuild streak counts,
+    a device. ``rebuild.device`` records the device the rebuild streak counts,
     and a later teardown verdict -- PortAudio refusing an instance -- says
     something about the ENGINE, which no new device excuses. Honouring the
-    stale ``rebuild_device`` there would spend the full futile teardown on
+    stale ``rebuild.device`` there would spend the full futile teardown on
     every press, which is the stall the window exists to prevent.
     """
     registry, pa, _module = _registry()
@@ -221,7 +285,7 @@ def test_an_engine_verdict_holds_the_window_even_when_the_device_changed(
     # One clean rebuild, so the streak now counts device 88.
     _live_default_input(coreaudio_stub, 88)
     registry.refresh(_find_device)
-    assert registry.rebuild_device == 88
+    assert registry.rebuild.device == 88
 
     # Then the engine turns: every teardown from here on refuses.
     pa.terminate.side_effect = OSError("Pa_Terminate failed")
@@ -231,7 +295,7 @@ def test_an_engine_verdict_holds_the_window_even_when_the_device_changed(
 
     assert registry.needs_restart is True
     assert registry.terminate_failures == reset_module.MAX_TERMINATE_FAILURES
-    assert registry.rebuild_device == 88  # stale: the verdict is not about it
+    assert registry.rebuild.device == 88  # stale: the verdict is not about it
 
     terminates = pa.terminate.call_count
     result = registry.refresh(_find_device)

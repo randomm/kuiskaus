@@ -137,6 +137,36 @@ def test_a_raising_bridge_read_is_no_evidence(coreaudio_stub, capsys):
     assert "CoreAudio property read failed" in capsys.readouterr().out
 
 
+def test_an_import_that_raises_beyond_importerror_is_no_evidence_not_a_crash(
+    coreaudio_stub, monkeypatch, capsys
+):
+    """The module's own contract is that nothing raises out of this read -- it
+    runs on the ``AudioRecorder.__init__`` path (app.py and menubar.py
+    construct it unguarded) and on the press path, where an escape is an app
+    that never launches. A PyObjC dylib or pyobjc-core version skew raises
+    ``OSError``/``ValueError`` from the import itself, not ``ImportError``,
+    and the guard caught only the latter: reproduced, the OSError propagated
+    out of ``registry.open()`` and up to app launch."""
+    from kuiskaus import audio_coreaudio
+
+    class _SkewFinder:
+        def find_spec(self, name, path=None, target=None):
+            if name == "CoreAudio":
+                raise OSError("dlopen(): PyObjC bridge bundle mismatch")
+
+    monkeypatch.delitem(sys.modules, "CoreAudio")
+    monkeypatch.setattr(sys, "meta_path", [_SkewFinder(), *sys.meta_path])
+
+    assert read_live_default_input() is None
+    assert "CoreAudio unavailable" in capsys.readouterr().out
+
+    # Latched like a missing framework: the verdict is permanent for the
+    # process, so a later read neither re-raises nor re-prints.
+    assert read_live_default_input() is None
+    assert capsys.readouterr().out == ""
+    assert audio_coreaudio._coreaudio_unavailable is True
+
+
 def test_a_raising_address_constructor_is_no_evidence(coreaudio_stub):
     coreaudio_stub.AudioObjectPropertyAddress.side_effect = RuntimeError(
         "bridge marshalling"

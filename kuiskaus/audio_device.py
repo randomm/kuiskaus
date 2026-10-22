@@ -32,6 +32,7 @@ from kuiskaus.audio_device_reset import (
     reset_session,
     unavailable_reason,
 )
+from kuiskaus.audio_rebuild_budget import RebuildBudget
 from kuiskaus.audio_retry import (
     close_stream_quietly,
     log_retry_attempt,
@@ -108,12 +109,11 @@ class PyAudioRegistry:
         # would send the user to quit the app over a read about to return).
         self.terminate_failures = 0
         self.needs_restart = False
-        # Rebuilds this session has run against the same device in a row. A
-        # pair CoreAudio reports differently on every read defeats the dedupe
-        # guard legitimately, so the count -- not the guard -- is what stops
-        # a flapping device costing a full teardown on every press.
-        self.rebuild_streak = 0
-        self.rebuild_device: int | None = None
+        # Rebuilds since the session last agreed with the live device --
+        # the budget that stops a flapping default costing a full teardown
+        # on every press. The counters, and why one count is not enough, are
+        # on RebuildBudget (kuiskaus.audio_rebuild_budget).
+        self.rebuild = RebuildBudget()
         # Monotonic instant the next press may retry a teardown, once
         # ``needs_restart`` has been declared (see ``RESTART_RETRY_SECONDS``).
         self.restart_retry_after = 0.0

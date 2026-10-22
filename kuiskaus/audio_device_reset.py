@@ -24,6 +24,7 @@ from kuiskaus.audio_coreaudio import (
     read_live_default_input,
     session_needs_reset,
 )
+from kuiskaus.audio_rebuild_budget import MAX_RESET_REBUILDS
 from kuiskaus.audio_retry import microphone_unavailable
 from kuiskaus.audio_warm_arm import worker_may_be_native
 from kuiskaus.audio_worker_keep import terminate_blocker
@@ -64,17 +65,6 @@ MICROPHONE_BUSY = "microphone busy — recording did not start"
 # transient", and it still leaves room for one.
 MAX_TERMINATE_FAILURES = 3
 
-# Consecutive rebuilds one session may be asked for before it says the
-# device is not settling. The dedupe guard stops a STABLE pair from costing
-# a rebuild per press, but it cannot help a pair that CoreAudio reports
-# differently on every read (an AirPod whose liveness flag flaps through a
-# storm): each press then legitimately needs the reset, and each press pays
-# a full terminate-all + Pa_Initialize + re-enumeration on the hotkey
-# callback thread. Three is "this is not a transition, it is a flapping
-# device"; the backoff below still retries, so a device that settles is
-# recovered without an app restart.
-MAX_RESET_REBUILDS = 3
-
 # How long a session that gave up on its teardown waits before asking
 # PortAudio again. While ``needs_restart`` is set the teardown is known
 # futile, and re-running it on every press costs the hotkey callback that
@@ -96,8 +86,8 @@ def note_terminate_outcome(registry: PyAudioRegistry, clean: bool) -> None:
     A clean teardown means the instance that would not die is gone, so the
     verdict goes back to nothing and a later storm pays for itself from zero:
     the claim must describe the teardown as it is now, not the worst it ever
-    was. The rebuild streak is NOT cleared here -- every reset tears down
-    cleanly by construction, and clearing it would make the streak a
+    was. The rebuild budget is NOT cleared here -- every reset tears down
+    cleanly by construction, and clearing it would make the counters a
     constant zero.
     """
     if clean:
@@ -162,24 +152,25 @@ def _press_is_new_evidence(registry: PyAudioRegistry, live: LiveDefaultInput) ->
     not already cover.
 
     Two verdicts can be on the record and only one of them is about a
-    device. The rebuild streak counts one device that will not settle, so a
-    press asking about a DIFFERENT device is not that repetition -- it is the
-    user moving the default by hand, the whole condition issue #72 exists to
-    follow, and it is attempted inside the window (where the streak itself is
-    restarted, since a change of device is progress).
+    device. The rebuild budget counts devices that will not settle, so a
+    press asking about a device the session has never rebuilt against
+    during this run is not that repetition -- it is the user moving the
+    default by hand, the whole condition issue #72 exists to follow, and it
+    is attempted inside the window. A device the budget HAS rebuilt against
+    is the counted pair bouncing back: a default alternating A<->B presents
+    a "different device" on every press, so comparing against the last one
+    counted alone would leave the exemption permanently open and spend the
+    full futile teardown on every press -- the stall the window exists to
+    prevent.
 
     The teardown's own verdict is not about a device at all -- PortAudio
-    refusing an instance says the ENGINE will not come down -- so a different
-    device is no new evidence there and the window still holds. That is also
-    why ``rebuild_device`` alone cannot be the test: it is the last device the
-    streak counted, which a later engine verdict has no reason to match, and
-    honouring it would spend the full futile teardown on every press -- the
-    stall the window exists to prevent.
+    refusing an instance says the ENGINE will not come down -- so a
+    different device is no new evidence there and the window still holds.
     """
     return (
         not registry.terminate_failures
-        and registry.rebuild_device is not None
-        and live.device_id != registry.rebuild_device
+        and registry.rebuild.device is not None
+        and registry.rebuild.is_new_device(live.device_id)
     )
 
 
@@ -289,8 +280,7 @@ def reset_session(
         # device that spent it and let it cost a full teardown every other
         # press for the life of the process.
         if not _teardown_backoff_open(registry):
-            registry.rebuild_streak = 0
-            registry.rebuild_device = None
+            registry.rebuild.settle()
             registry.needs_restart = False
         return _unchanged(registry)
 
@@ -366,36 +356,43 @@ def reset_session(
             registry, warm, rearm_warm, rearmable=False, ask_recovery=True
         )
         return _unchanged(registry, unbound=True)
-    if warm is not None and rearm_warm is not None:
-        # Only now does the session exist to arm against.
-        rearm_warm(True)
     if registry.last_reset is None:
         # open()'s own read gave no evidence (transient -- quite possible
         # right after the coreaudiod storm that moved the default). Record
         # the pair THIS read saw instead: the guard needs a baseline, and
         # whichever read it comes from, the pair it compares has to be the
-        # one read that set it.
+        # one read that set it. Written BEFORE the re-arm below: the re-armed
+        # capture's own thread can run a reset immediately, and finding the
+        # baseline still unset there costs a second full rebuild inside this
+        # same press -- and a second unsynchronised write to the budget.
         registry.last_reset = live
-    # Consecutive rebuilds for the SAME device are the shape that never
-    # settles: an AirPod whose liveness flag oscillates through a storm makes
-    # every read a different pair, so the dedupe guard above is structurally
-    # blind to it and every press pays a full teardown + Pa_Initialize +
-    # re-enumeration on the hotkey callback thread. A change of DEVICE is
-    # progress and starts a new count, so a user switching microphones by
-    # hand is never told to restart the app -- only a device that never
-    # settles is. Counted after the rebuild because a clean teardown resets
-    # the verdict, and this one earned it.
-    if registry.rebuild_device == live.device_id:
-        registry.rebuild_streak += 1
-    else:
-        registry.rebuild_streak = 1
-        registry.rebuild_device = live.device_id
-    if registry.rebuild_streak >= MAX_RESET_REBUILDS:
+    if warm is not None and rearm_warm is not None:
+        # Only now does the session exist to arm against.
+        rearm_warm(True)
+    # An AirPod whose liveness flag oscillates makes every read a different
+    # pair, and a default that alternates between two devices makes every
+    # read a different DEVICE; the dedupe guard above is structurally blind
+    # to both, and every press pays a full teardown + Pa_Initialize +
+    # re-enumeration on the hotkey callback thread. Reaching here IS the
+    # churn the budget exists to bound: counted after the rebuild because a
+    # clean teardown resets the verdict, and this one earned it. The
+    # same-device streak says WHICH device never settled (and its message
+    # names it); the cross-device count bounds the default that alternates,
+    # which restarts any per-device count on every press.
+    registry.rebuild.note_rebuild(live.device_id)
+    if registry.rebuild.streak >= MAX_RESET_REBUILDS:
         _declare_needs_restart(
             registry,
             f"Input device {live.device_id} never settled after "
-            f"{registry.rebuild_streak} rebuilds; the microphone is not "
+            f"{registry.rebuild.streak} rebuilds; the microphone is not "
             "settling.",
+        )
+    elif registry.rebuild.count >= MAX_RESET_REBUILDS:
+        _declare_needs_restart(
+            registry,
+            f"The input default kept moving: {registry.rebuild.count} "
+            "rebuilds without the session ever agreeing with it; the "
+            "microphone is not settling.",
         )
     return _unchanged(registry)
 
