@@ -77,11 +77,16 @@ class PyAudioRegistry:
         # through the property below, never through a copy.
         self._indices = DeviceIndexBinding()
         self.device_id: int | None = None
-        # The (device_id, is_alive) pair the last FULLY SUCCESSFUL reset
-        # was performed against (issue #72 review): a default that stays
-        # reported not-alive must cost one rebuild, not one per press --
-        # see the dedupe check in the reset. Only written after open()
-        # came back, so failed resets stay retryable.
+        # The (device_id, is_alive) pair the CURRENT session was opened
+        # against (issue #72 review): a default that stays reported
+        # not-alive must cost one rebuild, not one per press -- see the
+        # dedupe check in the reset. ONE read writes this together with
+        # ``device_id`` (open(), or the reset's fallback when open()'s
+        # read gave no evidence): the guard compares both fields, and
+        # pinning them from two independent CoreAudio reads is what let
+        # it suppress a still-needed reset forever. A failed open clears
+        # both -- no instance, no baseline, nothing to dedupe against --
+        # so failed resets stay retryable.
         self.last_reset: LiveDefaultInput | None = None
         # The keep-warm request, plus any capture this session dropped while
         # its thread was parked in a native read: the recorder clears its own
@@ -130,6 +135,32 @@ class PyAudioRegistry:
         (issue #60), whose name nobody holds any more.
         """
         self.workers.note(worker)
+
+    def forget_worker(self, worker: threading.Thread) -> None:
+        """Remove a worker that can never run (its ``start()`` raised).
+
+        A thread that never started counts as a blocker -- the arming
+        window is exactly what the ledger exists to cover (issue #72
+        review) -- so a launch that failed must be taken back out by hand
+        or it would refuse every later terminate_all() for the life of the
+        process. See ``audio_warm_arm.start_press``, the only caller.
+        """
+        self.workers.forget(worker)
+
+    def start_worker(self, worker: threading.Thread) -> None:
+        """Start a noted worker; on a failed start, drop it from the
+        ledger and re-raise (issue #72 review).
+
+        ``thread.start()`` does fail -- RuntimeError under a thread-limit
+        storm -- and a thread that never ran can never enter PortAudio,
+        so it must not stay named as one. Used by
+        ``audio_warm_arm.start_press``.
+        """
+        try:
+            worker.start()
+        except BaseException:
+            self.workers.forget(worker)
+            raise
 
     def any_worker_may_be_native(self) -> bool:
         """Whether a worker this session started may be inside a native call."""
@@ -260,11 +291,24 @@ class PyAudioRegistry:
                 "Warning: PyAudio construction failed at startup "
                 f"({construct_error}); will retry at first recording."
             )
+            # No instance, no baseline: a previous open's pair left
+            # standing would have the dedupe guard vouch for a session
+            # that does not exist (issue #72 review).
+            self.device_id = None
+            self.last_reset = None
             return False
         self.register(pa)
         self.pyaudio = pa
+        # ONE read writes both halves of the dedupe baseline (issue #72
+        # review, CRITICAL): device_id and last_reset used to come from
+        # two independent CoreAudio reads (this one and the reset's own),
+        # and when they disagreed the guard compared a live read against
+        # a pair from another one -- suppressing a still-needed reset
+        # forever. A reset whose open() read gave no evidence fills both
+        # from its own read instead (see audio_device_reset).
         live = read_live_default_input()
         self.device_id = None if live is None else live.device_id
+        self.last_reset = live
         # A fresh instance re-enumerates, so whatever was resolved before
         # describes another instance's device list (issue #72 review, r1).
         self._indices.clear()

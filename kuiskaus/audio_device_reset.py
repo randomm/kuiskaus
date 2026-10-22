@@ -78,16 +78,26 @@ def reset_session(
         # ``live is None`` is CoreAudio saying "no evidence" -- never
         # treated as a change, and never as an absence either.
         return SessionRefresh(*registry.snapshot(), False)
-    if registry.device_id is not None and live == registry.last_reset:
+    if (
+        registry.device_id is not None
+        and live.device_id == registry.device_id
+        and live == registry.last_reset
+    ):
         # A fully successful reset already ran against this exact live
-        # read. The reset re-records device_id but never the liveness it
-        # reset against, so the "doubt falls to not-alive" fail-safe
-        # would otherwise pay a full terminate-all + Pa_Initialize +
-        # re-enumeration on EVERY press forever -- on the keep-warm
-        # path, synchronously in the hotkey press callback (issue #72
-        # review). A moved or revived default is a different pair and
-        # resets; failed resets recorded nothing (``last_reset`` is
-        # written only after a successful open), so they retry.
+        # read, and the session is actually bound to that device: the
+        # live.device_id conjunct (issue #72 review, CRITICAL) makes the
+        # guard compare the pair against the session it guards, not just
+        # against itself -- device_id and last_reset are now written from
+        # one read (registry.open, or the fallback below), and a guard
+        # that only compared the pair let split reads pin it to a device
+        # the session never opened on, suppressing the still-needed reset
+        # forever. The reset exists to stop the "doubt falls to
+        # not-alive" fail-safe paying a full terminate-all +
+        # Pa_Initialize + re-enumeration on EVERY press forever -- on the
+        # keep-warm path, synchronously in the hotkey press callback
+        # (issue #72 review). A moved or revived default is a different
+        # pair and resets; failed resets clear the pair (open() writes
+        # None for both on a construction failure), so they retry.
         return SessionRefresh(*registry.snapshot(), False)
 
     # Never drive PortAudio's init count to zero while another thread
@@ -150,23 +160,34 @@ def reset_session(
     registry.pyaudio = None
     registry.forget_index()
     rebuilt = registry.open(find_default_input_device)
-    if warm_stopped and warm is not None and rearm_warm is not None:
-        rearm_warm(True)
     if not rebuilt:
         # The engine never came back. Leave the session unbound -- the
         # next press re-reads the live device and retries, with
         # nothing left holding PortAudio open.
+        #
+        # And nothing was re-armed over that missing session: the re-arm
+        # belongs after a successful rebuild (issue #72 review, minor).
+        # The capture stopped cleanly above, so drop() set no recovery
+        # flag -- mirror the terminate_all() bail: hand the dead capture
+        # back (a stopped capture is dead for presses) and ask for
+        # recovery, so the worker path's recover() brings keep-warm back
+        # when the engine does.
+        if warm_stopped and warm is not None and rearm_warm is not None:
+            rearm_warm(False)
+            registry.warm.need_recovery()
         return SessionRefresh(None, None, False)
-    # Dedupe baseline: this exact live read now has a session built
-    # against it (see the dedupe check above). device_id is filled from
-    # THIS read when open()'s second read gave no evidence: the dedupe
-    # guard needs a non-None device_id to engage, and leaving it None
-    # (open()'s transient failure is quite possible right after a
-    # coreaudiod storm) meant a full rebuild on every press -- on the
-    # hotkey callback thread in the keep-warm path, the exact hazard
-    # the dedupe was added to remove (issue #72 review, round 1).
-    registry.last_reset = live
-    if registry.device_id is None:
+    if warm_stopped and warm is not None and rearm_warm is not None:
+        # Only now does the session exist to arm against.
+        rearm_warm(True)
+    if registry.last_reset is None:
+        # open()'s own read gave no evidence (transient -- quite possible
+        # right after the coreaudiod storm that moved the default). Fill
+        # BOTH halves of the dedupe baseline from THIS read (issue #72
+        # review, round 1 + CRITICAL): the guard needs a non-None
+        # device_id to engage, and whichever read it falls back to, the
+        # pair it compares has to be the one read that set it. With
+        # open()'s read present, open() already wrote both from it.
+        registry.last_reset = live
         registry.device_id = live.device_id
     return SessionRefresh(*registry.snapshot(), False)
 
