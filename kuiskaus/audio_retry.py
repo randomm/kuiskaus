@@ -44,14 +44,18 @@ def format_microphone_error(error: BaseException) -> str:
 
     errno == PA_INTERNAL_ERROR_ERRNO gets the killall-coreaudiod hint;
     everything else -- RuntimeError from device lookup, any other errno --
-    keeps the generic message.
+    keeps the generic message. The foreign text is bounded to 120 chars:
+    every branch here reaches the menubar status item (through
+    ``microphone_unavailable``), and a native exception can carry an
+    arbitrarily long PortAudio/CoreAudio description.
     """
+    text = str(error)[:120]
     if isinstance(error, OSError) and error.errno == PA_INTERNAL_ERROR_ERRNO:
         return (
-            f"Microphone unavailable ({error}). CoreAudio may be in a bad "
+            f"Microphone unavailable ({text}). CoreAudio may be in a bad "
             "state; try 'sudo killall coreaudiod' in Terminal."
         )
-    return f"Microphone unavailable: {error}"
+    return f"Microphone unavailable: {text}"
 
 
 def microphone_unavailable(last_error: BaseException | None) -> str:

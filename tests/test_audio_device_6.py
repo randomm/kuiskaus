@@ -396,3 +396,21 @@ def test_the_exhausted_retry_message_bounds_the_foreign_error_text(coreaudio_stu
     assert len(message) < len(MICROPHONE_NEEDS_RESTART) + 200, (
         f"unbounded native error text in the menubar status item: {len(message)} chars"
     )
+
+
+def test_the_plain_unavailable_message_bounds_the_foreign_error_text(coreaudio_stub):
+    """The other branch that reaches the status item goes through
+    ``microphone_unavailable``, which interpolated the error unbounded: the
+    ``[:120]`` lived only in the restart-verdict branch above, so the
+    generic "Microphone unavailable: ..." line still took a 10 KB PortAudio
+    description to the menubar verbatim (issue #72).
+    """
+    registry, _pa, _module = _registry()
+    assert registry.needs_restart is False  # the microphone_unavailable path
+
+    message = registry.unavailable_reason(OSError("x" * 10_000))
+
+    assert message.startswith("Microphone unavailable")
+    assert len(message) < 200, (
+        f"unbounded native error text in the menubar status item: {len(message)} chars"
+    )

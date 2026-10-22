@@ -276,3 +276,25 @@ class WarmKeep:
             with self._lock:
                 self._recover_pending = False
             rearm_warm(True)
+
+    def recover_quietly(self, rearm_warm: Callable[[bool], None]) -> None:
+        """``recover()`` as the worker head runs it: a failed re-arm must
+        not fail the user's press (issue #72).
+
+        Keep-warm does not re-arm itself after a stuck-read drop, so the
+        worker asks for it at the top of every session -- but the re-arm is
+        auxiliary: the press opened its own stream on the worker path. A
+        raising ``rearm_warm`` (``WarmArm._arm_locked`` re-raises a capture
+        whose ``start()`` failed -- thread creation does fail) shared the
+        worker head's one guard with the essential session reset, so the
+        press the user just made died over the capture it was not using.
+        Log it and go on: the failed arming re-files the recovery ask, and
+        a later press brings keep-warm back.
+        """
+        try:
+            self.recover(rearm_warm)
+        except Exception as recover_error:  # noqa: BLE001 - auxiliary re-arm, logged
+            print(
+                f"Keep-warm recovery failed ({str(recover_error)[:120]}); "
+                "the recording goes on without it."
+            )

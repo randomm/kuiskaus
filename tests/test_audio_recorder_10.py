@@ -16,12 +16,17 @@ registered -- which is how the fix reproduced issue #72's own symptom.
 The last test here drives that state.
 """
 
+from __future__ import annotations
+
+import threading
+
 from kuiskaus.audio_device_reset import MAX_TERMINATE_FAILURES
 from tests.support_audio_recorder import (
     _cleanup_recorder,
     _live_default_input,
     _make_pyaudio_instance,
     _make_recorder,
+    _streaming_stream,
     _wait_until,
 )
 
@@ -56,11 +61,14 @@ def test_a_raising_session_reset_fails_the_press_instead_of_stranding_it(
         _cleanup_recorder(recorder)
 
 
-def test_a_raising_keep_warm_recovery_fails_the_press_too(
+def test_a_raising_keep_warm_recovery_leaves_the_press_recording(
     audio_recorder_module, monkeypatch
 ):
-    """Same boundary, second call: keep-warm recovery runs right after the
-    reset and reaches the same native paths."""
+    """Contract change (issue #72): the keep-warm re-arm no longer shares
+    the worker head's guard. It is auxiliary -- the press opened its own
+    stream on the worker path -- so a raising recover is logged and the
+    press keeps recording. Sharing the guard meant fail_worker_session took
+    the user's recording down over the capture it was never using."""
     module = audio_recorder_module
     pa = _make_pyaudio_instance(0)
     recorder = _make_recorder(module, init_probe=pa)
@@ -69,11 +77,17 @@ def test_a_raising_keep_warm_recovery_fails_the_press_too(
         raise RuntimeError("ledger wedged")
 
     monkeypatch.setattr(recorder._session.warm, "recover", explode)
+    release = threading.Event()
+    pa.open.return_value = _streaming_stream(release)
     try:
         assert recorder.start_recording() is True
-        assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
-        assert recorder.last_error is not None
+        assert _wait_until(lambda: recorder.stream is not None, timeout=5.0), (
+            "the press died over the auxiliary re-arm it was never using"
+        )
+        assert recorder.recording is True
+        assert recorder.last_error is None
     finally:
+        release.set()
         _cleanup_recorder(recorder)
 
 

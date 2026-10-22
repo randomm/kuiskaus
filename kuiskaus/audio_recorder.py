@@ -333,12 +333,12 @@ class AudioRecorder:
         # The head of this worker reaches CoreAudio and the thread ledgers.
         try:
             refresh_recorder_session(self, previous)
-            # Keep-warm does not re-arm itself after a stuck-read drop.
-            self._session.warm.recover(self._rearm_warm)
         except Exception as head_error:  # noqa: BLE001 - worker thread boundary
             print(f"Error preparing the recording session: {str(head_error)[:120]}")
             fail_worker_session(self, my_gen, head_error)
             return
+        # Keep-warm's re-arm is auxiliary: a failed one never fails the press.
+        self._session.warm.recover_quietly(self._rearm_warm)
         stream = self._open_stream_with_retry(my_gen)
         if stream is None:
             return  # last_error already set (or generation superseded)
