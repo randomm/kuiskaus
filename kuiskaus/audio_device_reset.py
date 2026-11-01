@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING
 
 from kuiskaus.audio_coreaudio import (
     LiveDefaultInput,
@@ -25,6 +25,7 @@ from kuiskaus.audio_coreaudio import (
     session_needs_reset,
 )
 from kuiskaus.audio_rebuild_budget import MAX_RESET_REBUILDS
+from kuiskaus.audio_reset_outcome import SessionRefresh, unchanged
 from kuiskaus.audio_worker_keep import terminate_blocker, worker_may_be_native
 
 if TYPE_CHECKING:
@@ -34,11 +35,6 @@ if TYPE_CHECKING:
 
     from kuiskaus.audio_device import PyAudioRegistry
     from kuiskaus.audio_warm import WarmCapture
-
-    # Annotation alias: the SessionRefresh field below is named ``pyaudio``,
-    # which would otherwise shadow the module inside its own class body (the
-    # same alias audio_retry.py uses for the same reason).
-    _PyAudio = pyaudio.PyAudio
 
 # The one true thing to say once the session has given up on tearing PortAudio
 # down. It lives beside the other press-failure text because both are what the
@@ -169,41 +165,16 @@ def _press_is_new_evidence(registry: PyAudioRegistry, live: LiveDefaultInput) ->
     refusing an instance says the ENGINE will not come down -- so a
     different device is no new evidence there and the window still holds.
 
-    A pure read: the exemption itself is claimed by ``reset_session``, on
-    the path that actually proceeds to the rebuild -- a press the ledger
-    gate then defers must not pay for a teardown it never ran.
+    A pure read: the exemption itself is claimed by ``reset_session``, at
+    the point of no return after every deferral gate (ledger, keep-warm
+    stop, teardown) has passed -- a press any of them defers must not pay
+    for a rebuild it never ran.
     """
     return (
         not registry.terminate_failures
         and registry.rebuild.device is not None
         and registry.rebuild.is_new_device(live.device_id)
     )
-
-
-class SessionRefresh(NamedTuple):
-    """What the caller writes back under its lock: the session to use and
-    the device index resolved against it. ``busy`` means something may still
-    be inside a native call, so PortAudio was NOT terminated and the session
-    stays dirty for the next press to retry. ``locked`` marks the busy that
-    is only "another thread's reset is running right now" -- admissible to
-    the press gate, unlike the ledger deferral."""
-
-    pyaudio: _PyAudio | None
-    input_device_index: int | None
-    busy: bool
-    locked: bool = False
-
-
-def _unchanged(
-    registry: PyAudioRegistry, *, busy: bool = False, locked: bool = False
-) -> SessionRefresh:
-    """A refresh result that leaves the session where it is.
-
-    The pair is read from ``snapshot()`` as one value: an index is only a
-    fact about the instance that enumerated it.
-    """
-    pyaudio_instance, device_index = registry.snapshot()
-    return SessionRefresh(pyaudio_instance, device_index, busy, locked)
 
 
 def _hand_back_capture(
@@ -280,26 +251,30 @@ def reset_session(
     would park the hotkey callback behind another thread's teardown (#60).
     """
     if not registry._reset_lock.acquire(blocking=False):
-        return _unchanged(registry, busy=True, locked=True)
+        return unchanged(registry, busy=True, locked=True)
     try:
         live = read_live_default_input()
         if live is None:
             # CoreAudio saying "no evidence": never treated as a change, and
             # never as an absence either. Nothing was proved about the session,
             # so nothing here may clear a verdict an earlier press earned.
-            return _unchanged(registry)
+            return unchanged(registry)
         settled = _settled_or_refused(registry, live)
         if settled is not None:
             return settled
         blocked = _native_blocker(registry, warm, blocked_workers)
         if blocked is not None:
             print(f"Device reset deferred: {blocked} may still be native.")
-            return _unchanged(registry, busy=True)
-        if _teardown_backoff_open(registry) and not registry.rebuild.claim_exemption():
-            # The backoff still being open means the press was let through
-            # on the new-evidence exemption -- so it is spent here, on the
-            # path that rebuilds, not in the predicate.
-            return _unchanged(registry, busy=True)
+            return unchanged(registry, busy=True)
+        # Captured BEFORE the teardown, and the exemption is claimed after
+        # it (see below): a clean terminate clears ``needs_restart``, so a
+        # re-read at the claim would always say "closed" at this point.
+        backoff = _teardown_backoff_open(registry)
+        if backoff and not registry.rebuild.exemption_available():
+            # Refused HERE, before anything is torn down: the allowance's
+            # whole point is that a fast device-id rotation must not pay the
+            # full futile teardown on every press once it is spent.
+            return unchanged(registry, busy=True)
         if not registry.warm.drop(warm):
             # The stuck read owns a capture whose stop event is already set:
             # when the read returns the thread exits and THIS capture can never
@@ -315,14 +290,20 @@ def reset_session(
             # again; WarmKeep.drop() answers with a probe, not a second join.
             print("Keep-warm capture would not stop; dropping it.")
             _hand_back_capture(registry, warm, rearm_warm, ask_recovery=False)
-            return _unchanged(registry, busy=True)
+            return unchanged(registry, busy=True)
         if not registry.terminate_all():
             # Busy: the session stays dirty and the next press retries. The
             # capture was stopped cleanly above and is dead for presses
             # either way, so hand it back and ask for recovery (see
             # _hand_back_capture).
             _hand_back_capture(registry, warm, rearm_warm, ask_recovery=True)
-            return _unchanged(registry, busy=True)
+            return unchanged(registry, busy=True)
+        if backoff:
+            # The point of no return: the teardown ran clean and the rebuild
+            # is next, so THIS press pays for it. Claiming above the two
+            # deferral bails let a press that never rebuilt spend the
+            # allowance -- the rule the ledger gate already honours.
+            registry.rebuild.claim_exemption()
         return _rebuild(registry, live, warm, rearm_warm, find_default_input_device)
     finally:
         registry._reset_lock.release()
@@ -369,7 +350,7 @@ def _settled_or_refused(
             # retiring MAX_TERMINATE_FAILURES as a budget after the first
             # settle.
             registry.terminate_failures = 0
-        return _unchanged(registry)
+        return unchanged(registry)
 
     if _teardown_backoff_open(registry) and not _press_is_new_evidence(registry, live):
         # The press that still wants the teardown is the one the verdict is
@@ -380,7 +361,7 @@ def _settled_or_refused(
         # different device, are both picked up on that press instead of
         # being refused for the rest of the window without the device ever
         # having been read.
-        return _unchanged(registry, busy=True)
+        return unchanged(registry, busy=True)
     return None
 
 
@@ -484,7 +465,7 @@ def _rebuild(
             "rebuilds without the session ever agreeing with it; the "
             "microphone is not settling.",
         )
-    return _unchanged(registry)
+    return unchanged(registry)
 
 
 # Re-exported for callers that name the entry point rather than the module.

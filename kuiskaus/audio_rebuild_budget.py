@@ -124,6 +124,13 @@ class RebuildBudget:
         """
         return device_id not in self.recent
 
+    def exemption_available(self) -> bool:
+        """Whether the allowance still has one to give -- the PURE half of
+        ``claim_exemption``, so the gate can refuse an exhausted press
+        BEFORE paying the teardown it is refusing.
+        """
+        return self.new_evidence_spent < MAX_NEW_EVIDENCE_EXEMPTIONS
+
     def claim_exemption(self) -> bool:
         """Claim one new-evidence exemption (paired with ``is_new_device``).
 
