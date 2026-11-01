@@ -96,9 +96,11 @@ def note_terminate_outcome(registry: PyAudioRegistry, clean: bool) -> None:
     if registry.needs_restart:
         # Already given up: re-arm the backoff so the next press does not
         # pay for the same futile teardown, and stop there. What the user is
-        # now told follows from ``terminate_failures`` being non-zero (see
-        # ``restart_verdict``), so the stronger claim -- an instance really
-        # did refuse to release -- replaces the weaker one on its own.
+        # now told follows from ``terminate_failures`` against
+        # ``MAX_TERMINATE_FAILURES`` (see ``restart_verdict``): a streak
+        # verdict with a first refusal on top still says "not settling" --
+        # one refusal has not earned the PortAudio claim -- and the stronger
+        # wording replaces it on its own once the refusals reach the budget.
         registry.restart_retry_after = _now() + RESTART_RETRY_SECONDS
         return
     if registry.terminate_failures < MAX_TERMINATE_FAILURES:
@@ -115,15 +117,17 @@ def restart_verdict(registry: PyAudioRegistry) -> str:
 
     The two verdicts say different things and only one of them is allowed to
     blame PortAudio: "would not release the device" is a claim about a
-    teardown, so it belongs to the session that has a refusal on the record
-    (``terminate_failures`` non-zero, which a clean teardown clears along
-    with the verdict -- see ``note_terminate_outcome``). The streak verdict
-    has no such refusal: every teardown released, and what will not settle is
-    the device. Choosing the wording here rather than storing it is what
-    keeps the sentence true after the state that earned it moves -- the same
-    reason the streak itself is not frozen into a message.
+    teardown, so it belongs to the session that has ``MAX_TERMINATE_FAILURES``
+    consecutive refusals on the record (which a clean teardown clears along
+    with the verdict -- see ``note_terminate_outcome``). A single refusal is
+    not that claim: the streak verdict is declared with every teardown
+    released cleanly, and one later refusal is one data point, not a storm --
+    this user's microphone may still come back on the next press, and the
+    backoff retries on its own. Choosing the wording here rather than storing
+    it is what keeps the sentence true after the state that earned it moves
+    -- the same reason the streak itself is not frozen into a message.
     """
-    if registry.terminate_failures:
+    if registry.terminate_failures >= MAX_TERMINATE_FAILURES:
         return MICROPHONE_NEEDS_RESTART
     return MICROPHONE_NOT_SETTLING
 

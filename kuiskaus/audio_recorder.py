@@ -33,7 +33,11 @@ from kuiskaus.audio_warm_arm import (
     start_press,
     warm_press_gate,
 )
-from kuiskaus.audio_worker_session import fail_worker_session, refresh_recorder_session
+from kuiskaus.audio_worker_session import (
+    fail_worker_session,
+    prepare_worker_session,
+    refresh_recorder_session,
+)
 
 # Aliases for annotations written inside the class body, where the
 # ``pyaudio`` property otherwise shadows the module name.
@@ -330,11 +334,8 @@ class AudioRecorder:
                 if self._generation != my_gen or not self.recording:
                     return  # released again while waiting
         # The head of this worker reaches CoreAudio and the thread ledgers.
-        try:
-            refresh_recorder_session(self, previous)
-        except Exception as head_error:  # noqa: BLE001 - worker thread boundary
-            print(f"Error preparing the recording session: {str(head_error)[:120]}")
-            fail_worker_session(self, my_gen, head_error)
+        # A raise, or a reset owned by another thread, fails the press here.
+        if not prepare_worker_session(self, my_gen, previous, refresh_recorder_session):
             return
         # Keep-warm's re-arm is auxiliary: a failed one never fails the press.
         self._session.warm.recover_quietly(self._rearm_warm)

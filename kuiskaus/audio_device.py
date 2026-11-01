@@ -40,8 +40,9 @@ from kuiskaus.audio_retry import (
     log_retry_attempt,
     terminate_quietly,
 )
+from kuiskaus.audio_teardown import dispose_prepared, refuse_teardown
 from kuiskaus.audio_warm_keep import WarmKeep
-from kuiskaus.audio_worker_keep import WorkerKeep, terminate_blocker
+from kuiskaus.audio_worker_keep import WorkerKeep
 
 if TYPE_CHECKING:
     from kuiskaus.audio_warm import WarmCapture
@@ -291,7 +292,7 @@ class PyAudioRegistry:
         if self._refuse_teardown():
             return False
         for pa in pending:
-            if self._dispose(pa):
+            if dispose_prepared(self, pa):
                 disposed += 1
             else:
                 incomplete = True
@@ -319,13 +320,9 @@ class PyAudioRegistry:
 
     def _refuse_teardown(self) -> bool:
         """True (and logged) while something this session started may still
-        be inside a native PortAudio call.
+        be inside a native PortAudio call (``audio_teardown.refuse_teardown``).
         """
-        blocker = terminate_blocker(self.workers, self.warm)
-        if blocker is None:
-            return False
-        print(f"{blocker.capitalize()} may still be native; not terminating PyAudio.")
-        return True
+        return refuse_teardown(self)
 
     def open(self, find_default_input_device: Callable[[pyaudio.PyAudio], int]) -> bool:
         """Construct the persistent cached session (issue #42) and record the

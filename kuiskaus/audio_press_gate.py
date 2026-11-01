@@ -56,9 +56,14 @@ def press_is_admissible(
     admitted (True). An admitted keep-warm press runs the reset itself;
     False = fail this press, and ``press_refusal_reason`` is what the user is
     told about it. A ``locked`` busy is the one busy that admits: it means
-    the very reset this press asks for is already running on another thread
-    (issue #72 -- press, worker and warm capture all enter), and a press must
-    not fail because its own work is being done.
+    another thread holds ``_reset_lock`` and is running a reset right now
+    (issue #72 -- press, worker and warm capture all enter). That says
+    NOTHING about which device the holder's reset covers -- it is bounded to
+    the one press it belongs to -- so this admission is not a promise that
+    this press's device was settled; it only declines to fail a press for the
+    crime of a reset being busy, and the worker re-checks the session at the
+    head of its own press (where a still-locked reset fails it busy instead
+    of opening on a torn pair).
     """
     if recording or warm is None:
         return True

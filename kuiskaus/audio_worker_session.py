@@ -1,8 +1,9 @@
 """The recording worker's session lifecycle (issue #72).
 
-Three procedures, all of them the worker's own view of the device session:
-reset it at the head of a press, name the worker the gate must ask about, and
-fail the press when the session could not be prepared.
+Three procedures (and their two failure paths), all of them the worker's own
+view of the device session: reset it at the head of a press, name the worker
+the gate must ask about, and fail the press when the session could not be
+prepared -- including when its reset belongs to another thread.
 
 Split from ``kuiskaus.audio_warm_arm`` -- which is the warm-capture arming and
 the press gate, decided under the recorder lock -- because these run OUTSIDE
@@ -22,6 +23,7 @@ warm capture's open.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from kuiskaus.audio_retry import find_default_input_device
@@ -41,7 +43,7 @@ def current_worker(recorder: RecorderState) -> threading.Thread | None:
 
 def refresh_recorder_session(
     recorder: RecorderState, blocked: threading.Thread | None = None
-) -> None:
+) -> bool:
     """Live-default device reset (issue #72) at the top of the worker.
 
     Native calls run OUTSIDE _lock (issue #60): they can block and
@@ -49,6 +51,12 @@ def refresh_recorder_session(
     ``blocked`` is the worker just joined, and the gate also consults the
     recorder's CURRENT worker at gate time -- which is why the
     name travels as a callable rather than as the thread.
+
+    Returns True on a ``locked`` deferral: another thread owns the reset
+    right now, and the caller must NOT open a stream on this session --
+    the pair behind it may name an instance ``terminate_all()`` has
+    already terminated. False = proceed (settled, or a ledger deferral
+    that keeps the current pair).
 
     The session is asked for its own reset, not looked up through the instance
     it happens to be holding: a half-finished teardown unbinds ``pyaudio``
@@ -68,23 +76,19 @@ def refresh_recorder_session(
         blocked_workers=lambda: (blocked, current_worker(recorder)),
     )
     if result.locked:
-        # Nothing is written back. Another thread holds ``_reset_lock`` and is
-        # mutating ``pyaudio`` / ``_indices`` right now, so the pair this
-        # result carries was sampled mid-teardown: ``_dispose`` terminates the
-        # instance BEFORE ``forget``/``unbind`` run, and a ``snapshot()`` taken
-        # in that window names an instance ``Pa_Terminate()`` has already been
-        # called on while its index still resolves -- the (corpse, live index)
-        # pairing ``DeviceIndexBinding`` exists to make unrepresentable.
-        # Writing it back clobbers the rebuild the holder is about to publish,
-        # and because the holder's ``open()`` left ``last_reset`` agreeing with
-        # the live device, every later press then takes the dedupe arm of
-        # ``_settled_or_refused`` and re-publishes the corpse: the mic dead
-        # until restart, through the path this commit added.
+        # Nothing is written back, and the caller is told: another thread
+        # holds ``_reset_lock`` and is mutating ``pyaudio`` / ``_indices``
+        # right now, so the pair this result carries was sampled mid-teardown
+        # -- an instance ``Pa_Terminate()`` may already have been called on
+        # while its index still resolves. Writing the pair back clobbers the
+        # rebuild the holder is about to publish, and OPENING on it records
+        # into a corpse; the worker fails the press busy instead (see
+        # ``prepare_worker_session``).
         print(
             "[audio.retry] device reset deferred: another thread is resetting "
             "the session; its write-back stands, not this snapshot."
         )
-        return
+        return True
     if result.busy:
         # The press proceeds against the stale session (the only safe move
         # while a thread may be inside a native call), but the deferral has to
@@ -94,6 +98,7 @@ def refresh_recorder_session(
             "PortAudio; session stays dirty for the next press."
         )
     recorder.publish_session(result.pyaudio, result.input_device_index)
+    return False
 
 
 def fail_worker_session(
@@ -114,3 +119,57 @@ def fail_worker_session(
         recorder.recording = False
         recorder.stream = None
         recorder.recording_thread = None
+
+
+def fail_worker_busy(recorder: RecorderState, my_gen: int) -> None:
+    """Generation-gated busy failure for a press whose session reset is
+    owned by another thread right now (the ``locked`` deferral).
+
+    Same gate and same state teardown as the exhausted retry loop, but the
+    message is the registry's press-refusal wording: while a retry can still
+    succeed this reads as busy, and a session that has earned the restart
+    verdict says that instead -- a poisoned session is never dressed up as a
+    deferral that will lift (the rule ``press_refusal_reason`` exists for).
+    """
+    with recorder._lock:
+        if recorder._generation != my_gen:
+            return
+        recorder.last_error = recorder._session.press_refusal_reason()
+        recorder.recording = False
+        recorder.stream = None
+        recorder.recording_thread = None
+
+
+def prepare_worker_session(
+    recorder: RecorderState,
+    my_gen: int,
+    blocked: threading.Thread | None = None,
+    refresh: Callable[[RecorderState, threading.Thread | None], bool] = (
+        refresh_recorder_session
+    ),
+) -> bool:
+    """The worker's head: reset the session, or fail the press. True = open.
+
+    Two failures end the press here, both generation-gated, both before any
+    stream is opened:
+
+    * the reset itself raises (native code behind a PyObjC bridge);
+    * the reset reports a ``locked`` deferral -- another thread may be
+      mid-``terminate_all()``, and opening now can re-adopt the
+      (corpse, live index) pair the deferral's snapshot carried. The press
+      is told busy, not recorded into a PortAudio corpse.
+
+    ``refresh`` is the reset seam, passed BY the worker (not defaulted at
+    call time) so the recorder module's importable name stays the test
+    seam it already is.
+    """
+    try:
+        deferred = refresh(recorder, blocked)
+    except Exception as head_error:  # noqa: BLE001 - worker thread boundary
+        print(f"Error preparing the recording session: {str(head_error)[:120]}")
+        fail_worker_session(recorder, my_gen, head_error)
+        return False
+    if deferred:
+        fail_worker_busy(recorder, my_gen)
+        return False
+    return True

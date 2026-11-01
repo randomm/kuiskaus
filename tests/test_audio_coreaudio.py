@@ -115,6 +115,25 @@ def test_failed_liveness_read_doubts_the_device(coreaudio_stub):
     assert read_live_default_input() == LiveDefaultInput(device_id=96, is_alive=False)
 
 
+def test_a_nonzero_liveness_value_reads_as_alive(coreaudio_stub):
+    """``isAlive`` is documented as UInt32 0/1, but the read is a raw
+    UInt32 and a driver answering any other non-zero value is reporting a
+    live device: only zero -- or no answer at all, the fail-safe above --
+    means not-alive. ``alive == 1`` threw the mic into perpetual rebuilds
+    over a driver that answers 2 for "yes".
+    """
+
+    def _read(object_id, address, _qs, _q, _s, _out):
+        if address.mSelector == DEFAULT_INPUT_SELECTOR:
+            return 0, 4, (96).to_bytes(4, sys.byteorder)
+        if address.mSelector == ALIVE_SELECTOR:
+            return 0, 4, (2).to_bytes(4, sys.byteorder)  # non-zero, non-1
+        return 1852797079, 0, None  # 'who?'
+
+    coreaudio_stub.AudioObjectGetPropertyData.side_effect = _read
+    assert read_live_default_input() == LiveDefaultInput(device_id=96, is_alive=True)
+
+
 def test_non_bytes_property_data_is_no_evidence(coreaudio_stub):
     """A successful status with a non-bytes out-buffer is not a value."""
     from kuiskaus import audio_coreaudio

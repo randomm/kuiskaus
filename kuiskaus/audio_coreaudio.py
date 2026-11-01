@@ -198,9 +198,15 @@ def read_live_default_input() -> LiveDefaultInput | None:
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain,
     )
-    # Doubt about liveness falls to "not alive": the safe response to an
-    # unproven device is a fresh session, not a stream opened on it.
-    return LiveDefaultInput(device_id=device_id, is_alive=alive == 1)
+    # Doubt about liveness (no answer at all) falls to "not alive": the safe
+    # response to an unproven device is a fresh session, not a stream opened
+    # on it. Any OTHER non-zero is the device saying yes -- isAlive is a raw
+    # UInt32 and a driver answering something besides 1 for alive is still
+    # answering alive; treating only 1 as alive rebuilt the session forever
+    # over such a driver.
+    return LiveDefaultInput(
+        device_id=device_id, is_alive=alive is not None and alive != 0
+    )
 
 
 def session_needs_reset(

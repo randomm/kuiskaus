@@ -32,7 +32,12 @@ import threading
 from unittest.mock import MagicMock
 
 import kuiskaus.audio_device_reset as reset_module
-from kuiskaus.audio_device_reset import MAX_TERMINATE_FAILURES
+from kuiskaus.audio_device_reset import (
+    MAX_TERMINATE_FAILURES,
+    MICROPHONE_NEEDS_RESTART,
+    MICROPHONE_NOT_SETTLING,
+    restart_verdict,
+)
 from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
 
@@ -64,6 +69,90 @@ def _live_worker() -> tuple[threading.Event, threading.Thread]:
     worker = threading.Thread(target=hold.wait, daemon=True)
     worker.start()
     return hold, worker
+
+
+# ---------------------------------------------------------------------------
+# What terminate_all() orders the teardown (torn-pair window)
+# ---------------------------------------------------------------------------
+
+
+def test_terminate_all_never_pairs_a_terminated_instance_with_its_index(
+    coreaudio_stub,
+):
+    """The window ``DeviceIndexBinding`` exists to make unrepresentable was
+    open INSIDE ``terminate_all()``: ``_dispose`` called ``terminate()``
+    FIRST and only then ``forget``/``unbind``, so a ``snapshot()`` taken by
+    another thread during the native ``Pa_Terminate()`` returned the
+    just-terminated instance PAIRED WITH ITS STILL-LIVE index -- exactly the
+    (corpse, live index) pair the retry loop then opened on. The forget and
+    the unbind must therefore happen BEFORE the terminate, so no read during
+    the native call can ever see that pairing.
+    """
+    registry, live, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+
+    snapshots_during_terminate: list = []
+
+    def _terminate_and_snapshot():
+        # The read another thread (the worker's retry loop) takes while
+        # this native call is in flight.
+        snapshots_during_terminate.append(registry.snapshot())
+
+    live.terminate.side_effect = _terminate_and_snapshot
+    assert registry.terminate_all() is True
+
+    assert snapshots_during_terminate, "the terminate never ran"
+    for instance, index in snapshots_during_terminate:
+        assert index is None or instance is not live, (
+            f"snapshot() paired the terminated instance with live index {index}"
+        )
+
+
+def test_a_refused_instance_keeps_its_registration_and_its_index(
+    coreaudio_stub,
+):
+    """Forgetting BEFORE terminating must not lose the instance that
+    refused: it stays registered (reachable by the next attempt -- the rule
+    the whole module is built on) and its index binding stands, because it
+    is still live and the index is still a fact about it.
+    """
+    registry, live, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    live.terminate.side_effect = OSError("Pa_Terminate failed")
+
+    assert registry.terminate_all() is False
+
+    assert live in registry._instances, "the refused instance became unreachable"
+    assert registry.pyaudio is live
+    assert registry.snapshot() == (live, 3), (
+        "the refusal lost the index that is still a fact about the live "
+        "instance -- every later attempt pays a fresh enumeration"
+    )
+
+
+def test_a_streak_verdict_plus_one_refusal_still_says_not_settling():
+    """The two verdicts say different things, and one refusal does not
+    earn the stronger one. The streak verdict is declared with every
+    teardown released cleanly (``terminate_failures`` 0); a single later
+    refusal is not yet the storm "PortAudio would not release the device"
+    claims -- that wording belongs to ``MAX_TERMINATE_FAILURES`` in a row
+    (the budget ``note_terminate_outcome`` already counts to). Sending the
+    not-settling user to quit the app over one refusal is the false claim
+    the wording rule exists to prevent.
+    """
+    registry, _pa, _module = _registry()
+    registry.needs_restart = True  # the streak verdict, teardowns all clean
+    registry.terminate_failures = 0
+
+    reset_module.note_terminate_outcome(registry, clean=False)  # one refusal
+    assert registry.terminate_failures == 1
+    assert restart_verdict(registry) == MICROPHONE_NOT_SETTLING
+
+    for _ in range(MAX_TERMINATE_FAILURES - 1):  # the streak the wording wants
+        reset_module.note_terminate_outcome(registry, clean=False)
+    assert restart_verdict(registry) == MICROPHONE_NEEDS_RESTART
 
 
 # ---------------------------------------------------------------------------
