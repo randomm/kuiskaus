@@ -266,9 +266,23 @@ def test_worker_path_does_not_rearm_warm_when_the_user_switched_it_off(
         assert _wait_until(lambda: not warm_thread.is_alive(), timeout=8.0)
 
         assert recorder.start_recording() is True
-        worker = recorder.recording_thread
-        assert worker is not None
-        assert _wait_until(lambda: not worker.is_alive(), timeout=8.0)
+        # Wait for the STATE, not the worker's name (same race as
+        # test_a_locked_reset_fails_the_worker_press_busy_without_opening):
+        # `release` is set, so the mock read raises the moment the worker
+        # reaches it and the press finishes -- clearing
+        # `recording`/`recording_thread` with it -- before a loaded machine
+        # hands this thread back. The press is still pinned to the worker path
+        # by what only that path does: it rode no capture (`_press_warm` names
+        # the capture a warm press routes its ring into), and the worker ledger
+        # answering "nobody I started is still native" is what
+        # `not worker.is_alive()` used to say, readable without the name.
+        assert recorder._press_warm is None, "the press rode the keep-warm route"
+        assert _wait_until(lambda: recorder.recording is False, timeout=8.0), (
+            "the worker press never completed its own teardown"
+        )
+        assert _wait_until(
+            lambda: not recorder._session.workers.any_may_be_native(), timeout=8.0
+        ), "the worker this press started never exited"
         assert recorder._warm is None, "keep-warm came back after the user unchecked it"
     finally:
         release.set()

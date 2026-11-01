@@ -91,8 +91,13 @@ def test_four_presses_cannot_terminate_under_a_worker_that_lost_its_name(
         # The default moved, so this press really wants the reset.
         _live_default_input(coreaudio_stub, 77)
         assert recorder.start_recording() is True
-        worker_3 = recorder.recording_thread
-        assert worker_3 is not None
+        # The worker's NAME is not read here on purpose: `release` is already
+        # set, so this press's read raises the moment it starts and the worker's
+        # own teardown clears `recording_thread` before a loaded main thread
+        # gets back here -- the same race as
+        # test_a_locked_reset_fails_the_worker_press_busy_without_opening. What
+        # the press is pinned by is its open below (`live["calls"] >= 3`), which
+        # only a worker press performs (keep-warm is off in this test).
         # Either the reset was refused (this worker opens on the live
         # instance, so pa.open runs again) or it terminated underneath W1.
         # Waiting on the disjunction keeps the assertion below the one that
@@ -107,7 +112,11 @@ def test_four_presses_cannot_terminate_under_a_worker_that_lost_its_name(
         assert live["in_open"] == 1  # W1 never left the native call
         # Busy, not half-reset: the press proceeds on the session it has.
         assert recorder.pyaudio is pa
-        assert _wait_until(lambda: not worker_3.is_alive(), timeout=8.0)
+        # The press ran to its own teardown -- `recording` is what the worker
+        # clears on the way out. The worker ledger cannot answer this one here:
+        # W1 is deliberately still alive inside it, which is the point of the
+        # test, so "nobody in the ledger is native" is never true.
+        assert _wait_until(lambda: recorder.recording is False, timeout=8.0)
         # ... and the press did not pay for it with a second live instance.
         assert module.pyaudio.PyAudio.call_count == 1
     finally:
@@ -175,13 +184,22 @@ def test_wedged_worker_stops_blocking_once_its_open_returns(
         wedged.set()
         assert _wait_until(lambda: not worker.is_alive(), timeout=8.0)
         assert recorder.start_recording() is True
-        final = recorder.recording_thread
-        assert final is not None
+        # Wait for the STATE, not the worker's name: `release` is set, so this
+        # press's read fails the moment it starts and its teardown clears
+        # `recording_thread` before a loaded main thread gets back here (the
+        # same race as
+        # test_a_locked_reset_fails_the_worker_press_busy_without_opening).
+        # What the press is pinned by is the thing only ITS worker can do --
+        # finish the reset press B was refused: terminate the stale instance
+        # once and rebuild the session on the replacement. That is a stronger
+        # claim than "a thread was named here".
         assert _wait_until(lambda: recorder.pyaudio is rebuild, timeout=8.0)
         pa.terminate.assert_called_once()
 
         release.set()
-        assert _wait_until(lambda: not final.is_alive(), timeout=8.0)
+        assert _wait_until(
+            lambda: not recorder._session.workers.any_may_be_native(), timeout=8.0
+        ), "the worker this press started never exited"
     finally:
         wedged.set()
         release.set()
