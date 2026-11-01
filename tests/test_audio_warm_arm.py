@@ -23,6 +23,14 @@
 4. A capture whose thread could not be created must not stay installed: an
    installed capture with no thread reads as arming, and would then refuse
    every later ``terminate_all()`` for the life of the process.
+
+5. A ``locked`` deferral -- another thread holds ``_reset_lock`` and is
+   rebuilding the session right now -- may not write back the pair it
+   snapshotted. ``_dispose`` terminates an instance before it unbinds its
+   index, so a snapshot taken inside that window names a ``Pa_Terminate()``d
+   instance with a live index, and publishing it over the holder's rebuild
+   leaves the registry naming a corpse the next reset's dedupe guard will
+   keep "settling" on.
 """
 
 import threading
@@ -30,8 +38,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kuiskaus.audio_warm_arm import WarmArm, refresh_recorder_session
+from kuiskaus.audio_warm_arm import WarmArm
 from kuiskaus.audio_warm_keep import WarmKeep
+from kuiskaus.audio_worker_session import refresh_recorder_session
 from tests.support_audio_recorder import (
     _cleanup_recorder,
     _live_default_input,
@@ -321,3 +330,92 @@ def test_reset_gate_checks_the_current_worker_not_the_joined_name(
     refresh_recorder_session(recorder, w1)
     pa.terminate.assert_called_once()
     assert module.pyaudio.PyAudio.call_count == 2
+
+
+def test_a_locked_deferral_never_writes_its_snapshot_back(
+    audio_recorder_module, monkeypatch
+):
+    """Finding 5: the worker's write-back must skip a ``locked`` deferral.
+
+    The interleaving, made deterministic: the holder of ``_reset_lock`` is
+    inside ``terminate_all()`` -- ``_dispose`` has run ``terminate()`` but not
+    yet ``unbind()``, so the registry still pairs the dead instance with its
+    index -- and the worker enters, is refused, and reads that pair. The holder
+    then completes its rebuild and publishes it. The worker's own write-back
+    must not land afterwards, or it re-publishes the corpse over the rebuild.
+    """
+    recorder = _make_recorder(audio_recorder_module)
+    registry = recorder._session
+    torn = _make_pyaudio_instance(3)  # terminated, its index binding still set
+    rebuilt = _make_pyaudio_instance(7)
+
+    snapshotted = threading.Event()
+    holder_finished = threading.Event()
+    published: list = []
+
+    real_snapshot = registry.snapshot
+
+    def snapshot_mid_teardown():
+        """Read the pair as the holder is tearing it down, then hold the
+        entrant there until the holder's own write-back has landed: the
+        ordering the race needs, without a sleep in it."""
+        pair = real_snapshot()
+        snapshotted.set()
+        assert holder_finished.wait(timeout=5.0), "the holder never completed"
+        return pair
+
+    monkeypatch.setattr(registry, "snapshot", snapshot_mid_teardown)
+    monkeypatch.setattr(
+        recorder, "publish_session", lambda pa, index: published.append((pa, index))
+    )
+
+    registry._reset_lock.acquire()  # the holder is inside reset_session
+    registry.pyaudio = torn
+    registry.set_index(3, torn)
+    entrant = threading.Thread(
+        target=refresh_recorder_session, args=(recorder,), daemon=True
+    )
+    try:
+        entrant.start()
+        assert snapshotted.wait(timeout=5.0), "the entrant never read the session"
+
+        # The holder finishes: this is exactly what its own write-back does
+        # after _rebuild(), performed here while the entrant still holds the
+        # pair it sampled before the teardown.
+        registry.pyaudio = rebuilt
+        registry.set_index(7, rebuilt)
+        holder_finished.set()
+        entrant.join(timeout=5.0)
+    finally:
+        registry._reset_lock.release()
+
+    assert not entrant.is_alive()
+    assert published == [], f"a locked deferral published its torn pair: {published}"
+    assert recorder.pyaudio is rebuilt, "the holder's rebuild was clobbered"
+    assert recorder.input_device_index == 7
+
+
+def test_a_ledger_busy_deferral_still_writes_its_session_back(
+    audio_recorder_module, monkeypatch
+):
+    """The guard is for ``locked`` alone. A ledger deferral has no rebuild
+    running underneath it -- nothing is mutating the pair it reports -- and
+    the press proceeds on exactly that pair, so suppressing the write-back
+    for it as well would drop a session the worker is about to open on."""
+    from kuiskaus.audio_device_reset import SessionRefresh
+
+    recorder = _make_recorder(audio_recorder_module)
+    deferred = _make_pyaudio_instance(2)
+    published: list = []
+    monkeypatch.setattr(
+        recorder, "publish_session", lambda pa, index: published.append((pa, index))
+    )
+    monkeypatch.setattr(
+        recorder._session,
+        "refresh",
+        lambda *_args, **_kwargs: SessionRefresh(deferred, 2, busy=True),
+    )
+
+    refresh_recorder_session(recorder)
+
+    assert published == [(deferred, 2)]

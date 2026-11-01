@@ -128,8 +128,8 @@ def test_a_wrong_shape_payload_logs_a_bounded_diagnostic(coreaudio_stub, capsys)
     "CoreAudio answered something unparseable" failure -- and it was the
     only silent one: a refused read logs, a raising bridge logs, this just
     returned None, so a bridge that consistently handed back garbage left
-    no trace of WHY every reset was skipped. One line per read, under the
-    same log budget as the refused-read line (this runs on the press path).
+    no trace of WHY every reset was skipped. One line per read, under its
+    OWN log budget (this runs on the press path).
     """
     from kuiskaus import audio_coreaudio
 
@@ -145,6 +145,35 @@ def test_a_wrong_shape_payload_logs_a_bounded_diagnostic(coreaudio_stub, capsys)
         printed.count("CoreAudio returned") <= audio_coreaudio._OSSTATUS_LOG_BUDGET
     ), "the payload-shape diagnostic prints unbounded on the press path"
     assert len(printed) < 1000, f"unbounded payload diagnostic: {len(printed)} chars"
+
+
+def test_refused_reads_do_not_silence_the_payload_diagnostic(coreaudio_stub, capsys):
+    """The two diagnostics are bounded separately, on purpose. Sharing one
+    counter meant a bridge that refused five reads -- a coreaudiod storm, the
+    common shape -- spent the whole budget on "refused" lines, and the
+    payload-shape line added specifically to explain why every reset was
+    skipped stayed silent for the life of the process.
+    """
+    from kuiskaus import audio_coreaudio
+
+    def _refused(*_args):
+        return 1852797029, 0, None  # '!sta' -- CoreAudio said no
+
+    coreaudio_stub.AudioObjectGetPropertyData.side_effect = _refused
+    for _ in range(audio_coreaudio._OSSTATUS_LOG_BUDGET * 2):
+        assert audio_coreaudio._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) is None
+    assert capsys.readouterr().out.count("CoreAudio refused") == (
+        audio_coreaudio._OSSTATUS_LOG_BUDGET
+    ), "the refused-read line is not bounded as documented"
+
+    coreaudio_stub.AudioObjectGetPropertyData.side_effect = None
+    coreaudio_stub.AudioObjectGetPropertyData.return_value = (0, 4, 42)
+    assert audio_coreaudio._read_uint32(1, DEFAULT_INPUT_SELECTOR, 0, 0) is None
+
+    assert "CoreAudio returned" in capsys.readouterr().out, (
+        "an exhausted refused-read budget silenced the payload-shape "
+        "diagnostic: the two share a counter"
+    )
 
 
 def test_a_memoryview_is_measured_in_bytes_not_elements(coreaudio_stub):

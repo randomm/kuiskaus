@@ -27,14 +27,13 @@ from kuiskaus.audio_warm_arm import (
     WarmArm,
     announce_capture,
     cleanup_recorder_session,
-    fail_worker_session,
     finish_recording,
     open_warm_capture_stream,
     rearm_warm,
-    refresh_recorder_session,
     start_press,
     warm_press_gate,
 )
+from kuiskaus.audio_worker_session import fail_worker_session, refresh_recorder_session
 
 # Aliases for annotations written inside the class body, where the
 # ``pyaudio`` property otherwise shadows the module name.

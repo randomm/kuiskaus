@@ -45,11 +45,11 @@ from kuiskaus.audio_resample import assemble_audio
 from kuiskaus.audio_retry import (
     MICROPHONE_BUSY,
     PREVIOUS_WORKER_WAIT_SECONDS,
-    find_default_input_device,
     log_stop,
     open_warm_stream,
     worker_alive,
 )
+from kuiskaus.audio_worker_session import refresh_recorder_session
 
 if TYPE_CHECKING:
     import pyaudio
@@ -272,70 +272,6 @@ def warm_press_gate(
     return session.press_check_if_admissible(
         recording, warm, worker, find_default_input_device, rearm_warm
     )
-
-
-def current_worker(recorder: RecorderState) -> threading.Thread | None:
-    """The worker named at CALL time, read under _lock: a name captured
-    before a long join is stale by gate time -- a finished W1 must not mask a
-    live W2 (issue #72).
-    """
-    with recorder._lock:
-        return recorder.recording_thread
-
-
-def refresh_recorder_session(
-    recorder: RecorderState, blocked: threading.Thread | None = None
-) -> None:
-    """Live-default device reset (issue #72) at the top of the worker.
-
-    Native calls run OUTSIDE _lock (issue #60): they can block and
-    stop_recording() needs the lock. One worker runs this at a time;
-    ``blocked`` is the worker just joined, and the gate also consults the
-    recorder's CURRENT worker at gate time -- which is why the
-    name travels as a callable rather than as the thread.
-
-    The session is asked for its own reset, not looked up through the instance
-    it happens to be holding: a half-finished teardown unbinds ``pyaudio``
-    (terminate_all() terminated the live instance and a second one refused)
-    while that instance stays registered, and that is exactly the state where
-    the reset is the only thing that can finish the job. Resolving the session
-    from a None instance answers "no session here" and leaves PortAudio
-    initialised on a frozen device list -- the #72 symptom, back inside the
-    fix, on the default (non-keep-warm) path.
-    """
-    result = recorder._session.refresh(
-        find_default_input_device,
-        blocked_workers=lambda: (blocked, current_worker(recorder)),
-    )
-    if result.busy:
-        # The press proceeds against the stale session (the only safe move
-        # while a thread may be inside a native call), but the deferral has to
-        # be visible in the same log stream as the open attempts.
-        print(
-            "[audio.retry] device reset deferred: a worker may still hold "
-            "PortAudio; session stays dirty for the next press."
-        )
-    recorder.publish_session(result.pyaudio, result.input_device_index)
-
-
-def fail_worker_session(
-    recorder: RecorderState, my_gen: int, error: BaseException | None
-) -> None:
-    """Generation-gated teardown for a worker that never got a stream.
-
-    Shared by the exhausted retry loop and both of the worker's guards: either
-    way the press is over, and "recording" must not outlive the thread that
-    was recording it. The message goes through the registry's wrapper so a
-    device the session already knows is gone reads differently from a busy
-    microphone.
-    """
-    with recorder._lock:
-        if recorder._generation != my_gen:
-            return
-        recorder.last_error = recorder._session.unavailable_reason(error)
-        recorder.recording = False
-        recorder.stream = None
-        recorder.recording_thread = None
 
 
 def rearm_warm(recorder: RecorderState, usable: bool) -> None:

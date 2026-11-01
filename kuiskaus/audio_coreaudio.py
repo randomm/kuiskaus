@@ -54,8 +54,15 @@ _coreaudio_unavailable = False
 # difference between "the device is not there" and "we could not ask". It
 # is bounded because the reads run on the press path: the first few per
 # process are the diagnostic, the rest are the same storm.
+#
+# The two diagnostics below are bounded SEPARATELY, at the same budget. They
+# fail for different reasons and a reader needs both: a bridge that refuses
+# five reads (a coreaudiod storm, the common shape) would otherwise spend one
+# shared budget entirely on "refused" lines and leave the payload-shape line
+# -- the one that explains why every reset was skipped -- permanently silent.
 _OSSTATUS_LOG_BUDGET = 5
-_osstatus_logged = 0
+_refused_logged = 0
+_malformed_logged = 0
 
 
 def _coreaudio():
@@ -88,9 +95,10 @@ def _coreaudio():
 
 def _reset_diagnostics_for_tests() -> None:
     """Clear the latched diagnostics (test seam; production never calls it)."""
-    global _coreaudio_unavailable, _osstatus_logged
+    global _coreaudio_unavailable, _refused_logged, _malformed_logged
     _coreaudio_unavailable = False
-    _osstatus_logged = 0
+    _refused_logged = 0
+    _malformed_logged = 0
 
 
 class LiveDefaultInput(NamedTuple):
@@ -111,7 +119,7 @@ def _read_uint32(object_id: int, selector: int, scope: int, element: int) -> int
     is latched and logged once; a raising call and a nonzero OSStatus are
     both transient and are each logged as what they are.
     """
-    global _osstatus_logged
+    global _refused_logged, _malformed_logged
     CoreAudio = _coreaudio()
     if CoreAudio is None:
         return None
@@ -131,8 +139,8 @@ def _read_uint32(object_id: int, selector: int, scope: int, element: int) -> int
         # CoreAudio reports failure as a status code rather than raising, so
         # this is the only trace that the answer was "refused" and not "no
         # such device". Bounded for the same press-path reason as above.
-        if _osstatus_logged < _OSSTATUS_LOG_BUDGET:
-            _osstatus_logged += 1
+        if _refused_logged < _OSSTATUS_LOG_BUDGET:
+            _refused_logged += 1
             print(
                 f"CoreAudio refused selector {selector} with OSStatus {status}; "
                 "treating as no evidence."
@@ -153,10 +161,12 @@ def _read_uint32(object_id: int, selector: int, scope: int, element: int) -> int
     # The third "CoreAudio answered something unparseable" failure, and the
     # only silent one until now: a refused read logs, a raising bridge logs,
     # this just returned None -- so a bridge consistently handing back
-    # garbage left no trace of why every reset was skipped. Same bounded
-    # budget as the refused-read line: this runs on the press path.
-    if _osstatus_logged < _OSSTATUS_LOG_BUDGET:
-        _osstatus_logged += 1
+    # garbage left no trace of why every reset was skipped. Its own budget,
+    # not the refused-read one: a storm that spends those five lines must
+    # still leave this one to print. Bounded either way -- this runs on the
+    # press path.
+    if _malformed_logged < _OSSTATUS_LOG_BUDGET:
+        _malformed_logged += 1
         print(
             f"CoreAudio returned {bad_shape} for selector {selector}; "
             "treating as no evidence."
