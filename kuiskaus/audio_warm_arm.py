@@ -20,6 +20,13 @@ between the check and the act:
   ``WarmArm.rearm`` satisfies the request the user actually has, read under
   the same lock as the arm (``set_enabled`` -- the menu's path -- takes that
   lock too, so the check and the act cannot be split by a click).
+* the warm capture's own open asks the session for its live-default reset
+  and used to discard the answer. A ``locked`` deferral means another thread
+  holds ``_reset_lock`` and may be mid-``terminate_all()``, so opening on the
+  snapshot it returns can re-adopt a terminated instance whose index still
+  resolves. ``open_warm_capture_stream`` treats the deferral as an open
+  failure for that iteration and raises, which is the no-stream result
+  ``WarmCapture._run`` already retries after its reopen delay.
 * a worker name captured before a join of up to 30 s may be stale by gate
   time: that worker may have finished and a live one become current.
   ``worker_may_be_native`` resolves the names through a callable at gate
@@ -307,7 +314,17 @@ def open_warm_capture_stream(
     previous = recorder.recording_thread
     if previous is not None and previous.is_alive():
         previous.join(timeout=PREVIOUS_WORKER_WAIT_SECONDS)
-    refresh_recorder_session(recorder, previous)
+    if refresh_recorder_session(recorder, previous):
+        # A ``locked`` deferral is an open FAILURE for this iteration, not a
+        # licence to open on the snapshot: the holder of ``_reset_lock`` may
+        # be mid-``terminate_all()``, and ``_dispose`` terminates an instance
+        # before unbinding its index, so the pair this snapshot carries can
+        # name a PortAudio corpse whose index still resolves -- the same
+        # hazard ``prepare_worker_session`` refuses for the per-press worker.
+        # Raising is the one no-stream result ``WarmCapture._run`` already
+        # handles: the capture waits out its reopen delay and asks again, so
+        # keep-warm comes back once the holder is gone (#72).
+        raise RuntimeError("warm open deferred: another thread holds the session reset")
     # One snapshot for the pair: the index is only a fact about the instance
     # that enumerated it (#72).
     pa, device_index = recorder._session.snapshot()
