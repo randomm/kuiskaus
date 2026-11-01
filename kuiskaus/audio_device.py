@@ -26,7 +26,6 @@ from kuiskaus.audio_coreaudio import LiveDefaultInput, read_live_default_input
 from kuiskaus.audio_device_index import DeviceIndexBinding
 from kuiskaus.audio_device_reset import (
     SessionRefresh,
-    note_terminate_outcome,
     reset_session,
 )
 from kuiskaus.audio_press_gate import (
@@ -35,12 +34,12 @@ from kuiskaus.audio_press_gate import (
     unavailable_reason,
 )
 from kuiskaus.audio_rebuild_budget import RebuildBudget
-from kuiskaus.audio_retry import (
-    close_stream_quietly,
-    log_retry_attempt,
-    terminate_quietly,
+from kuiskaus.audio_retry import close_stream_quietly, log_retry_attempt
+from kuiskaus.audio_teardown import (
+    dispose_claimed,
+    refuse_teardown,
+    terminate_all_pass,
 )
-from kuiskaus.audio_teardown import dispose_prepared, refuse_teardown
 from kuiskaus.audio_warm_keep import WarmKeep
 from kuiskaus.audio_worker_keep import WorkerKeep
 
@@ -141,12 +140,25 @@ class PyAudioRegistry:
                 self._instances.append(pa)
         return pa
 
-    def forget(self, pa: pyaudio.PyAudio) -> None:
-        """Stop tracking an instance (it stays live -- the caller keeps
-        using it, e.g. the instance a new stream is opened on)."""
+    def forget(self, pa: pyaudio.PyAudio) -> bool:
+        """Untrack an instance; True when THIS call is the one that removed it.
+
+        The bool is the claim on its teardown (``audio_teardown``): more than
+        one thread can hold a snapshot of the same instance -- ``terminate_all()``
+        takes no recorder lock and no ``_reset_lock``, so the cleanup path and
+        a reset really do overlap -- and only the caller that removed it may
+        ``terminate()`` it. A second ``Pa_Terminate()`` on one instance drops
+        PortAudio's init count below the live reference count and kills an
+        unrelated live instance.
+
+        The instance stays live -- the caller keeps using it, e.g. the
+        instance a new stream is opened on.
+        """
         with self._instances_lock:
-            if pa in self._instances:
-                self._instances.remove(pa)
+            if pa not in self._instances:
+                return False
+            self._instances.remove(pa)
+            return True
 
     def note_worker(self, worker: threading.Thread) -> None:
         """Record a worker the caller is about to start.
@@ -236,19 +248,26 @@ class PyAudioRegistry:
         self._indices.bind(device_index, resolved_on, self.pyaudio)
 
     def _dispose(self, pa: pyaudio.PyAudio) -> bool:
-        """Terminate one instance and unbind everything that was a fact
-        about it. False = it would not terminate, so it stays registered
-        (and its index binding stays readable) for the next attempt.
+        """Take down one instance THIS caller owns: untrack it, unbind it,
+        terminate it. False = it would not terminate.
+
+        Delegates to ``audio_teardown.dispose_claimed`` so this path and
+        ``terminate_all()`` share the ordering: the untrack/unbind run BEFORE
+        the native call (no read can pair a terminated instance with a live
+        index), and a refusal puts the instance back on the list with its
+        binding, because an untracked live instance is what this class exists
+        to reach.
+
+        No claim here, deliberately: every caller holds this instance by
+        construction -- the retry loop terminates the instance its own attempt
+        built, and ``adopt()`` the instance a reset displaced -- so there is
+        no second thread to lose a race to, and an instance the registry never
+        tracked would survive unterminated with its binding still naming a
+        device it never enumerated. The claim is ``terminate_all()``'s, the
+        one path that reads a list two threads can be reading at once.
         """
-        if not terminate_quietly(pa):
-            return False
         self.forget(pa)
-        # An index resolved against an instance that has just been terminated
-        # describes a device list that no longer exists, so the pairing goes
-        # with it: a leftover binding is what let every later press open on a
-        # dead index.
-        self._indices.unbind(pa)
-        return True
+        return dispose_claimed(self, pa)
 
     def terminate(self, pa: pyaudio.PyAudio) -> None:
         """Terminate and unregister one instance (its stream must be
@@ -262,61 +281,13 @@ class PyAudioRegistry:
     def terminate_all(self) -> bool:
         """Terminate every instance this session ever built. True = all gone.
 
-        PortAudio's init count is reference-counted, so a single missed
-        instance -- an unregistered one, or one whose terminate() raised --
-        keeps the engine up and the next construction reuses the frozen device
-        list. terminate_quietly() swallows per-instance failures so one broken
-        instance cannot strand the rest, but it reports them: an instance that
-        would not terminate STAYS registered, because forgetting a live
-        instance is how it becomes permanently unreachable.
-
-        Two different False answers live here, and only one is counted. A
-        refusal from the ledger gate -- a worker this session started, or a
-        keep-warm capture it installed or dropped, may still be inside a native
-        call -- is a deferral that releases itself, so callers treat it as busy
-        and nothing is claimed. A refusal from an instance that would not
-        terminate is retried and counted, and past ``MAX_TERMINATE_FAILURES``
-        in a row the session says so through ``needs_restart`` rather than
-        leaving the app reporting Ready over a dead microphone.
+        The pass itself lives in ``kuiskaus.audio_teardown`` (the
+        module-size seam, the same split ``refresh()`` uses for the reset);
+        this is the registry's entry point into it. See there for what it
+        orders, what it claims, and what the two different False answers cost
+        the session.
         """
-        if self._refuse_teardown():
-            return False
-        incomplete = False
-        disposed = 0
-        with self._instances_lock:
-            pending = list(self._instances)
-        # The ledger gains names on other threads (a press notes its worker
-        # under the recorder's lock, not this one), so the gate is asked
-        # again immediately before anything is disposed: the snapshot above
-        # is a list of instances, not a promise about the threads on them.
-        if self._refuse_teardown():
-            return False
-        for pa in pending:
-            if dispose_prepared(self, pa):
-                disposed += 1
-            else:
-                incomplete = True
-        if incomplete and disposed:
-            # Say so when the pass was only half a teardown: the session can
-            # be left pointing at an instance this call DID terminate (a press
-            # then opens on it and gets "microphone unavailable" on healthy
-            # hardware until the next press re-binds), and without this line
-            # that press has no trace of why.
-            print(
-                f"Terminated {disposed} of {len(pending)} PyAudio instances; "
-                "the session may still name one of them."
-            )
-        live = self.pyaudio
-        if live is not None and not self.tracks(live):
-            # The session names an instance this pass terminated. Left bound,
-            # the retry loop opens on a corpse, so the name goes with the
-            # instance and the next press rebuilds. Unbind rather than clear: a
-            # press that rebuilt in the meantime owns the binding now.
-            self._indices.unbind(live)
-            if self.pyaudio is live:
-                self.pyaudio = None
-        note_terminate_outcome(self, clean=not incomplete)
-        return not incomplete
+        return terminate_all_pass(self)
 
     def _refuse_teardown(self) -> bool:
         """True (and logged) while something this session started may still

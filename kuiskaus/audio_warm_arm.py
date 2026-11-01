@@ -317,9 +317,11 @@ def open_warm_capture_stream(
     if refresh_recorder_session(recorder, previous):
         # A ``locked`` deferral is an open FAILURE for this iteration, not a
         # licence to open on the snapshot: the holder of ``_reset_lock`` may
-        # be mid-``terminate_all()``, and ``_dispose`` terminates an instance
-        # before unbinding its index, so the pair this snapshot carries can
-        # name a PortAudio corpse whose index still resolves -- the same
+        # be mid-``terminate_all()``, and it is terminating instances while
+        # this thread reads -- the pair this snapshot carries can name a
+        # PortAudio corpse by the time ``open()`` runs, however the teardown
+        # orders its own unbind (the dispose paths unbind first, which makes
+        # the PAIR safe but cannot make the instance survive). The same
         # hazard ``prepare_worker_session`` refuses for the per-press worker.
         # Raising is the one no-stream result ``WarmCapture._run`` already
         # handles: the capture waits out its reopen delay and asks again, so

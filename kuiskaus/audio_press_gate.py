@@ -61,9 +61,15 @@ def press_is_admissible(
     NOTHING about which device the holder's reset covers -- it is bounded to
     the one press it belongs to -- so this admission is not a promise that
     this press's device was settled; it only declines to fail a press for the
-    crime of a reset being busy, and the worker re-checks the session at the
-    head of its own press (where a still-locked reset fails it busy instead
-    of opening on a torn pair).
+    crime of a reset being busy. What makes the admission safe is that nobody
+    acts on the state the gate read. On the worker path the worker re-checks
+    the session at the head of its own press (where a still-locked reset
+    fails it busy instead of opening on a torn pair); on the keep-warm path
+    there is no worker, and ``start_recording`` re-reads ``_warm`` under
+    ``_lock`` AFTER this gate returns, so the capture this press routes its
+    ring into is the one the session holds at that instant, not the one this
+    gate saw -- a reset that replaced or dropped it in between is not
+    resurrected by the admission.
     """
     if recording or warm is None:
         return True
