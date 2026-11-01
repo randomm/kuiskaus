@@ -26,6 +26,15 @@ PortAudio's init count below the live reference count and tears down an
 unrelated live instance (-10000). So ``forget()`` answers whether THIS call
 removed the instance, and the one that did not own its teardown either.
 
+Losing that claim is a third answer, not a clean one. ``dispose_prepared``
+says ``DONE``, ``DELEGATED`` or ``FAILED``, and ``terminate_all_pass`` books a
+verdict only for what it claimed itself: a delegated instance is resolved
+against the registry afterwards, because the caller that won the claim can
+still fail at the native call and put the instance back -- live and tracked --
+and a pass that terminated nothing must not report the engine clean. That is
+how a restart verdict earned against a poison instance disappeared under a
+concurrent pass, and the next reset rebuilt over a PyAudio that never died.
+
 A refusal keeps the old observable state: the instance that would not
 terminate goes back on the list (an untracked live instance is unreachable,
 the rule ``terminate_all()`` is built on) and its index binding -- still a
@@ -36,6 +45,7 @@ in flight, and restoring a value read before it would make the stale one win.
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from kuiskaus.audio_device_reset import note_terminate_outcome
@@ -46,6 +56,20 @@ if TYPE_CHECKING:
     import pyaudio
 
     from kuiskaus.audio_device import PyAudioRegistry
+
+
+class Teardown(Enum):
+    """What one instance's teardown came to, from THIS caller's side.
+
+    Three answers, not two, because "it is gone" and "somebody else is taking
+    it down" are different facts a whole-pass verdict has to tell apart: the
+    first is a teardown this caller ran, the second is one it merely watched,
+    and only the first may book itself as clean (see ``terminate_all_pass``).
+    """
+
+    DONE = "done"  # claimed here and terminated
+    DELEGATED = "delegated"  # another caller claimed it -- outcome not this one's
+    FAILED = "failed"  # claimed here, would not terminate, back on the list
 
 
 def dispose_claimed(registry: PyAudioRegistry, pa: pyaudio.PyAudio) -> bool:
@@ -85,13 +109,16 @@ def dispose_claimed(registry: PyAudioRegistry, pa: pyaudio.PyAudio) -> bool:
     return False
 
 
-def dispose_prepared(registry: PyAudioRegistry, pa: pyaudio.PyAudio) -> bool:
+def dispose_prepared(registry: PyAudioRegistry, pa: pyaudio.PyAudio) -> Teardown:
     """Claim one instance, then take it down (``dispose_claimed``).
 
-    True = it is gone -- which includes "someone else claimed it and is
-    terminating it": a caller that lost the claim has nothing left to do
-    here, and reaching ``terminate()`` anyway is the double ``Pa_Terminate()``
-    this module exists to prevent.
+    ``DONE`` = this caller claimed it and it is gone. ``FAILED`` = this caller
+    claimed it and it would not terminate, so it is back on the list. And
+    ``DELEGATED`` = this caller never owned it: somebody else claimed it and is
+    terminating it (or will fail and restore it), which is why reaching
+    ``terminate()`` anyway is the double ``Pa_Terminate()`` this module exists
+    to prevent -- and why DELEGATED is NOT a ``DONE``: this pass did not see
+    the native call succeed, and the caller that did can fail.
 
     This is the path ``terminate_all()`` uses, because it is the one that
     reads a list two threads can be reading at the same moment -- and the
@@ -99,8 +126,8 @@ def dispose_prepared(registry: PyAudioRegistry, pa: pyaudio.PyAudio) -> bool:
     than a second ``Pa_Terminate()``.
     """
     if not registry.forget(pa):
-        return True
-    return dispose_claimed(registry, pa)
+        return Teardown.DELEGATED
+    return Teardown.DONE if dispose_claimed(registry, pa) else Teardown.FAILED
 
 
 def terminate_all_pass(registry: PyAudioRegistry) -> bool:
@@ -116,19 +143,31 @@ def terminate_all_pass(registry: PyAudioRegistry) -> bool:
     docstring), so a second concurrent pass over the same snapshot terminates
     nothing a second time.
 
+    What a pass may book, and what it may not. It booked a verdict only for
+    the instances it actually claimed: a ``DELEGATED`` instance was somebody
+    else's teardown, and reporting the pass clean because the claim was lost is
+    how a pass that terminated NOTHING retires a restart verdict some earlier
+    real teardown earned -- the claimant's ``terminate()`` can fail, and a
+    refusal puts the instance back on the list live and tracked, so the next
+    reset rebuilds over a PyAudio that never died and PortAudio keeps handing
+    out the frozen device list (the issue #72 symptom, back inside the fix).
+    So a delegation resolves against the registry: if the instance is still --
+    or again -- tracked, this pass did not come clean.
+
     Two different False answers live here, and only one is counted. A refusal
     from the ledger gate -- a worker this session started, or a keep-warm
     capture it installed or dropped, may still be inside a native call -- is a
     deferral that releases itself, so callers treat it as busy and nothing is
-    claimed. A refusal from an instance that would not terminate is retried
-    and counted, and past ``MAX_TERMINATE_FAILURES`` in a row the session says
-    so through ``needs_restart`` rather than leaving the app reporting Ready
-    over a dead microphone.
+    claimed. A refusal from an instance that would not terminate is retried and
+    counted, and past ``MAX_TERMINATE_FAILURES`` in a row the session says so
+    through ``needs_restart`` rather than leaving the app reporting Ready over
+    a dead microphone.
     """
     if registry._refuse_teardown():
         return False
-    incomplete = False
     disposed = 0
+    claimed = 0
+    delegated: list[pyaudio.PyAudio] = []
     with registry._instances_lock:
         pending = list(registry._instances)
     # The ledger gains names on other threads (a press notes its worker under
@@ -138,16 +177,21 @@ def terminate_all_pass(registry: PyAudioRegistry) -> bool:
     if registry._refuse_teardown():
         return False
     for pa in pending:
-        if dispose_prepared(registry, pa):
+        outcome = dispose_prepared(registry, pa)
+        if outcome is Teardown.DELEGATED:
+            delegated.append(pa)
+            continue
+        claimed += 1
+        if outcome is Teardown.DONE:
             disposed += 1
-        else:
-            incomplete = True
+    incomplete = disposed < claimed or any(registry.tracks(pa) for pa in delegated)
     if incomplete and disposed:
         # Say so when the pass was only half a teardown: the session can be
         # left pointing at an instance this call DID terminate (a press then
         # opens on it and gets "microphone unavailable" on healthy hardware
         # until the next press re-binds), and without this line that press has
-        # no trace of why.
+        # no trace of why. `disposed` counts only what THIS pass terminated --
+        # a delegation it watched is not one of them.
         print(
             f"Terminated {disposed} of {len(pending)} PyAudio instances; "
             "the session may still name one of them."
@@ -161,12 +205,14 @@ def terminate_all_pass(registry: PyAudioRegistry) -> bool:
         registry._indices.unbind(live)
         if registry.pyaudio is live:
             registry.pyaudio = None
-    if not pending:
-        # Nothing was tracked, so nothing was torn down: an empty pass is not
-        # a teardown that came clean, and booking it as one retires a restart
-        # verdict some earlier, real teardown earned -- a press that never
-        # touched PortAudio would clear the claim against a dead microphone.
-        return True
+    if not claimed:
+        # Nothing was claimed, so nothing was torn down by this pass -- an
+        # empty list, or a pass whose every instance belonged to another
+        # caller. Either way it is not a teardown that came clean, and booking
+        # it as one retires a restart verdict some earlier, real teardown
+        # earned: a press that never touched PortAudio would clear the claim
+        # against a dead microphone.
+        return not incomplete
     note_terminate_outcome(registry, clean=not incomplete)
     return not incomplete
 

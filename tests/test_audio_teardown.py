@@ -25,7 +25,7 @@ from __future__ import annotations
 import threading
 from unittest.mock import MagicMock
 
-from kuiskaus.audio_teardown import dispose_prepared
+from kuiskaus.audio_teardown import Teardown, dispose_claimed, dispose_prepared
 from tests.support_audio_device import _find_device, _registry
 from tests.support_audio_recorder import _live_default_input
 
@@ -131,7 +131,11 @@ def test_the_caller_that_lost_the_claim_never_touches_the_native_teardown(
     registry.open(_find_device)
 
     assert registry.forget(live) is True  # the other thread owns this teardown
-    assert dispose_prepared(registry, live) is True
+    outcome = dispose_prepared(registry, live)
+    assert outcome is Teardown.DELEGATED, (
+        "losing the claim is neither a teardown this caller ran nor a refusal "
+        f"it owes the budget for: {outcome}"
+    )
     live.terminate.assert_not_called()
 
 
@@ -287,3 +291,96 @@ def test_a_half_teardown_still_names_the_instances_it_reached(coreaudio_stub, ca
     assert stuck in registry._instances
     printed = capsys.readouterr().out
     assert "Terminated 1 of 2" in printed
+
+
+# ---------------------------------------------------------------------------
+# A delegation is not a clean pass
+# ---------------------------------------------------------------------------
+
+
+def _handed_to_a_failing_claimant(registry, instance, monkeypatch):
+    """Make ``instance`` be claimed by ANOTHER teardown caller whose
+    ``terminate()`` then fails, so it goes back on the registry's list.
+
+    The window ``terminate_all()`` is exposed to: it snapshots the list, a
+    second caller forgets the instance first (so this pass loses the claim and
+    must not touch the native call), and that caller's refusal re-registers
+    the instance -- live, tracked, and never terminated by anybody this pass
+    can see. Threading cannot be scheduled deterministically here, so the
+    claimant's whole teardown runs inside this pass's lost ``forget()``: the
+    state the pass then resolves against is exactly the one the race produces.
+    """
+    real_forget = registry.forget
+    handed_over = [False]
+
+    def _forget(pa):
+        if pa is instance and not handed_over[0]:
+            handed_over[0] = True
+            real_forget(pa)  # the claimant got there first
+            instance.terminate.side_effect = OSError("Pa_Terminate failed")
+            dispose_claimed(registry, pa)  # it failed, and put the instance back
+            return False
+        return real_forget(pa)
+
+    monkeypatch.setattr(registry, "forget", _forget)
+
+
+def test_a_delegated_instance_the_claimant_failed_keeps_the_pass_dirty(
+    coreaudio_stub, monkeypatch
+):
+    """The claim-loss bug: a pass whose every instance belonged to somebody
+    else booked ``note_terminate_outcome(clean=True)`` even when that somebody
+    else FAILED, so the session retired a restart verdict it had earned and the
+    next reset rebuilt over a PyAudio that never died -- PortAudio keeps the
+    frozen device list and never re-enumerates, the issue #72 symptom itself.
+
+    A delegation is only clean if the instance actually left the registry.
+    """
+    registry, live, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    registry.needs_restart = True
+    registry.terminate_failures = 3
+    _handed_to_a_failing_claimant(registry, live, monkeypatch)
+
+    assert registry.terminate_all() is False, (
+        "the instance is still registered: this pass terminated nothing and "
+        "nobody told it so"
+    )
+    assert registry.tracks(live) is True
+    live.terminate.assert_called_once()  # only the claimant reached the native call
+    assert registry.terminate_failures == 3, (
+        "a pass that terminated nothing booked a clean teardown and cleared "
+        "the refusal budget"
+    )
+    assert registry.needs_restart is True, (
+        "a pass that terminated nothing retired the verdict a real teardown "
+        "earned; the next reset rebuilds over a live instance"
+    )
+
+
+def test_a_delegated_instance_that_reached_the_list_again_counts_as_incomplete(
+    coreaudio_stub, monkeypatch, capsys
+):
+    """Mixed pass: one instance this caller took down, one it lost to a
+    claimant that failed. The pass is incomplete, and the partial-teardown log
+    says what THIS pass terminated -- not what it delegated away.
+    """
+    registry, live, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    delegated = MagicMock(name="PyAudioInstance-delegated")
+    registry.register(delegated)
+    _handed_to_a_failing_claimant(registry, delegated, monkeypatch)
+
+    assert registry.terminate_all() is False
+
+    live.terminate.assert_called_once()
+    assert registry.tracks(delegated) is True, "the claimant's instance came back live"
+    printed = capsys.readouterr().out
+    assert "Terminated 1 of 2" in printed, (
+        "a delegated instance is not one this pass terminated: " + printed
+    )
+    assert registry.terminate_failures == 1, (
+        "the pass that did reach a native call still books its own attempt"
+    )
