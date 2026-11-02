@@ -22,6 +22,7 @@ timeout. No wait in this file is unbounded.
 """
 
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -77,6 +78,37 @@ def _assert_stop_log_line(
     assert f"reason={reason}" in log_lines[0]
 
 
+def _live_default_input(stub: MagicMock, device_id: int, is_alive: bool = True) -> None:
+    """Make the stubbed CoreAudio bridge report ``device_id`` as the live
+    system default input (issue #72).
+
+    The autouse stub's default is "every read fails" -- no evidence, so
+    ``read_live_default_input()`` returns None and the recorder takes the
+    no-reset fast path, which is what the pre-#72 recorder tests were
+    written against. A test that exercises the device-change reset has to
+    say what the system default actually is; call this again with a
+    different id to move it.
+
+    Pass the ``coreaudio_stub`` fixture's mock. The baseline the session
+    compares against is captured when the session is built, so a test
+    that never calls this before construction gets ``device_id`` None --
+    and any live read then counts as a change.
+    """
+    from kuiskaus.audio_coreaudio import (
+        kAudioDevicePropertyDeviceIsAlive,
+        kAudioHardwarePropertyDefaultInputDevice,
+    )
+
+    def _read(_object_id, address, _qualifier_size, _qualifier, _size, _out):
+        if address.mSelector == kAudioHardwarePropertyDefaultInputDevice:
+            return 0, 4, device_id.to_bytes(4, sys.byteorder)
+        if address.mSelector == kAudioDevicePropertyDeviceIsAlive:
+            return 0, 4, int(is_alive).to_bytes(4, sys.byteorder)
+        return 1852797079, 0, None  # 'who?' -- unknown property
+
+    stub.AudioObjectGetPropertyData.side_effect = _read
+
+
 def _make_pyaudio_instance(
     index: int = 0,
     rate: float | None = None,
@@ -90,7 +122,7 @@ def _make_pyaudio_instance(
         device_info["defaultSampleRate"] = rate
     instance = MagicMock(name=f"PyAudioInstance-{index}")
     instance.get_default_input_device_info.return_value = device_info
-    # Issue #55 lens review MEDIUM (security): the open-time native-rate
+    # Issue #55 (security): the open-time native-rate
     # query now targets the resolved device via get_device_info_by_index
     # (the default-device info is only used to resolve the index), so the
     # fixture mirrors the rate on that path too.
@@ -105,8 +137,7 @@ def _make_recorder(
     extra_pa: MagicMock | None = None,
     **kwargs,
 ):
-    """Build an AudioRecorder wired for the cached-instance shape (issue
-    #42: PR #38's per-recording construction is retired).
+    """Build an AudioRecorder wired for the cached-instance shape (issue #42: PR #38 per-recording construction is retired).
 
     ``module.pyaudio.PyAudio`` yields, in order: ``init_probe`` (the
     __init__'s persistent cached instance -- synthesized when not given),
@@ -209,7 +240,8 @@ def _capture_callback_recorder(
 
 
 def _blocking_read_then_block(read_data: bytes, release_event: threading.Event):
-    """side_effect callable: first call returns read_data, every later call
+    """A ``stream.read`` side_effect callable: first call returns read_data,
+    every later call
     blocks on release_event then raises OSError("stop the loop"). The
     "already returned once" state lives in a local list (a function
     attribute would not be ty-resolvable, so a one-element list keeps the

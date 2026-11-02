@@ -16,6 +16,10 @@ dependencies = [
     "rumps",
     "python-dotenv",
     "pyobjc-framework-avfoundation>=12.1",
+    # Issue #72: the live default-input read in audio_device.py is a
+    # direct CoreAudio call, not an AVFoundation one -- the framework was
+    # until now only present transitively via avfoundation.
+    "pyobjc-framework-CoreAudio>=12.1",
 ]
 
 [dependency-groups]
@@ -40,8 +44,8 @@ testpaths = ["tests"]
 [tool.ty.environment]
 python-version = "3.11"
 
-# PyObjC (Foundation, AppKit, Quartz, ApplicationServices) is an untyped
-# Objective-C bridge: ty cannot see the symbols it exposes, so every
+# PyObjC (Foundation, AppKit, Quartz, ApplicationServices, CoreAudio) is an
+# untyped Objective-C bridge: ty cannot see the symbols it exposes, so every
 # `from AppKit import ...` / `Quartz.CFRunLoop*` access reads as an
 # unresolved import/attribute. That is boundary noise, not a defect in our
 # code, and hand-written stubs for a third-party framework are an explicit
@@ -59,4 +63,5 @@ replace-imports-with-any = [
     "AVFoundation",
     "Quartz",
     "ApplicationServices",
+    "CoreAudio",
 ]

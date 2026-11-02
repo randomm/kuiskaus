@@ -41,7 +41,7 @@ def resample_to_target(audio: np.ndarray, capture_rate: int | None) -> np.ndarra
     # 48 kHz native is ~2.88M samples). Interpolating via integer indices
     # into the source allocates O(target_len) working space instead of
     # np.interp's O(audio.size) linspace + O(target_len) float64
-    # temporaries (issue #55 lens review MEDIUM, performance).
+    # temporaries (issue #55, performance).
     idx = np.arange(target_len, dtype=np.float64) * (audio.size / target_len)
     lo = np.clip(idx.astype(np.intp), 0, audio.size - 1)
     hi = np.clip(lo + 1, 0, audio.size - 1)

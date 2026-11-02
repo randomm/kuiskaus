@@ -19,6 +19,7 @@ import queue
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -65,6 +66,57 @@ def _clean_kuiskaus_debug_env(monkeypatch: pytest.MonkeyPatch):
     other tests' module loads.
     """
     monkeypatch.delenv("KUISKAUS_DEBUG", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def coreaudio_stub(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Stub the PyObjC CoreAudio bridge for every test (issue #72).
+
+    autouse, not per-test monkeypatch.setitem: kuiskaus.audio_device
+    resolves CoreAudio through sys.modules at call time, and a stub that
+    only some tests install would let the host machine's real default
+    input device leak into the suite (a live read of the developer's
+    microphone is never a legitimate test input).
+
+    Default behaviour: every property read fails, so
+    read_live_default_input() returns None and the recorder takes the
+    no-reset fast path -- the behaviour every pre-#72 recorder test was
+    written against. Tests that want a live default call
+    tests.support_audio_recorder._live_default_input(stub, device_id).
+    """
+    stub = MagicMock(name="CoreAudio")
+    from kuiskaus import audio_coreaudio
+
+    # The selector constants are the contract between this stub and the
+    # reader; restating the literals here meant a test could pass against a
+    # number the module no longer uses.
+    stub.kAudioObjectSystemObject = audio_coreaudio.kAudioObjectSystemObject
+    stub.kAudioObjectPropertyScopeGlobal = (
+        audio_coreaudio.kAudioObjectPropertyScopeGlobal
+    )
+    stub.kAudioObjectPropertyElementMain = (
+        audio_coreaudio.kAudioObjectPropertyElementMain
+    )
+    stub.kAudioHardwarePropertyDefaultInputDevice = (
+        audio_coreaudio.kAudioHardwarePropertyDefaultInputDevice
+    )
+    stub.kAudioDevicePropertyDeviceIsAlive = (
+        audio_coreaudio.kAudioDevicePropertyDeviceIsAlive
+    )
+    # A real AudioObjectPropertyAddress carries the selector the reader
+    # asked for, so a stub that answers per-selector can tell the two
+    # reads apart -- which is what makes "device moved" and "device not
+    # alive" separately testable.
+    stub.AudioObjectPropertyAddress.side_effect = lambda selector, scope, element: (
+        SimpleNamespace(mSelector=selector, mScope=scope, mElement=element)
+    )
+    stub.AudioObjectGetPropertyData.return_value = (1852797029, 0, None)
+    monkeypatch.setitem(sys.modules, "CoreAudio", stub)
+    # The unavailable-framework latch and the OSStatus log budget are
+    # process-lifetime state; a test that tripped either must not hand the
+    # verdict to the rest of the suite.
+    audio_coreaudio._reset_diagnostics_for_tests()
+    return stub
 
 
 @pytest.fixture

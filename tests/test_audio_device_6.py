@@ -1,0 +1,354 @@
+"""A device that will not settle must not cost a rebuild on every press.
+
+The reset's dedupe guard compares the live CoreAudio pair against the pair
+the session was last rebuilt against. When CoreAudio is steady that is
+exactly one rebuild per device move. It is NOT exactly one when the pair
+itself oscillates -- an AirPod stream whose ``isAlive`` flag flips between
+reads through a coreaudiod storm -- because each press then legitimately
+sees a different pair, the guard cannot engage, and each press pays a full
+terminate-all + ``Pa_Initialize`` + re-enumeration on the hotkey callback
+thread. Nothing bounded that, so the "one rebuild" property issue #72 is
+about was only ever true for a well-behaved CoreAudio.
+
+The exemption that lets a hand-moved default out of the backoff window --
+and the alternating-default shape that hardest tests that bound -- lives in
+``tests/test_audio_device_8.py``.
+"""
+
+from unittest.mock import MagicMock
+
+import kuiskaus.audio_device_reset as reset_module
+from kuiskaus.audio_coreaudio import (
+    kAudioDevicePropertyDeviceIsAlive,
+    kAudioHardwarePropertyDefaultInputDevice,
+)
+from kuiskaus.audio_device_reset import (
+    MAX_TERMINATE_FAILURES,
+    MICROPHONE_NEEDS_RESTART,
+    MICROPHONE_NOT_SETTLING,
+)
+from kuiskaus.audio_retry import MICROPHONE_BUSY
+from tests.support_audio_device import _find_device, _registry
+from tests.support_audio_recorder import _live_default_input
+
+
+def test_a_manual_switch_during_the_backoff_is_picked_up_next_press(
+    coreaudio_stub, monkeypatch
+):
+    """The backoff exists to skip a teardown that is known futile; it must
+    not decide which device this session is on. A user who switches to a
+    healthy microphone by hand inside the 30 s window is picked up on that
+    very press: the guard sits below the live read and the dedupe check, so
+    the device is actually read, the stale verdict goes with the evidence,
+    and the press is admitted instead of refused.
+    """
+    registry, _pa, module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    _oscillating_liveness(coreaudio_stub, 77)
+    clock = [0.0]
+    monkeypatch.setattr(reset_module, "_now", lambda: clock[0])
+    for _ in range(reset_module.MAX_RESET_REBUILDS):
+        registry.refresh(_find_device)
+    assert registry.needs_restart is True
+
+    # The storm is over and the user picks a different, healthy microphone --
+    # WITHOUT the backoff expiring.
+    _live_default_input(coreaudio_stub, 250, is_alive=True)
+    settled = MagicMock(name="PyAudioInstance-settled")
+    module.PyAudio = MagicMock(return_value=settled)
+
+    result = registry.refresh(_find_device)
+
+    assert result.busy is False, "the backoff refused a press that needed no teardown"
+    assert result.pyaudio is settled
+    assert registry.device_id == 250
+    assert registry.press_refusal_reason() != MICROPHONE_NEEDS_RESTART
+
+    # The cross-device count is the bound, so this press -- a rebuild --
+    # does not lift a verdict an earlier press earned; the press that does
+    # is the one that finds the session already agreeing with the live
+    # device, once the window it armed has expired.
+    assert registry.needs_restart is True
+    clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
+    assert registry.refresh(_find_device).busy is False
+    assert registry.needs_restart is False
+    assert registry.rebuild.count == 0
+
+
+def test_a_press_that_needs_no_teardown_is_admitted_inside_the_backoff(
+    coreaudio_stub, monkeypatch
+):
+    """The backoff exists to skip one known-futile teardown; it never had a
+    right to refuse the press. A press whose live read already matches the
+    session is admitted on the spot -- busy=False, no terminate, no
+    construction -- so a user still sitting on the microphone that merely
+    blinked alive is not told "busy" for the rest of the window."""
+    registry, pa, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    _oscillating_liveness(coreaudio_stub, 77)
+    clock = [0.0]
+    monkeypatch.setattr(reset_module, "_now", lambda: clock[0])
+    for _ in range(reset_module.MAX_RESET_REBUILDS):
+        registry.refresh(_find_device)
+    assert registry.needs_restart is True
+    terminates = pa.terminate.call_count
+
+    # The same device now reads alive: the session already describes it, so
+    # there is nothing to reset and nothing to refuse.
+    _live_default_input(coreaudio_stub, 77, is_alive=True)
+    assert registry.refresh(_find_device).busy is False
+    assert pa.terminate.call_count == terminates
+
+
+def test_the_streak_survives_a_blink_inside_the_window(coreaudio_stub, monkeypatch):
+    """The other half of that rule. A device flapping its liveness flag reads
+    as "settled" on every other press, so a press inside the window is not
+    yet the evidence the rebuild budget was asking for -- handing the budget
+    back there would let the flapping device cost a full teardown every other
+    press for the life of the process, the churn ``MAX_RESET_REBUILDS``
+    exists to bound. The verdict stands until the window expires."""
+    registry, _pa, module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    _oscillating_liveness(coreaudio_stub, 77)
+    clock = [0.0]
+    monkeypatch.setattr(reset_module, "_now", lambda: clock[0])
+    for _ in range(reset_module.MAX_RESET_REBUILDS * 4):
+        registry.refresh(_find_device)
+        clock[0] += 1.0  # never reaches the end of the window
+
+    assert registry.needs_restart is True
+    assert registry.press_refusal_reason() == MICROPHONE_NOT_SETTLING
+    # Bounded: the verdict was earned once and no later press re-earned it.
+    assert module.PyAudio.call_count <= reset_module.MAX_RESET_REBUILDS + 1
+
+    # And it is deferred, not abandoned: the window expires, the press runs
+    # the teardown it was being refused. That press is itself a rebuild, so
+    # the verdict goes with the NEXT press -- the one that finds the session
+    # agreeing with the live device (while the window is open, a press is
+    # not the settling evidence the budget was asking for).
+    clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
+    _live_default_input(coreaudio_stub, 88, is_alive=True)
+    assert registry.refresh(_find_device).busy is False
+    clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
+    assert registry.refresh(_find_device).busy is False
+    assert registry.needs_restart is False
+
+
+def test_a_teardown_that_refused_still_says_portaudio_would_not_release(
+    coreaudio_stub, monkeypatch
+):
+    """The counterpart of the honest streak message: this is the verdict that
+    HAS earned "PortAudio would not release the device" -- an instance that
+    refused ``terminate()`` -- and both user-facing strings must say so."""
+    registry, pa, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    pa.terminate.side_effect = OSError("Pa_Terminate failed")
+    _live_default_input(coreaudio_stub, 88)
+    clock = [0.0]
+    monkeypatch.setattr(reset_module, "_now", lambda: clock[0])
+    for _ in range(reset_module.MAX_TERMINATE_FAILURES):
+        registry.refresh(_find_device)
+
+    assert registry.needs_restart is True
+    assert registry.terminate_failures > 0
+    assert registry.press_refusal_reason() == MICROPHONE_NEEDS_RESTART
+    assert registry.unavailable_reason(None) == MICROPHONE_NEEDS_RESTART
+    assert MICROPHONE_BUSY not in registry.press_refusal_reason()
+
+
+def test_a_flapping_device_with_clean_teardowns_does_not_blame_portaudio(
+    coreaudio_stub, monkeypatch
+):
+    """Every teardown in the flapping path terminated cleanly, so the
+    session has no evidence PortAudio would not release the device -- and
+    the module's own rule is that the claim describes the teardown as it is
+    now. The streak verdict says the honest thing (the device is not
+    settling, and the backoff retries by itself) instead of sending the user
+    to quit the app for a condition that clears on its own.
+    """
+    registry, pa, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    _oscillating_liveness(coreaudio_stub, 77)
+    clock = [0.0]
+    monkeypatch.setattr(reset_module, "_now", lambda: clock[0])
+    for _ in range(reset_module.MAX_RESET_REBUILDS * 2):
+        registry.refresh(_find_device)
+
+    assert registry.needs_restart is True
+    assert registry.terminate_failures == 0  # every teardown released cleanly
+    assert pa.terminate.call_count >= reset_module.MAX_RESET_REBUILDS
+    assert registry.press_refusal_reason() == MICROPHONE_NOT_SETTLING
+    message = registry.unavailable_reason(None)
+    assert "settling" in message
+    assert "restart" not in message.lower()
+    assert MICROPHONE_NEEDS_RESTART not in message
+
+
+def _oscillating_liveness(stub, device_id: int) -> None:
+    """Report ``device_id`` as the default, with ``isAlive`` alternating on
+    every read -- the storm shape that defeats the dedupe guard."""
+    counter = {"n": 0}
+
+    def _read(_object_id, address, _qs, _q, _s, _out):
+        if address.mSelector == kAudioHardwarePropertyDefaultInputDevice:
+            return 0, 4, device_id.to_bytes(4, "little")
+        if address.mSelector == kAudioDevicePropertyDeviceIsAlive:
+            counter["n"] += 1
+            return 0, 4, int(counter["n"] % 2 == 0).to_bytes(4, "little")
+        return 1852797079, 0, None  # 'who?' -- unknown property
+
+    stub.AudioObjectGetPropertyData.side_effect = _read
+
+
+def test_a_persistently_dead_default_rebuilds_once_not_once_per_press(
+    coreaudio_stub,
+):
+    """The stable-pair baseline: the guard engages, and the presses after the
+    first cost no teardown and no construction."""
+    registry, pa, module = _registry()
+    _live_default_input(coreaudio_stub, 77, is_alive=False)
+    registry.open(_find_device)
+
+    results = [registry.refresh(_find_device) for _ in range(4)]
+
+    assert all(r.busy is False for r in results)
+    pa.terminate.assert_not_called()
+    assert module.PyAudio.call_count == 1  # only the open() above
+
+
+def test_an_engine_verdict_holds_the_window_even_when_the_device_changed(
+    coreaudio_stub, monkeypatch
+):
+    """The exemption the manual switch gets is for the verdict that is ABOUT
+    a device. ``rebuild.device`` records the device the rebuild streak counts,
+    and a later teardown verdict -- PortAudio refusing an instance -- says
+    something about the ENGINE, which no new device excuses. Honouring the
+    stale ``rebuild.device`` there would spend the full futile teardown on
+    every press, which is the stall the window exists to prevent.
+    """
+    registry, pa, _module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    clock = [0.0]
+    monkeypatch.setattr(reset_module, "_now", lambda: clock[0])
+
+    # One clean rebuild, so the streak now counts device 88.
+    _live_default_input(coreaudio_stub, 88)
+    registry.refresh(_find_device)
+    assert registry.rebuild.device == 88
+
+    # Then the engine turns: every teardown from here on refuses.
+    pa.terminate.side_effect = OSError("Pa_Terminate failed")
+    _live_default_input(coreaudio_stub, 99)
+    for _ in range(reset_module.MAX_TERMINATE_FAILURES):
+        registry.refresh(_find_device)
+
+    assert registry.needs_restart is True
+    assert registry.terminate_failures == reset_module.MAX_TERMINATE_FAILURES
+    assert registry.rebuild.device == 88  # stale: the verdict is not about it
+
+    terminates = pa.terminate.call_count
+    result = registry.refresh(_find_device)
+
+    assert result.busy is True, "the engine verdict let a press run the futile teardown"
+    assert pa.terminate.call_count == terminates
+    assert registry.press_refusal_reason() == MICROPHONE_NEEDS_RESTART
+
+
+def test_an_oscillating_default_is_bounded_rather_than_rebuilding_forever(
+    coreaudio_stub,
+):
+    """With the pair changing on every read the guard cannot
+    engage, so consecutive rebuilds have to be counted -- otherwise the
+    session churns PortAudio for the life of the process and never says so."""
+    registry, _pa, module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    _oscillating_liveness(coreaudio_stub, 77)
+    presses = reset_module.MAX_RESET_REBUILDS * 3
+
+    for _ in range(presses):
+        registry.refresh(_find_device)
+
+    assert registry.needs_restart is True
+    # Bounded: the rebuilds stop at the budget (plus the one open() above),
+    # instead of one per press.
+    assert module.PyAudio.call_count <= reset_module.MAX_RESET_REBUILDS + 1
+
+
+def test_a_settled_device_is_recovered_by_the_retry_after_the_backoff(
+    coreaudio_stub, monkeypatch
+):
+    """The bound defers, it does not give up: once the device stops
+    oscillating and the backoff expires, the reset runs again and the
+    restart verdict goes away."""
+    registry, _pa, module = _registry()
+    _live_default_input(coreaudio_stub, 77)
+    registry.open(_find_device)
+    _oscillating_liveness(coreaudio_stub, 77)
+    clock = [0.0]
+    monkeypatch.setattr(reset_module, "_now", lambda: clock[0])
+    for _ in range(reset_module.MAX_RESET_REBUILDS):
+        registry.refresh(_find_device)
+    assert registry.needs_restart is True
+
+    _live_default_input(coreaudio_stub, 88, is_alive=True)  # it settled
+    clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
+    fresh = MagicMock(name="PyAudioInstance-settled")
+    module.PyAudio = MagicMock(return_value=fresh)
+    result = registry.refresh(_find_device)
+
+    assert result.pyaudio is fresh
+    assert registry.device_id == 88
+    # The rebuild that recovered the session is still a rebuild, so the
+    # verdict it inherits goes when a press finds the session agreeing --
+    # not before, which is what keeps a flapping default from earning the
+    # budget back on every other press.
+    assert registry.needs_restart is True
+    clock[0] += reset_module.RESTART_RETRY_SECONDS + 1.0
+    assert registry.refresh(_find_device).busy is False
+    assert registry.needs_restart is False
+
+
+def test_the_exhausted_retry_message_bounds_the_foreign_error_text(coreaudio_stub):
+    """The menubar's red line is a status item, not a log.
+
+    Every other piece of foreign text this PR puts on screen is bounded
+    (``str(arm_error)[:120]`` in the reset's hand-back, the ``[:120]`` on the
+    CoreAudio bridge failures) because a native exception can carry an
+    arbitrarily long PortAudio/CoreAudio description. This one went through
+    unbounded, so a 10 KB PortAudio string landed in the status item verbatim.
+    """
+    registry, _pa, _module = _registry()
+    registry.needs_restart = True
+    registry.terminate_failures = MAX_TERMINATE_FAILURES  # the PortAudio verdict
+
+    message = registry.unavailable_reason(OSError("x" * 10_000))
+
+    assert message.startswith(MICROPHONE_NEEDS_RESTART)
+    assert len(message) < len(MICROPHONE_NEEDS_RESTART) + 200, (
+        f"unbounded native error text in the menubar status item: {len(message)} chars"
+    )
+
+
+def test_the_plain_unavailable_message_bounds_the_foreign_error_text(coreaudio_stub):
+    """The other branch that reaches the status item goes through
+    ``microphone_unavailable``, which interpolated the error unbounded: the
+    ``[:120]`` lived only in the restart-verdict branch above, so the
+    generic "Microphone unavailable: ..." line still took a 10 KB PortAudio
+    description to the menubar verbatim (issue #72).
+    """
+    registry, _pa, _module = _registry()
+    assert registry.needs_restart is False  # the microphone_unavailable path
+
+    message = registry.unavailable_reason(OSError("x" * 10_000))
+
+    assert message.startswith("Microphone unavailable")
+    assert len(message) < 200, (
+        f"unbounded native error text in the menubar status item: {len(message)} chars"
+    )

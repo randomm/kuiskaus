@@ -17,26 +17,25 @@ from tests.support_audio_recorder import (
 # ---------------------------------------------------------------------------
 # Retry: inline, best-effort, exactly one
 # ---------------------------------------------------------------------------
-def test_retry_succeeds_constructs_fresh_pyaudio_and_reresolves_device(
+def test_retry_reuses_the_live_session_and_constructs_nothing(
     audio_recorder_module,
 ):
-    """Issue #42: attempt 1 reuses the cached self.pyaudio (pa1) and
-    its cached device index; a failed attempt-1 open costs no
-    construction. The retry (attempt 2) constructs a fresh PyAudio()
-    and re-resolves the device against it -- PR #38's retry behaviour,
-    unchanged. Success lands on exactly attempt 2: 1 cached
-    construction (__init__) + 1 fresh retry = 2 total."""
+    """Issue #72 replaces issue #42's per-retry construction: every
+    attempt opens on the single live PyAudio instance. Constructing a
+    fresh one per attempt left PortAudio's init count above zero, so the
+    retry replayed the same frozen device snapshot -- re-enumerating is
+    the device reset's job, not the retry's. Success lands on attempt 2
+    with exactly ONE construction (the __init__ cache)."""
     module = audio_recorder_module
     pa1 = _make_pyaudio_instance(0)
-    pa1.open.side_effect = OSError("first attempt failed")
-    pa_retry = _make_pyaudio_instance(7)
     release_event = threading.Event()
     retry_stream = _blocking_stream(
         OSError("stop the loop after adoption"), release_event
     )
-    pa_retry.open.return_value = retry_stream
+    # A transient storm: the first open fails, the retry's succeeds.
+    pa1.open.side_effect = [OSError("first attempt failed"), retry_stream]
 
-    recorder = _make_recorder(module, pa_retry, init_probe=pa1)
+    recorder = _make_recorder(module, init_probe=pa1)
     # 1: __init__'s cached construction only -- no attempt has run yet.
     assert module.pyaudio.PyAudio.call_count == 1
 
@@ -44,16 +43,14 @@ def test_retry_succeeds_constructs_fresh_pyaudio_and_reresolves_device(
     thread = recorder.recording_thread
     assert thread is not None
 
-    # Bounded wait for adoption: recorder.pyaudio only becomes pa_retry
-    # once the retry's open() has succeeded and been adopted.
-    assert _wait_until(lambda: recorder.pyaudio is pa_retry)
-
-    # Exactly one fresh construction (retry attempt 2): 1 (__init__) + 1.
-    assert module.pyaudio.PyAudio.call_count == 2
-    # Cached attempt 1 resolved at __init__ (device -1); the retry
-    # re-resolves against its fresh instance (device 7). The rate query
-    # (issue #55) makes a second call on the same instance.
-    assert pa_retry.get_default_input_device_info.call_count >= 1
+    # Bounded wait for the retry's open: the stream is open on the cached
+    # instance, which the retry never replaced.
+    assert _wait_until(lambda: pa1.open.call_count >= 2)
+    # No second live instance alongside the first (issue #72).
+    assert module.pyaudio.PyAudio.call_count == 1
+    assert recorder.pyaudio is pa1
+    # The retry re-resolved the device on that same instance.
+    assert pa1.get_default_input_device_info.call_count >= 1
     assert thread.is_alive()  # still blocked in read()
 
     release_event.set()
@@ -68,7 +65,7 @@ def test_retry_succeeds_constructs_fresh_pyaudio_and_reresolves_device(
 def test_retry_runtime_error_from_device_lookup_sets_last_error(
     audio_recorder_module,
 ):
-    """Round-2 review CRITICAL finding: if the retry's own
+    """Cover the case where the retry's own
     _find_default_input_device() call exhausts its fallback loop and
     raises RuntimeError (no input device at all -- e.g. the mic was
     unplugged between the two attempts), the worker must not die
@@ -86,8 +83,7 @@ def test_retry_runtime_error_from_device_lookup_sets_last_error(
     # Fast-failure path: both attempts fail immediately (the retry's
     # device lookup raises RuntimeError), so the worker can complete and
     # clear recording before any capture; wait for completion on
-    # observable state instead (lens review HIGH #1/#4 read-before-start
-    # race).
+    # observable state instead.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -101,7 +97,7 @@ def test_retry_runtime_error_from_device_lookup_sets_last_error(
 def test_late_successful_open_does_not_clobber_already_surfaced_last_error(
     audio_recorder_module,
 ):
-    """Round-2 review ISSUES finding: if stop_recording()'s stuck-open
+    """Cover the case where stop_recording()'s stuck-open
     detection already set last_error for this generation (worker still
     blocked in open() past the join timeout) and the worker's open()
     subsequently succeeds late, it must not clear that already-surfaced
@@ -170,7 +166,7 @@ def test_worker_thread_is_daemon(audio_recorder_module):
     stream = _blocking_stream(OSError("stop the loop"), release_event)
     pa1.open.return_value = stream
 
-    # pa1 is the __init__'s cached instance; attempt 1 reuses it (issue #42).
+    # pa1 is the __init__'s cached instance; attempt 1 reuses it (issue #72).
     recorder = _make_recorder(module, init_probe=pa1)
     assert recorder.start_recording() is True
     thread = recorder.recording_thread
@@ -305,8 +301,7 @@ def test_release_during_backoff_sleep_aborts_before_next_attempt(
 
     # Fast-abort pattern: fake_sleep flips the state synchronously during
     # the sleep, so the worker may tear down before the thread handle is
-    # captured; wait for completion on observable state instead (lens
-    # review HIGH #1/#4).
+    # captured; wait for completion on observable state instead.
     assert recorder.start_recording() is True
     assert _wait_until(lambda: recorder.recording is False, timeout=5.0)
 
@@ -436,7 +431,7 @@ def test_max_attempts_less_than_one_raises_value_error(
     audio_recorder_module, bad_attempts
 ):
     """max_attempts <= 0 would otherwise silently skip the retry loop and
-    surface a bogus "unknown error" (lens review MEDIUM #2)."""
+    surface a bogus "unknown error"."""
     module = audio_recorder_module
     with pytest.raises(ValueError, match="max_attempts must be >= 1"):
         module.AudioRecorder(max_attempts=bad_attempts)
