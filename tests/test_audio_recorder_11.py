@@ -83,11 +83,19 @@ def test_a_failed_rearm_does_not_kill_the_press(audio_recorder_module, coreaudio
     _live_default_input(coreaudio_stub, 77)  # the default moved -> reset runs
     try:
         assert recorder.start_recording() is True  # the press survives
-        worker = recorder.recording_thread
-        assert worker is not None  # ... on the worker path, capture dropped
+        # The worker's NAME is not read here: right after an admitted press
+        # that read races a worker finishing and clearing recording_thread
+        # in microseconds (the class 730c65f removed from recorder_7/8).
+        # What pins the press to the worker path is the pair only that path
+        # produces: it rode no capture, and it opened and ADOPTED its own
+        # stream below -- a warm press routes the capture's ring and never
+        # sets recorder.stream, so the adoption answers "a worker ran".
+        assert recorder._press_warm is None, "the press rode the keep-warm route"
         # Survives means records: the worker adopted its stream and the
         # press is not blamed for the re-arm it was never using.
-        assert _wait_until(lambda: recorder.stream is not None, timeout=8.0)
+        assert _wait_until(lambda: recorder.stream is not None, timeout=8.0), (
+            "the press never adopted a stream: no worker opened for it"
+        )
         assert recorder.recording is True
         assert recorder.last_error is None
         # The failed arming asked for recovery, so keep-warm is not left off

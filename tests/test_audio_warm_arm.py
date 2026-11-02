@@ -276,8 +276,19 @@ def test_a_reset_does_not_resurrect_keep_warm_the_user_unchecked_during_it(
             "the reset re-armed a keep-warm capture the user had just "
             "unchecked, leaving the mic open behind an unchecked menu item"
         )
-        worker = recorder.recording_thread
-        assert worker is not None  # no warm capture left -> the worker path
+        # The worker's NAME is not read here (the class 730c65f removed:
+        # right after an admitted press it races a worker finishing and
+        # clearing it). The route the name read was standing in for -- no
+        # warm capture left, so the worker path -- is pinned by state: the
+        # press rode no capture, and it adopted a stream of its own, which
+        # only a worker press does. The rebuild wait below then proves the
+        # worker itself ran the reset.
+        assert recorder._press_warm is None, (
+            "no warm capture was left to ride, yet the press named one"
+        )
+        assert _wait_until(lambda: recorder.stream is not None, timeout=8.0), (
+            "the press never adopted a worker stream: it did not ride the worker path"
+        )
         assert _wait_until(lambda: recorder.pyaudio is rebuild, timeout=8.0)
 
         assert unchecked == [True]  # the reset really did run

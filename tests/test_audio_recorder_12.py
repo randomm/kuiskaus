@@ -49,8 +49,15 @@ def test_the_press_that_triggers_a_warm_rebuild_delivers_its_take(
 
     try:
         assert recorder.start_recording() is True
-        worker = recorder.recording_thread
-        assert worker is not None, (
+        # The worker's NAME is not read here: right after an admitted press
+        # it races a worker finishing and clearing recording_thread (the
+        # class 730c65f removed). The routing the name read was standing in
+        # for is pinned by the state instead: the press rode NO capture,
+        # and the chunks below can only come from the stream ITS read loop
+        # put on the queue -- a press routed into the capture armed
+        # mid-reset would have been seeded from that capture's empty ring
+        # and returned an empty take (the bug this test exists for).
+        assert recorder._press_warm is None, (
             "the press was routed into the capture armed mid-reset: it had "
             "not opened its stream, so begin() seeded the take from an "
             "empty ring"
@@ -59,7 +66,13 @@ def test_the_press_that_triggers_a_warm_rebuild_delivers_its_take(
         audio = recorder.stop_recording()
         assert audio.size > 0, "the take that paid for the rebuild came back empty"
         assert recorder.last_error is None
-        assert _wait_until(lambda: not worker.is_alive(), timeout=8.0)
+        # The worker exited -- answered by the ledger (the registry object
+        # survives the rebuild; only its instance/index are swapped), which
+        # asks the same question `not worker.is_alive()` used to, without
+        # reading the name a completing worker may have cleared.
+        assert _wait_until(
+            lambda: not recorder._session.workers.any_may_be_native(), timeout=8.0
+        ), "the worker this press started never exited"
         # The rebuild itself: one teardown, one construction, the session
         # now names the fresh instance.
         assert stale.terminate.call_count == 1
